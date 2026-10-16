@@ -129,5 +129,52 @@ pkgs.testers.runNixOSTest {
         manifest = json.loads(client.succeed("cat /target/badsecret/manifest.json"))
         assert "invalid_client" in " ".join(manifest["errors"]), manifest
         assert manifest["totals"]["acquired"] == 0, manifest
+
+    with subtest("m365-logs: sign-ins, directory audits and the Unified Audit Log"):
+        served = json.loads(server.succeed("cat /var/lib/logs.json"))
+        before = len(requests())
+        code, stdout = client.execute(
+            "dfcollect m365-logs --graph-endpoint https://server:8443 --login-endpoint https://server:8443"
+            " --tenant tenant1 --client-id test-client --auth app --client-secret-file <(echo s3cret)"
+            " --not-before 2026-03-01T00:00:00Z --not-after 2026-04-01T00:00:00Z --user alice@contoso.test"
+            " --ual-poll 1 -o /target/logs -C CASE-GRAPH -E logs01 -e tester --json"
+        )
+        assert code == 0, (code, stdout)
+        items = {i["path"]: i for i in (json.loads(l) for l in client.succeed("cat /target/logs/items.jsonl").splitlines())}
+        assert sorted(items) == ["logs/directory-audits", "logs/signins", "logs/unified-audit-log"], items
+        for name, recs in served.items():
+            item = items[f"logs/{name}"]
+            assert item["status"] == "acquired" and item["metadata"]["records"] == len(recs), item
+            stored = client.succeed(
+                f"python3 -c \"import zipfile; print(zipfile.ZipFile('/target/logs/data.zip').read('logs/{name}.jsonl').decode())\""
+            ).strip().splitlines()
+            assert [json.loads(l)["id"] for l in stored] == [r["id"] for r in recs], (name, stored)
+        assert items["logs/unified-audit-log"]["metadata"]["query_id"] == "q1", items["logs/unified-audit-log"]
+        reqs = requests()[before:]
+        posts = [r for r in reqs if r["method"] == "POST" and r["path"].startswith("/v1.0/")]
+        assert len(posts) == 1 and posts[0]["path"] == "/v1.0/security/auditLog/queries", posts
+        assert posts[0]["body"]["userPrincipalNameFilters"] == ["alice@contoso.test"], posts
+        signin_gets = [r["path"] for r in reqs if "/auditLogs/signIns" in r["path"]]
+        assert len(signin_gets) == 2 and "alice%40contoso.test" in signin_gets[0], signin_gets
+        footprint = [json.loads(l) for l in client.succeed("cat /target/logs/footprint.jsonl").splitlines()]
+        ual = [f["detail"] for f in footprint if f["kind"] == "audit_log_query"]
+        assert ual[-1]["status"] == "succeeded" and ual[-1]["polls"] == 2, ual
+        manifest = json.loads(client.succeed("cat /target/logs/manifest.json"))
+        assert manifest["scope"]["accounts"] == ["alice@contoso.test"], manifest["scope"]
+        client.succeed("dfcollect verify /target/logs")
+
+    with subtest("m365-logs: a log the tenant refuses fails alone"):
+        code, stdout = client.execute(
+            "dfcollect m365-logs --graph-endpoint https://server:8443 --login-endpoint https://server:8443"
+            " --tenant tenant1 --client-id test-client --auth app --client-secret-file <(echo s3cret)"
+            " --not-before 2026-03-01T00:00:00Z --not-after 2026-04-01T00:00:00Z --user nopremium@contoso.test"
+            " --logs signins,directory -o /target/logs2 -C CASE-GRAPH -E logs02 -e tester --json"
+        )
+        items = {i["path"]: i for i in (json.loads(l) for l in client.succeed("cat /target/logs2/items.jsonl").splitlines())}
+        assert items["logs/signins"]["status"] == "error", items
+        assert "NonPremium" in items["logs/signins"]["reason"], items
+        assert items["logs/directory-audits"]["status"] == "acquired", items
+        manifest = json.loads(client.succeed("cat /target/logs2/manifest.json"))
+        assert manifest["status"] == "complete_with_errors", manifest
   '';
 }

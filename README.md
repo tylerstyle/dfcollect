@@ -7,8 +7,8 @@ that records what was taken, what was left out and how.
 dfcollect is part of the dfnix tool suite, alongside dfdisk (disk imaging),
 dfmount (read-only mounts), dfnet (network shares and streams) and dfcore
 (shared safety core and audit log). Where dfdisk images whole devices,
-dfcollect acquires files and mailboxes (IMAP, Microsoft 365), and later cloud
-data and databases.
+dfcollect acquires files, mailboxes (IMAP, Microsoft 365) and Microsoft 365
+logs, and later cloud data and databases.
 
 ## What `dfcollect files` does
 
@@ -142,6 +142,44 @@ On the tenant's side the sign-in is logged, and Exchange may log
 MailItemsAccessed in the Unified Audit Log. A sign-in as the account holder can
 notify them. Prefer provider orders or the tenant's cooperation where that
 matters.
+
+## What `dfcollect m365-logs` does
+
+The logs of a Microsoft 365 tenant for a time window. They expire sooner than
+the data, so take them first:
+
+- Entra sign-in logs. These need Entra ID P1/P2 and are kept for 30 days.
+- Entra directory audits.
+- The Unified Audit Log (Purview Audit): MailItemsAccessed, file access,
+  mailbox audit and more.
+
+```bash
+dfcollect m365-logs --auth app --tenant contoso.onmicrosoft.com --client-id <app id> \
+  --client-secret-file /run/secret \
+  --not-before 2026-03-01T00:00:00+01:00 --not-after 2026-04-01T00:00:00+02:00 \
+  --user anna@contoso.com \
+  -o /media/target/case01/m365-logs -C "VG 12345/26" -E logs01 -e "KHK Muster"
+```
+
+1. **Permissions.** Usually the tenant cooperates (`--auth app`); the admin
+   grants your app `AuditLog.Read.All`, `Directory.Read.All` and
+   `AuditLogsQuery.Read.All`. With `--auth device`, an account holding a
+   reader role (e.g. Global Reader, Security Reader) signs in. dfcollect asks
+   only for the permissions the chosen `--logs` need.
+2. **Filtered on the server.** Every log is filtered by the time window (whole
+   seconds: the start rounded down, the end up) and, with `--user`, by account:
+   sign-ins of the account, directory changes it initiated, audit records of it.
+   `--record-type` and `--operation` narrow the audit log further.
+3. **The audit log is a query.** dfcollect creates an audit log query in the
+   tenant (`POST /security/auditLog/queries`). This is its only write, recorded
+   in the footprint with the query's id. It waits for the query to run
+   (`--ual-wait`, default 4 hours) and then reads the records.
+4. **Stored as they came.** Each log is one member `logs/<log>.jsonl` of
+   `data.zip`, one record per line. Its item carries the record count, the
+   filter, the window, and for the audit log the query.
+5. **One refusal doesn't stop the rest.** A log the tenant refuses (missing
+   licence or permission) fails as its own item; the other logs are still
+   read, and the collection ends complete with errors.
 
 ## The collection directory
 

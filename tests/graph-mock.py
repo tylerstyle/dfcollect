@@ -10,7 +10,10 @@ and serves:
   Recoverable Items deletions, messages with metadata, and $value bodies;
 - one 429 with Retry-After for m2's body; m6's body revokes the first
   access token (401), so the client must renew it;
-- for mallory@contoso.test, a nextLink to another host.
+- for mallory@contoso.test, a nextLink to another host;
+- the logs: sign-ins over two pages (403 "non-premium" when filtered on
+  nopremium@contoso.test), directory audits, and an audit log query that
+  runs on the second status check and returns records over two pages.
 """
 import base64, json, ssl, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,7 +36,16 @@ TOKENS = {
 }
 VALID = {TOKENS["at1"], TOKENS["at2"], TOKENS["app"]}
 lock = threading.Lock()
-state = {"polls": 0, "throttled": False}
+state = {"polls": 0, "throttled": False, "ual_checks": 0}
+
+SIGNINS = [{"id": f"s{i}", "createdDateTime": f"2026-03-0{i}T10:00:00Z", "userPrincipalName": "alice@contoso.test",
+            "ipAddress": "203.0.113.9", "appDisplayName": "Outlook"} for i in range(1, 4)]
+DIRAUDITS = [{"id": f"d{i}", "activityDateTime": f"2026-03-1{i}T10:00:00Z", "activityDisplayName": "Update user",
+              "initiatedBy": {"user": {"userPrincipalName": "alice@contoso.test"}}} for i in range(1, 3)]
+UAL = [{"id": f"u{i}", "createdDateTime": f"2026-03-2{i}T10:00:00Z", "operation": "MailItemsAccessed",
+        "userPrincipalName": "alice@contoso.test", "auditData": {"ClientIP": "203.0.113.9", "n": i}} for i in range(1, 4)]
+with open(BODIES.replace("bodies", "logs"), "w") as f:
+    json.dump({"signins": SIGNINS, "directory-audits": DIRAUDITS, "unified-audit-log": UAL}, f)
 
 def msg(n, subject):
     return (f"From: a@example.org\r\nTo: alice@contoso.test\r\nSubject: {subject}\r\n"
@@ -103,19 +115,29 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def record(self):
+    def record(self, body=None):
         auth = self.headers.get("Authorization", "")
         with lock, open(REQUEST_LOG, "a") as f:
             f.write(json.dumps({"method": self.command, "path": self.path, "token": auth[7:][-8:],
-                                "prefer": self.headers.get("Prefer")}) + "\n")
+                                "prefer": self.headers.get("Prefer"), "body": body}) + "\n")
 
     def do_POST(self):
-        self.record()
         length = int(self.headers.get("Content-Length", 0))
-        form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode()).items()}
+        raw = self.rfile.read(length).decode()
         path = urlsplit(self.path).path
+        if path == "/v1.0/security/auditLog/queries":
+            self.record(json.loads(raw))
+            token = self.headers.get("Authorization", "")[7:]
+            if token not in VALID:
+                return self.send(401, {"error": {"code": "InvalidAuthenticationToken", "message": "expired"}})
+            q = json.loads(raw)
+            assert q["@odata.type"] == "#microsoft.graph.security.auditLogQuery", q
+            assert q["filterStartDateTime"] == "2026-03-01T00:00:00Z" and q["filterEndDateTime"] == "2026-04-01T00:00:00Z", q
+            return self.send(201, {"id": "q1", "status": "notStarted", "displayName": q.get("displayName")})
+        self.record()
+        form = {k: v[0] for k, v in parse_qs(raw).items()}
         if path == "/tenant1/oauth2/v2.0/devicecode":
-            assert "Mail.Read" in form["scope"] and "offline_access" in form["scope"], form
+            assert "offline_access" in form["scope"], form
             return self.send(200, {"device_code": "dc1", "user_code": "ABCD-EFGH", "interval": 1,
                                    "verification_uri": "https://microsoft.com/devicelogin", "expires_in": 900,
                                    "message": "To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code ABCD-EFGH to authenticate."})
@@ -145,6 +167,30 @@ class H(BaseHTTPRequestHandler):
         u = urlsplit(self.path)
         q = parse_qs(u.query)
         parts = [unquote(p) for p in u.path.split("/")[2:]]  # after /v1.0
+        if parts[0] == "auditLogs":
+            flt = q.get("$filter", [""])[0]
+            if parts[1] == "signIns":
+                if "$skiptoken" not in q:
+                    assert flt.startswith("createdDateTime ge 2026-03-01T00:00:00Z and createdDateTime lt 2026-04-01T00:00:00Z"), flt
+                if "nopremium@" in flt:
+                    return self.send(403, {"error": {"code": "Authentication_RequestFromNonPremiumTenantOrB2CTenant",
+                                                     "message": "Tenant does not have a SKU required for this call"}})
+                if "$skiptoken" not in q:
+                    return self.send(200, {"value": SIGNINS[:2], "@odata.nextLink": f"{BASE}{u.path}?$skiptoken=2"})
+                return self.send(200, {"value": SIGNINS[2:]})
+            if parts[1] == "directoryAudits":
+                assert flt.startswith("activityDateTime ge 2026-03-01T00:00:00Z"), flt
+                return self.send(200, {"value": DIRAUDITS})
+        if parts[:3] == ["security", "auditLog", "queries"]:
+            if len(parts) == 4:
+                with lock:
+                    state["ual_checks"] += 1
+                    status = "running" if state["ual_checks"] == 1 else "succeeded"
+                return self.send(200, {"id": parts[3], "status": status})
+            if len(parts) == 5 and parts[4] == "records":
+                if "$skiptoken" not in q:
+                    return self.send(200, {"value": UAL[:2], "@odata.nextLink": f"{BASE}{u.path}?$skiptoken=2"})
+                return self.send(200, {"value": UAL[2:]})
         if parts[0] == "users":
             who = parts[1]
             parts = parts[2:]

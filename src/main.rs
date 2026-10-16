@@ -7,6 +7,7 @@ mod container;
 mod files;
 mod graph;
 mod http;
+mod m365logs;
 mod mail;
 mod meta;
 mod oauth;
@@ -81,6 +82,10 @@ fn main() -> ExitCode {
             o.code
         }),
         args::Command::Graph(a) => graph::run(a, &STOP).map(|o| {
+            print(a.json, &o.summary);
+            o.code
+        }),
+        args::Command::M365Logs(a) => m365logs::run(a, &STOP).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),

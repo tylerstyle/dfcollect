@@ -16,7 +16,7 @@
 //!   MailItemsAccessed in the Unified Audit Log.
 
 use crate::{
-    args::GraphArgs,
+    args::{GraphArgs, GraphConnArgs},
     common,
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
@@ -95,11 +95,112 @@ fn who(mailbox: &str) -> String {
     }
 }
 
+/// Requests to Graph with a bearer token: a refused token is renewed once,
+/// and URLs outside the Graph endpoint (a crafted nextLink) never get it.
+pub(crate) struct Api {
+    pub http: Client,
+    pub auth: Auth,
+    pub graph: String,
+}
+
+impl Api {
+    fn send(
+        &mut self,
+        method: &str,
+        url: &str,
+        accept: &str,
+        body: Option<&Value>,
+    ) -> Result<Response> {
+        if !url.starts_with(&format!("{}/", self.graph)) {
+            bail!("refusing to send the token to {}", strip_query(url));
+        }
+        let data = body.map(|b| b.to_string());
+        let mut renewed = false;
+        loop {
+            let bearer = self.auth.bearer(&mut self.http)?;
+            let resp = self.http.request(
+                method,
+                url,
+                &[
+                    ("Authorization", &bearer),
+                    ("Accept", accept),
+                    ("Prefer", "IdType=\"ImmutableId\""),
+                ],
+                data.as_deref().map(|d| ("application/json", d.as_bytes())),
+            )?;
+            if resp.status == 401 && !renewed && self.auth.can_renew() {
+                self.auth.renew(&mut self.http)?;
+                renewed = true;
+                continue;
+            }
+            return Ok(resp);
+        }
+    }
+
+    pub fn get(&mut self, url: &str, accept: &str) -> Result<Response> {
+        self.send("GET", url, accept, None)
+    }
+
+    fn json_of(&self, method: &str, url: &str, resp: Response, ok: &[u16]) -> Result<Value> {
+        if !ok.contains(&resp.status) {
+            bail!(
+                "{method} {}: HTTP {}: {}",
+                strip_query(url.get(self.graph.len()..).unwrap_or(url)),
+                resp.status,
+                resp.error_text()
+            );
+        }
+        resp.json()
+    }
+
+    pub fn get_json(&mut self, url: &str) -> Result<Value> {
+        let resp = self.get(url, "application/json")?;
+        self.json_of("GET", url, resp, &[200])
+    }
+
+    /// A POST with a JSON body (m365-logs creates an audit log query)
+    pub fn post_json(&mut self, url: &str, body: &Value) -> Result<Value> {
+        let resp = self.send("POST", url, "application/json", Some(body))?;
+        self.json_of("POST", url, resp, &[200, 201, 202])
+    }
+
+    /// All pages of a collection
+    pub fn pages(&mut self, first: &str, stop: &AtomicBool) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        self.each_page(first, stop, |page| {
+            out.extend(page.iter().cloned());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Every page of a collection, handed over as it arrives
+    pub fn each_page(
+        &mut self,
+        first: &str,
+        stop: &AtomicBool,
+        mut f: impl FnMut(&[Value]) -> Result<()>,
+    ) -> Result<u64> {
+        let mut next = Some(first.to_string());
+        let mut pages = 0;
+        while let Some(url) = next {
+            if stop.load(Ordering::Relaxed) {
+                bail!("stopped by a signal");
+            }
+            let v = self.get_json(&url)?;
+            if let Some(items) = v["value"].as_array() {
+                f(items)?;
+            }
+            pages += 1;
+            next = v["@odata.nextLink"].as_str().map(str::to_string);
+        }
+        Ok(pages)
+    }
+}
+
 struct Session<'a> {
     args: &'a GraphArgs,
-    http: Client,
-    auth: Auth,
-    graph: String,
+    api: Api,
     base: String,
     account: String,
     rules: ScopeRules,
@@ -111,62 +212,8 @@ struct Session<'a> {
 }
 
 impl Session<'_> {
-    /// A GET to Graph; a refused token is renewed once. URLs outside the
-    /// Graph endpoint (a crafted nextLink) never get the token.
-    fn get(&mut self, url: &str, accept: &str) -> Result<Response> {
-        if !url.starts_with(&format!("{}/", self.graph)) {
-            bail!("refusing to send the token to {}", strip_query(url));
-        }
-        let mut renewed = false;
-        loop {
-            let bearer = self.auth.bearer(&mut self.http)?;
-            let resp = self.http.request(
-                "GET",
-                url,
-                &[
-                    ("Authorization", &bearer),
-                    ("Accept", accept),
-                    ("Prefer", "IdType=\"ImmutableId\""),
-                ],
-                None,
-            )?;
-            if resp.status == 401 && !renewed && self.auth.can_renew() {
-                self.auth.renew(&mut self.http)?;
-                renewed = true;
-                continue;
-            }
-            return Ok(resp);
-        }
-    }
-
-    fn get_json(&mut self, url: &str) -> Result<Value> {
-        let resp = self.get(url, "application/json")?;
-        if resp.status != 200 {
-            bail!(
-                "GET {}: HTTP {}: {}",
-                strip_query(&url[self.graph.len()..]),
-                resp.status,
-                resp.error_text()
-            );
-        }
-        resp.json()
-    }
-
-    /// All pages of a collection
     fn pages(&mut self, first: &str) -> Result<Vec<Value>> {
-        let mut out = Vec::new();
-        let mut next = Some(first.to_string());
-        while let Some(url) = next {
-            if self.stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
-            let v = self.get_json(&url)?;
-            if let Some(items) = v["value"].as_array() {
-                out.extend(items.iter().cloned());
-            }
-            next = v["@odata.nextLink"].as_str().map(str::to_string);
-        }
-        Ok(out)
+        self.api.pages(first, self.stop)
     }
 
     fn walk(&mut self, url: &str, parent: &str, out: &mut Vec<Folder>) -> Result<()> {
@@ -209,7 +256,7 @@ impl Session<'_> {
         self.walk(&url, "", &mut out)?;
         // Soft-deleted items live outside the folder tree
         let url = format!("{}/mailFolders/recoverableitemsdeletions", self.base);
-        let resp = self.get(&url, "application/json")?;
+        let resp = self.api.get(&url, "application/json")?;
         let recoverable = match resp.status {
             200 => {
                 let f = resp.json()?;
@@ -313,7 +360,7 @@ impl Session<'_> {
             }
         }
         let url = format!("{}/messages/{}/$value", self.base, encode(id));
-        let resp = self.get(&url, "*/*")?;
+        let resp = self.api.get(&url, "*/*")?;
         if resp.status != 200 {
             let mut item = Item::new(ItemStatus::Error, path);
             item.kind = Some("message".into());
@@ -391,7 +438,7 @@ fn tls_records(dir: &Path, http: &Client) -> Result<Value> {
 }
 
 fn header(args: &GraphArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
-    let graph = args.graph_endpoint.trim_end_matches('/');
+    let graph = args.conn.graph_endpoint.trim_end_matches('/');
     Ok(Header {
         action: AUDIT_ACTION.into(),
         case: common::case(&args.case),
@@ -427,53 +474,59 @@ fn header(args: &GraphArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
     })
 }
 
-fn flow(args: &GraphArgs) -> Result<Flow> {
+/// The sign-in the connection options ask for
+pub(crate) fn flow(conn: &GraphConnArgs) -> Result<Flow> {
     let client_id = || {
-        args.client_id.clone().ok_or_else(|| {
+        conn.client_id.clone().ok_or_else(|| {
             Usage(
                 "--client-id is required: the application (client) id of your app registration"
                     .into(),
             )
         })
     };
-    Ok(match args.auth {
+    Ok(match conn.auth {
         GraphAuth::Token => {
-            let path = args
+            let path = conn
                 .token_file
                 .as_ref()
                 .ok_or_else(|| Usage("--auth token needs --token-file".into()))?;
             Flow::Token(first_line(path)?)
         }
         GraphAuth::Device => Flow::Device {
-            tenant: args.tenant.clone(),
+            tenant: conn.tenant.clone(),
             client_id: client_id()?,
         },
         GraphAuth::App => {
-            if args.mailbox.eq_ignore_ascii_case("me") {
-                return Err(Usage(
-                    "--auth app reads a named mailbox: give --mailbox <user@domain>".into(),
-                )
-                .into());
-            }
-            if args.tenant.eq_ignore_ascii_case("organizations")
-                || args.tenant.eq_ignore_ascii_case("common")
+            if conn.tenant.eq_ignore_ascii_case("organizations")
+                || conn.tenant.eq_ignore_ascii_case("common")
             {
                 return Err(Usage(
                     "--auth app needs the tenant: --tenant <tenant id or domain>".into(),
                 )
                 .into());
             }
-            let secret = match &args.client_secret_file {
+            let secret = match &conn.client_secret_file {
                 Some(p) => first_line(p)?,
                 None => prompt_secret("Client secret: ")?,
             };
             Flow::App {
-                tenant: args.tenant.clone(),
+                tenant: conn.tenant.clone(),
                 client_id: client_id()?,
                 secret,
             }
         }
     })
+}
+
+/// Both endpoints must be https URLs
+pub(crate) fn check_endpoints(conn: &GraphConnArgs) -> Result<()> {
+    for (name, url) in [
+        ("--graph-endpoint", &conn.graph_endpoint),
+        ("--login-endpoint", &conn.login_endpoint),
+    ] {
+        crate::http::parse_url(url).map_err(|e| Usage(format!("{name}: {e:#}")))?;
+    }
+    Ok(())
 }
 
 pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
@@ -493,15 +546,15 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
         }
     }
     let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
-    for (name, url) in [
-        ("--graph-endpoint", &args.graph_endpoint),
-        ("--login-endpoint", &args.login_endpoint),
-    ] {
-        crate::http::parse_url(url).map_err(|e| Usage(format!("{name}: {e:#}")))?;
+    check_endpoints(&args.conn)?;
+    if args.conn.auth == GraphAuth::App && args.mailbox.eq_ignore_ascii_case("me") {
+        return Err(
+            Usage("--auth app reads a named mailbox: give --mailbox <user@domain>".into()).into(),
+        );
     }
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let flow = flow(args)?;
-    let graph = args.graph_endpoint.trim_end_matches('/').to_string();
+    let flow = flow(&args.conn)?;
+    let graph = args.conn.graph_endpoint.trim_end_matches('/').to_string();
     let accounts = scope.accounts.clone();
 
     let mut collection = Collection::create(&output, header(args, scope)?)?;
@@ -514,8 +567,14 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
             return Err(e);
         }
     };
-    let mut http = Client::new(Duration::from_secs(args.timeout));
-    let (auth, record) = match Auth::sign_in(&mut http, flow, &args.login_endpoint, &graph) {
+    let mut http = Client::new(Duration::from_secs(args.conn.timeout));
+    let (auth, record) = match Auth::sign_in(
+        &mut http,
+        flow,
+        &args.conn.login_endpoint,
+        &graph,
+        &["Mail.Read"],
+    ) {
         Ok(a) => a,
         Err(e) => {
             let reason = format!("{e:#}");
@@ -532,10 +591,8 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
 
     let mut session = Session {
         args,
-        http,
-        auth,
         base: format!("{graph}/v1.0/{}", who(&args.mailbox)),
-        graph,
+        api: Api { http, auth, graph },
         account: args.mailbox.clone(),
         rules,
         collection,
@@ -549,7 +606,7 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
             "{}?$select=id,displayName,userPrincipalName,mail",
             session.base
         );
-        let user = session.get_json(&url)?;
+        let user = session.api.get_json(&url)?;
         if let Some(upn) = user["userPrincipalName"].as_str() {
             session.account = upn.to_string();
         }
@@ -563,7 +620,7 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
                 session.account
             );
         }
-        let tls = tls_records(&output, &session.http)?;
+        let tls = tls_records(&output, &session.api.http)?;
         session.collection.set_source_identity(json!({
             "user": user,
             "auth": record,
@@ -580,8 +637,7 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
     let Session {
         mut collection,
         container,
-        http,
-        auth,
+        api: Api { http, auth, .. },
         folders_listed,
         bodies,
         ..

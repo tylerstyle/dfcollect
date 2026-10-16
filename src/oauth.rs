@@ -137,18 +137,23 @@ fn error_of(v: &Value) -> String {
 
 impl Auth {
     /// Sign in. `login` is the identity platform (https://login.microsoftonline.com),
-    /// `graph` the Graph endpoint the token is for.
+    /// `graph` the Graph endpoint the token is for, `delegated` the permissions
+    /// a device-code sign-in asks for (application sign-ins get `.default`).
     pub fn sign_in(
         http: &mut Client,
         flow: Flow,
         login: &str,
         graph: &str,
+        delegated: &[&str],
     ) -> Result<(Self, Value)> {
         let login = login.trim_end_matches('/');
         let graph = graph.trim_end_matches('/');
         let (tenant, scope) = match &flow {
             Flow::Device { tenant, .. } => {
-                (tenant.clone(), format!("{graph}/Mail.Read offline_access"))
+                let mut scopes: Vec<String> =
+                    delegated.iter().map(|s| format!("{graph}/{s}")).collect();
+                scopes.push("offline_access".into());
+                (tenant.clone(), scopes.join(" "))
             }
             Flow::App { tenant, .. } => (tenant.clone(), format!("{graph}/.default")),
             Flow::Token(_) => (String::new(), String::new()),

@@ -24,6 +24,10 @@ pub enum Command {
     Imap(Box<ImapArgs>),
     /// Acquire a Microsoft 365 mailbox through Microsoft Graph (GET only)
     Graph(Box<GraphArgs>),
+    /// Acquire a Microsoft 365 tenant's sign-in logs, directory audits and
+    /// Unified Audit Log for a time window through Microsoft Graph
+    #[command(name = "m365-logs")]
+    M365Logs(Box<M365LogsArgs>),
     /// Re-check a collection: records, container members and audit anchors
     Verify(VerifyArgs),
 }
@@ -274,20 +278,11 @@ pub struct ImapArgs {
     pub json: bool,
 }
 
+/// Sign-in and endpoints for Microsoft Graph (dfcollect graph, m365-logs)
 #[derive(Args, Debug)]
-pub struct GraphArgs {
-    /// Mailbox: `me` (the account signed in with --auth device) or a user's
-    /// address, UPN or id
-    #[arg(
-        long,
-        default_value = "me",
-        value_name = "MAILBOX",
-        help_heading = "Account"
-    )]
-    pub mailbox: String,
-
-    /// device: sign in as the account (device code, delegated Mail.Read);
-    /// app: application permission Mail.Read, with the tenant's cooperation;
+pub struct GraphConnArgs {
+    /// device: sign in as the account (device code, delegated permissions);
+    /// app: application permissions, with the tenant's cooperation;
     /// token: an access token from --token-file
     #[arg(long, value_enum, default_value = "device", help_heading = "Account")]
     pub auth: crate::graph::GraphAuth,
@@ -333,6 +328,22 @@ pub struct GraphArgs {
     /// Network timeout in seconds
     #[arg(long, default_value = "120", help_heading = "Connection")]
     pub timeout: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct GraphArgs {
+    /// Mailbox: `me` (the account signed in with --auth device) or a user's
+    /// address, UPN or id
+    #[arg(
+        long,
+        default_value = "me",
+        value_name = "MAILBOX",
+        help_heading = "Account"
+    )]
+    pub mailbox: String,
+
+    #[command(flatten)]
+    pub conn: GraphConnArgs,
 
     /// New collection directory (on a target drive)
     #[arg(long, short = 'o', value_name = "DIR")]
@@ -355,6 +366,87 @@ pub struct GraphArgs {
     pub md5: bool,
 
     /// Also compute SHA-1 for every message
+    #[arg(long, help_heading = "Hashes")]
+    pub sha1: bool,
+
+    /// Deflate the container members
+    #[arg(long, help_heading = "Output")]
+    pub compress: bool,
+
+    /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
+    #[arg(long, help_heading = "Safety")]
+    pub allow_tmpfs: bool,
+
+    /// Print the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct M365LogsArgs {
+    #[command(flatten)]
+    pub conn: GraphConnArgs,
+
+    /// Logs to read, comma-separated
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "signins,directory,ual",
+        help_heading = "Logs"
+    )]
+    pub logs: Vec<crate::m365logs::LogKind>,
+
+    /// Only these accounts (UPN, repeatable): sign-ins of them, directory
+    /// changes they initiated, audit records of them. Default: the whole tenant
+    #[arg(long = "user", value_name = "UPN", help_heading = "Logs")]
+    pub users: Vec<String>,
+
+    /// Unified Audit Log: only these record types, as Graph names them (e.g.
+    /// exchangeItem, sharePointFileOperation; repeatable)
+    #[arg(long = "record-type", value_name = "TYPE", help_heading = "Logs")]
+    pub record_types: Vec<String>,
+
+    /// Unified Audit Log: only these operations (e.g. MailItemsAccessed,
+    /// FileDownloaded; repeatable)
+    #[arg(long = "operation", value_name = "OPERATION", help_heading = "Logs")]
+    pub operations: Vec<String>,
+
+    /// Unified Audit Log: longest wait for the query to run, in minutes
+    #[arg(long, default_value = "240", help_heading = "Logs")]
+    pub ual_wait: u64,
+
+    /// Unified Audit Log: seconds between status checks of the query
+    #[arg(long, default_value = "30", hide = true)]
+    pub ual_poll: u64,
+
+    /// Start of the time window (RFC 3339, inclusive)
+    #[arg(long, value_name = "TIME", help_heading = "Scope")]
+    pub not_before: String,
+
+    /// End of the time window (RFC 3339, exclusive)
+    #[arg(long, value_name = "TIME", help_heading = "Scope")]
+    pub not_after: String,
+
+    /// Legal basis of the acquisition (order, date)
+    #[arg(long, value_name = "TEXT", help_heading = "Scope")]
+    pub legal_basis: Option<String>,
+
+    /// New collection directory (on a target drive)
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub case: CaseArgs,
+
+    #[command(flatten)]
+    pub clock: ClockArgs,
+
+    /// Also compute MD5 for every log file
+    #[arg(long, help_heading = "Hashes")]
+    pub md5: bool,
+
+    /// Also compute SHA-1 for every log file
     #[arg(long, help_heading = "Hashes")]
     pub sha1: bool,
 
