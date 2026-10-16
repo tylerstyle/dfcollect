@@ -24,6 +24,8 @@ pub enum Command {
     Imap(Box<ImapArgs>),
     /// Acquire a Microsoft 365 mailbox through Microsoft Graph (GET only)
     Graph(Box<GraphArgs>),
+    /// Acquire a Google Workspace or Gmail mailbox through the Gmail API (GET only, format=raw)
+    Gmail(Box<GmailArgs>),
     /// Acquire files from a cloud or remote service through rclone (lsjson
     /// and cat only), checked against the provider's own hashes
     Cloud(Box<CloudArgs>),
@@ -587,6 +589,114 @@ pub struct DbArgs {
     pub md5: bool,
 
     /// Also compute SHA-1 for every dump
+    #[arg(long, help_heading = "Hashes")]
+    pub sha1: bool,
+
+    /// Deflate the container members
+    #[arg(long, help_heading = "Output")]
+    pub compress: bool,
+
+    /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
+    #[arg(long, help_heading = "Safety")]
+    pub allow_tmpfs: bool,
+
+    /// Print the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct GmailArgs {
+    /// Mailbox (`me` for --auth installed/token, or the user's email address for --auth service-account)
+    #[arg(
+        long,
+        default_value = "me",
+        value_name = "MAILBOX",
+        help_heading = "Account"
+    )]
+    pub mailbox: String,
+
+    /// installed: Desktop app OAuth 2.0 authorization code with PKCE;
+    /// service-account: Google Workspace domain-wide delegation (--key-file, --mailbox);
+    /// token: an access token from --token-file
+    #[arg(
+        long,
+        value_enum,
+        default_value = "installed",
+        help_heading = "Account"
+    )]
+    pub auth: crate::gmail::GmailAuth,
+
+    /// OAuth 2.0 Desktop app client ID (--auth installed)
+    #[arg(long, value_name = "ID", help_heading = "Account")]
+    pub client_id: Option<String>,
+
+    /// File whose first line is the Desktop app client secret (--auth installed;
+    /// default: asked on the terminal)
+    #[arg(long, value_name = "FILE", help_heading = "Account")]
+    pub client_secret_file: Option<PathBuf>,
+
+    /// Service account JSON key file with private_key and client_email (--auth service-account)
+    #[arg(long, value_name = "FILE", help_heading = "Account")]
+    pub key_file: Option<PathBuf>,
+
+    /// File whose first line is an access token with gmail.readonly (--auth token)
+    #[arg(long, value_name = "FILE", help_heading = "Account")]
+    pub token_file: Option<PathBuf>,
+
+    /// Gmail API endpoint
+    #[arg(
+        long,
+        default_value = "https://gmail.googleapis.com",
+        value_name = "URL",
+        help_heading = "Connection"
+    )]
+    pub gmail_endpoint: String,
+
+    /// Google OAuth 2.0 token endpoint
+    #[arg(
+        long,
+        default_value = "https://oauth2.googleapis.com/token",
+        value_name = "URL",
+        help_heading = "Connection"
+    )]
+    pub token_endpoint: String,
+
+    /// Google OAuth 2.0 authorization endpoint (--auth installed)
+    #[arg(
+        long,
+        default_value = "https://accounts.google.com/o/oauth2/v2/auth",
+        value_name = "URL",
+        help_heading = "Connection"
+    )]
+    pub auth_endpoint: String,
+
+    /// Network timeout in seconds
+    #[arg(long, default_value = "120", help_heading = "Connection")]
+    pub timeout: u64,
+
+    /// New collection directory (on a target drive)
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub case: CaseArgs,
+
+    /// Scope: --include/--exclude are matched against `<label>/<internalDate>Z-<id>`
+    /// across every label on a message (excluded if any label matches an exclude,
+    /// included if no includes or any label matches one); the time window applies
+    /// to internalDate
+    #[command(flatten)]
+    pub scope: ScopeArgs,
+
+    #[command(flatten)]
+    pub clock: ClockArgs,
+
+    /// Also compute MD5 for every message
+    #[arg(long, help_heading = "Hashes")]
+    pub md5: bool,
+
+    /// Also compute SHA-1 for every message
     #[arg(long, help_heading = "Hashes")]
     pub sha1: bool,
 

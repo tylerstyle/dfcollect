@@ -419,7 +419,7 @@ impl Session<'_> {
 }
 
 /// The TLS sessions, with each host's certificates written to `tls/`
-fn tls_records(dir: &Path, http: &Client) -> Result<Value> {
+pub(crate) fn tls_records(dir: &Path, http: &Client) -> Result<Value> {
     std::fs::create_dir_all(dir.join("tls"))?;
     let mut out = serde_json::Map::new();
     for (host, tls) in &http.tls {

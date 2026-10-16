@@ -228,6 +228,7 @@ dependencies = [
  "digest 0.11.3",
  "libc",
  "md-5",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "serde",

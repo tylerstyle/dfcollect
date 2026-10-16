@@ -1,19 +1,32 @@
-//! Sign-in to Microsoft Graph through the Microsoft identity platform:
-//! - device code (delegated): the examiner signs in as the account holder on
-//!   any device with a browser; scopes `Mail.Read` and `offline_access`, so the
-//!   token is renewed during long acquisitions;
-//! - client credentials (the application permission `Mail.Read`, granted by
-//!   the tenant's admin): any mailbox of that tenant;
+//! Sign-in to Microsoft Graph (Microsoft identity platform) and Gmail (Google
+//! OAuth 2.0):
+//! - Microsoft Graph:
+//!   - device code (delegated): scopes `Mail.Read` and `offline_access`;
+//!   - client credentials (application permission `Mail.Read`);
+//! - Google Gmail (`https://www.googleapis.com/auth/gmail.readonly`):
+//!   - service account with domain-wide delegation (RS256 JWT assertion);
+//!   - installed desktop app (authorization code with PKCE S256 via loopback
+//!     listener or redirect URL pasted on stdin, renewed with refresh token);
 //! - an access token from a file, obtained some other way (not renewed).
 //!
 //! Tokens and secrets stay in memory. The record holds the method, client,
-//! tenant, granted scopes and the claims in the token that name the account
-//! and the app (read, not verified: the API verifies them).
+//! tenant/subject, granted scopes and the claims in the token that name the
+//! account and the app (read, not verified: the API verifies them).
 
 use crate::http::{form, Client};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+use ring::{
+    rand::{SecureRandom, SystemRandom},
+    signature::{RsaKeyPair, RSA_PKCS1_SHA256},
+};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use sha2::Digest;
+use std::{
+    io::{BufRead, BufReader, Write},
+    net::TcpListener,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 pub enum Flow {
     Device {
@@ -24,6 +37,18 @@ pub enum Flow {
         tenant: String,
         client_id: String,
         secret: String,
+    },
+    ServiceAccount {
+        client_email: String,
+        private_key_id: Option<String>,
+        project_id: Option<String>,
+        pkcs8_der: Vec<u8>,
+        mailbox: String,
+    },
+    Installed {
+        auth_url: String,
+        client_id: String,
+        client_secret: String,
     },
     Token(String),
 }
@@ -36,6 +61,14 @@ pub struct Auth {
     refresh: Option<String>,
     expires: Option<Instant>,
     pub renewals: u32,
+}
+
+/// URL-safe base64 without padding (RFC 4648 §5)
+pub fn b64url(data: &[u8]) -> String {
+    crate::mail::client::base64(data)
+        .trim_end_matches('=')
+        .replace('+', "-")
+        .replace('/', "_")
 }
 
 /// Base64 in either alphabet, padding optional
@@ -75,6 +108,116 @@ pub fn b64decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decode a PEM block (`-----BEGIN PRIVATE KEY-----`) to DER bytes
+pub fn pem_der(pem: &str) -> Option<Vec<u8>> {
+    let body: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("-----"))
+        .collect();
+    if body.is_empty() {
+        return None;
+    }
+    b64decode(&body)
+}
+
+/// Build and sign an RS256 JWT assertion with a PKCS#8 RSA private key
+pub fn sign_rs256_jwt(pkcs8_der: &[u8], key_id: Option<&str>, claims: &Value) -> Result<String> {
+    let key_pair = RsaKeyPair::from_pkcs8(pkcs8_der)
+        .map_err(|_| anyhow::anyhow!("invalid PKCS#8 RSA private_key"))?;
+    let header = match key_id {
+        Some(kid) if !kid.is_empty() => json!({ "alg": "RS256", "typ": "JWT", "kid": kid }),
+        _ => json!({ "alg": "RS256", "typ": "JWT" }),
+    };
+    let signing_input = format!(
+        "{}.{}",
+        b64url(header.to_string().as_bytes()),
+        b64url(claims.to_string().as_bytes())
+    );
+    let rng = SystemRandom::new();
+    let mut sig = vec![0u8; key_pair.public().modulus_len()];
+    key_pair
+        .sign(&RSA_PKCS1_SHA256, &rng, signing_input.as_bytes(), &mut sig)
+        .map_err(|_| anyhow::anyhow!("RSA-SHA256 signing failed"))?;
+    Ok(format!("{signing_input}.{}", b64url(&sig)))
+}
+
+/// Percent-decoding for query parameters (`+` -> space, `%XX` -> byte)
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether a request target or URL carries an OAuth redirect parameter (`state=` or `error=`)
+pub fn has_auth_params(input: &str) -> bool {
+    let no_frag = input.trim().split('#').next().unwrap_or("");
+    let Some((_, query)) = no_frag.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (k, _) = pair.split_once('=').unwrap_or((pair, ""));
+        matches!(percent_decode(k).as_str(), "state" | "error")
+    })
+}
+
+/// Extract and validate `code` and `state` from a loopback request target or
+/// a redirect URL pasted on stdin
+pub fn parse_auth_redirect(input: &str, expected_state: &str) -> Result<String> {
+    let no_frag = input.trim().split('#').next().unwrap_or("");
+    let query = no_frag.split_once('?').map_or(no_frag, |(_, q)| q);
+    let mut code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut error_desc = None;
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let k = percent_decode(k);
+        let v = percent_decode(v);
+        match k.as_str() {
+            "code" => code = Some(v),
+            "state" => state = Some(v),
+            "error" => error = Some(v),
+            "error_description" => error_desc = Some(v),
+            _ => {}
+        }
+    }
+    if let Some(err) = error {
+        bail!("sign-in refused: {err}: {}", error_desc.unwrap_or_default());
+    }
+    ensure!(
+        state.as_deref() == Some(expected_state),
+        "OAuth state mismatch in redirect URL"
+    );
+    let code = code
+        .filter(|c| !c.is_empty())
+        .context("redirect URL has no authorization code")?;
+    Ok(code)
+}
+
 /// The claims of a JWT access token that say who and what it is for, or
 /// `None` for an opaque token
 pub fn token_claims(token: &str) -> Option<Value> {
@@ -84,6 +227,9 @@ pub fn token_claims(token: &str) -> Option<Value> {
     for k in [
         "tid",
         "oid",
+        "sub",
+        "email",
+        "hd",
         "upn",
         "unique_name",
         "preferred_username",
@@ -91,6 +237,7 @@ pub fn token_claims(token: &str) -> Option<Value> {
         "azp",
         "app_displayname",
         "scp",
+        "scope",
         "roles",
         "aud",
         "iss",
@@ -156,7 +303,9 @@ impl Auth {
                 (tenant.clone(), scopes.join(" "))
             }
             Flow::App { tenant, .. } => (tenant.clone(), format!("{graph}/.default")),
-            Flow::Token(_) => (String::new(), String::new()),
+            Flow::Token(_) | Flow::ServiceAccount { .. } | Flow::Installed { .. } => {
+                (String::new(), String::new())
+            }
         };
         let token_url = format!("{login}/{}/oauth2/v2.0/token", crate::http::encode(&tenant));
         let mut auth = Auth {
@@ -197,6 +346,77 @@ impl Auth {
                     "claims": token_claims(&auth.access),
                 })
             }
+            Flow::ServiceAccount { .. } | Flow::Installed { .. } => {
+                bail!("use sign_in_google for Google OAuth flows")
+            }
+        };
+        Ok((auth, record))
+    }
+
+    /// Sign in to Google APIs (`token`, `service-account`, or `installed`).
+    pub fn sign_in_google(
+        http: &mut Client,
+        flow: Flow,
+        token_url: &str,
+        scope: &str,
+    ) -> Result<(Self, Value)> {
+        let mut auth = Auth {
+            flow,
+            token_url: token_url.to_string(),
+            scope: scope.to_string(),
+            access: String::new(),
+            refresh: None,
+            expires: None,
+            renewals: 0,
+        };
+        let record = match &auth.flow {
+            Flow::Token(t) => {
+                auth.access = t.clone();
+                json!({ "method": "access token from a file", "claims": token_claims(t) })
+            }
+            Flow::ServiceAccount {
+                client_email,
+                private_key_id,
+                project_id,
+                mailbox,
+                ..
+            } => {
+                let client_email = client_email.clone();
+                let private_key_id = private_key_id.clone();
+                let project_id = project_id.clone();
+                let mailbox = mailbox.clone();
+                let granted = auth.renew_inner(http)?;
+                json!({
+                    "method": "service account (domain-wide delegation)",
+                    "client_email": client_email,
+                    "private_key_id": private_key_id,
+                    "project_id": project_id,
+                    "subject": mailbox,
+                    "scope_requested": auth.scope,
+                    "scope_granted": granted,
+                    "claims": token_claims(&auth.access),
+                })
+            }
+            Flow::Installed {
+                auth_url,
+                client_id,
+                client_secret,
+            } => {
+                let auth_url = auth_url.clone();
+                let client_id = client_id.clone();
+                let client_secret = client_secret.clone();
+                let granted = auth.installed(http, &auth_url, &client_id, &client_secret)?;
+                json!({
+                    "method": "installed application (OAuth 2.0 authorization code with PKCE)",
+                    "client_id": client_id,
+                    "scope_requested": auth.scope,
+                    "scope_granted": granted,
+                    "claims": token_claims(&auth.access),
+                })
+            }
+            Flow::Device { .. } | Flow::App { .. } => {
+                bail!("use sign_in for Microsoft Graph flows")
+            }
         };
         Ok((auth, record))
     }
@@ -214,6 +434,120 @@ impl Auth {
             .or_else(|| v["expires_in"].as_str().and_then(|s| s.parse().ok()))
             .map(|s| Instant::now() + Duration::from_secs(s));
         Ok(v["scope"].as_str().map(str::to_string))
+    }
+
+    fn installed(
+        &mut self,
+        http: &mut Client,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<Option<String>> {
+        let rng = SystemRandom::new();
+        let mut vbytes = [0u8; 32];
+        let mut sbytes = [0u8; 16];
+        rng.fill(&mut vbytes)
+            .map_err(|_| anyhow::anyhow!("random generator failed"))?;
+        rng.fill(&mut sbytes)
+            .map_err(|_| anyhow::anyhow!("random generator failed"))?;
+        let verifier = b64url(&vbytes);
+        let challenge = b64url(&sha2::Sha256::digest(verifier.as_bytes()));
+        let state = b64url(&sbytes);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .context("cannot bind loopback listener on 127.0.0.1")?;
+        let port = listener.local_addr()?.port();
+        let redirect_uri = format!("http://127.0.0.1:{port}");
+        let query = form(&[
+            ("response_type", "code"),
+            ("client_id", client_id),
+            ("redirect_uri", &redirect_uri),
+            ("scope", &self.scope),
+            ("state", &state),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+        ]);
+        let full_url = format!("{}?{query}", auth_url.trim_end_matches('?'));
+        eprintln!("[!] Signing in can notify the account holder (new sign-in / third-party access alerts).");
+        eprintln!("[?] Open this URL in a browser (or on another device and paste the redirect URL here):");
+        eprintln!("{full_url}");
+
+        let (tx, rx) = mpsc::channel::<Result<String>>();
+        let tx_tcp = tx.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                let mut req_line = String::new();
+                {
+                    let mut reader = BufReader::new(&mut stream);
+                    let _ = reader.read_line(&mut req_line);
+                }
+                let target = req_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let is_redirect = has_auth_params(&target);
+                let (status, body): (&str, &[u8]) = if is_redirect {
+                    (
+                        "200 OK",
+                        b"Sign-in received. You may close this browser tab.\n",
+                    )
+                } else {
+                    ("404 Not Found", b"Waiting for OAuth redirect.\n")
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body);
+                let _ = stream.flush();
+                if is_redirect {
+                    let _ = tx_tcp.send(Ok(target));
+                    break;
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdin.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let _ = tx.send(Ok(trimmed.to_string()));
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let received = rx
+            .recv_timeout(Duration::from_secs(900))
+            .context("timed out waiting for the OAuth redirect or pasted URL")??;
+        let code = parse_auth_redirect(&received, &state)?;
+
+        let url = self.token_url.clone();
+        let (status, v) = token_request(
+            http,
+            &url,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("redirect_uri", &redirect_uri),
+                ("code_verifier", &verifier),
+            ],
+        )?;
+        if status != 200 {
+            bail!("token request refused: {}", error_of(&v));
+        }
+        self.take(&v)
     }
 
     fn device(
@@ -281,39 +615,84 @@ impl Auth {
 
     fn renew_inner(&mut self, http: &mut Client) -> Result<Option<String>> {
         let url = self.token_url.clone();
-        let (status, v) = match &self.flow {
-            Flow::App {
-                client_id, secret, ..
-            } => token_request(
-                http,
-                &url,
-                &[
-                    ("grant_type", "client_credentials"),
-                    ("client_id", client_id),
-                    ("client_secret", secret),
-                    ("scope", &self.scope),
-                ],
-            )?,
-            Flow::Device { client_id, .. } => {
-                let refresh = self
-                    .refresh
-                    .clone()
-                    .context("the token expired and there is no refresh token; sign in again")?;
-                token_request(
+        let (status, v) =
+            match &self.flow {
+                Flow::App {
+                    client_id, secret, ..
+                } => token_request(
                     http,
                     &url,
                     &[
-                        ("grant_type", "refresh_token"),
+                        ("grant_type", "client_credentials"),
                         ("client_id", client_id),
-                        ("refresh_token", &refresh),
+                        ("client_secret", secret),
                         ("scope", &self.scope),
                     ],
-                )?
-            }
-            Flow::Token(_) => {
-                bail!("the access token from the file expired or was refused; get a new one")
-            }
-        };
+                )?,
+                Flow::Device { client_id, .. } => {
+                    let refresh = self.refresh.clone().context(
+                        "the token expired and there is no refresh token; sign in again",
+                    )?;
+                    token_request(
+                        http,
+                        &url,
+                        &[
+                            ("grant_type", "refresh_token"),
+                            ("client_id", client_id),
+                            ("refresh_token", &refresh),
+                            ("scope", &self.scope),
+                        ],
+                    )?
+                }
+                Flow::ServiceAccount {
+                    client_email,
+                    private_key_id,
+                    pkcs8_der,
+                    mailbox,
+                    ..
+                } => {
+                    let now = dfcore::host::unix_now();
+                    let claims = json!({
+                        "iss": client_email,
+                        "sub": mailbox,
+                        "scope": &self.scope,
+                        "aud": &url,
+                        "iat": now,
+                        "exp": now + 3600,
+                    });
+                    let assertion = sign_rs256_jwt(pkcs8_der, private_key_id.as_deref(), &claims)?;
+                    token_request(
+                        http,
+                        &url,
+                        &[
+                            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                            ("assertion", &assertion),
+                        ],
+                    )?
+                }
+                Flow::Installed {
+                    client_id,
+                    client_secret,
+                    ..
+                } => {
+                    let refresh = self.refresh.clone().context(
+                        "the token expired and there is no refresh token; sign in again",
+                    )?;
+                    token_request(
+                        http,
+                        &url,
+                        &[
+                            ("grant_type", "refresh_token"),
+                            ("client_id", client_id),
+                            ("client_secret", client_secret),
+                            ("refresh_token", &refresh),
+                        ],
+                    )?
+                }
+                Flow::Token(_) => {
+                    bail!("the access token from the file expired or was refused; get a new one")
+                }
+            };
         if status != 200 {
             bail!("token request refused: {}", error_of(&v));
         }
@@ -361,17 +740,33 @@ mod tests {
     #[test]
     fn claims_of_a_token() {
         let payload = r#"{"tid":"t1","upn":"alice@example.org","scp":"Mail.Read","exp":1800000000,"secret_stuff":1}"#;
-        let enc = |b: &[u8]| {
-            crate::mail::client::base64(b)
-                .trim_end_matches('=')
-                .replace('+', "-")
-                .replace('/', "_")
-        };
-        let token = format!("{}.{}.sig", enc(b"{}"), enc(payload.as_bytes()));
+        let token = format!("{}.{}.sig", b64url(b"{}"), b64url(payload.as_bytes()));
         let c = token_claims(&token).unwrap();
         assert_eq!(c["upn"], "alice@example.org");
         assert_eq!(c["exp"], "2027-01-15T08:00:00Z");
         assert!(c.get("secret_stuff").is_none());
         assert!(token_claims("opaque-token").is_none());
+    }
+
+    #[test]
+    fn redirect_url_parsing_and_state_check() {
+        assert!(!has_auth_params(""));
+        assert!(!has_auth_params("/"));
+        assert!(!has_auth_params("/favicon.ico"));
+        assert!(!has_auth_params("/?foo=bar"));
+        assert!(has_auth_params("/?code=ok&state=st123"));
+        assert!(has_auth_params("/?error=access_denied"));
+        let code = parse_auth_redirect(
+            "http://127.0.0.1:43210/?state=st123&code=4%2F0Abc-xyz&scope=email#frag",
+            "st123",
+        )
+        .unwrap();
+        assert_eq!(code, "4/0Abc-xyz");
+        assert_eq!(
+            parse_auth_redirect("/?code=ok&state=st123", "st123").unwrap(),
+            "ok"
+        );
+        assert!(parse_auth_redirect("/?code=ok&state=wrong", "st123").is_err());
+        assert!(parse_auth_redirect("/?error=access_denied&state=st123", "st123").is_err());
     }
 }

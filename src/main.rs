@@ -7,6 +7,7 @@ mod common;
 mod container;
 mod db;
 mod files;
+mod gmail;
 mod graph;
 mod http;
 mod m365logs;
@@ -97,6 +98,10 @@ fn main() -> ExitCode {
             o.code
         }),
         args::Command::M365Logs(a) => m365logs::run(a, &STOP).map(|o| {
+            print(a.json, &o.summary);
+            o.code
+        }),
+        args::Command::Gmail(a) => gmail::run(a, &STOP).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),

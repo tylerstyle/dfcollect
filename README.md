@@ -7,8 +7,8 @@ that records what was taken, what was left out and how.
 dfcollect is part of the dfnix tool suite, alongside dfdisk (disk imaging),
 dfmount (read-only mounts), dfnet (network shares and streams) and dfcore
 (shared safety core and audit log). Where dfdisk images whole devices,
-dfcollect acquires files, mailboxes (IMAP, Microsoft 365), Microsoft 365 logs,
-cloud data and databases.
+dfcollect acquires files, mailboxes (IMAP, Microsoft 365, Gmail), Microsoft 365
+logs, cloud data and databases.
 
 ## What `dfcollect files` does
 
@@ -251,6 +251,61 @@ dfcollect db mariadb --host 10.0.0.5 --user examiner --database shop --tls requi
 6. **What a dump doesn't show.** A logical dump shows the current state only.
    Deleted rows survive in data files and in WAL/binlog. For those, add a
    file-level copy (from a filesystem snapshot) or the disk image.
+## What `dfcollect gmail` does
+
+Google Workspace and Gmail mailboxes through the Gmail API (`gmail.readonly`,
+`format=raw`). Unlike Gmail over IMAP, where a message with several labels is
+listed in several folders, the Gmail API stores each message once with all its
+labels recorded.
+
+```bash
+dfcollect gmail --auth service-account --key-file /run/sa.json \
+  --mailbox anna@contoso.org \
+  -o /media/target/case01/anna-gmail \
+  -C "VG 12345/26" -E mail03 -e "KHK Muster" \
+  --exclude "SPAM/**" \
+  --not-before 2026-01-01T00:00:00+01:00 --not-after 2026-07-01T00:00:00+02:00
+```
+
+1. **Sign-in (`--auth`):**
+   - `--auth service-account` (Google Workspace, with the admin's cooperation
+     and domain-wide delegation): give `--key-file sa.json` and
+     `--mailbox user@domain`. dfcollect signs an RS256 JWT assertion with the
+     service account's private key for scope
+     `https://www.googleapis.com/auth/gmail.readonly` and renews it during long
+     runs.
+   - `--auth installed` (the default; the account holder signs in): give
+     `--client-id` and `--client-secret-file` of a Desktop app OAuth client.
+     dfcollect runs the authorization-code flow with PKCE (`S256`) and prints
+     the authorization URL; it accepts the redirect either on its `127.0.0.1`
+     loopback listener (browser on dfnix) or when the full redirect URL is
+     pasted on `stdin` (browser on another device), verifies `state`, and
+     renews with the refresh token.
+   - `--auth token`: an access token with `gmail.readonly` from `--token-file`
+     (not renewed).
+2. **Read-only by API.** Only GET requests reach the Gmail API, and the
+   `gmail.readonly` scope cannot modify messages, labels or `UNREAD`. The token
+   is sent only to `--gmail-endpoint`.
+3. **Labels are not folders.** Every message (including `SPAM` and `TRASH`,
+   `includeSpamTrash=true`) is listed first, then its minimal metadata
+   (`?format=minimal`: `labelIds`, `internalDate`, `sizeEstimate`, `threadId`,
+   `historyId`) is fetched. Each in-scope message is stored once under its
+   first label in the order `INBOX`, `SENT`, `DRAFT`, `SPAM`, `TRASH`, then
+   user labels by name, else `All Mail`, as
+   `<label>/<internalDate compact>Z-<id>.eml` in `data.zip`.
+4. **Scope before download.** The time window applies to `internalDate`
+   (`"time_basis": "internalDate"`). Include and exclude patterns are matched
+   against `<label>/<internalDate compact>Z-<id>` once for every label the
+   message carries:
+   - excluded if any label path matches an exclude pattern (e.g. `SPAM/**`);
+   - otherwise included if there are no includes, or if any label path matches
+     one.
+5. **Exact RFC 2822 bytes.** For in-scope messages, `?format=raw` returns the
+   exact RFC 2822 message bytes. Each item carries `id`, `threadId`, `labels`
+   (IDs and names), `internalDate` (RFC 3339), `sizeEstimate` and `historyId`.
+6. **Footprint.** Google Workspace logs OAuth token grants for service accounts
+   in the Token Audit Log; an `installed` sign-in can send a "new sign-in" or
+   "third-party access" alert to the account holder.
 
 ## The collection directory
 
