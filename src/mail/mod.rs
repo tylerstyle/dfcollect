@@ -457,6 +457,19 @@ impl Session<'_> {
                     Ok(_) => {}
                     Err(CopyError::Container(e)) => return Err(e),
                     Err(CopyError::Source(e)) => return Err(e.into()),
+                    // Two folder names that normalize alike: keep going
+                    Err(CopyError::Duplicate(name)) => {
+                        let mut item =
+                            Item::new(ItemStatus::Error, format!("{}/{uid}", folder.name));
+                        item.kind = Some("message".into());
+                        item.account = Some(args.user.clone());
+                        item.reason =
+                            Some(format!("another message already has the container name {name}"));
+                        item.metadata =
+                            json!({ "folder": folder.name, "uidvalidity": uidvalidity, "uid": uid });
+                        collection.add(item)?;
+                        return Ok(());
+                    }
                 }
                 bytes += body.len() as u64;
                 let mut item = Item::new(ItemStatus::Acquired, format!("{}/{uid}", folder.name));
@@ -510,6 +523,22 @@ impl Session<'_> {
     fn folder(&mut self, folder: &Folder) -> Result<()> {
         if let Some(reason) = self.folder_scope(&folder.name) {
             self.collection.count_out_of_scope(&reason);
+            return Ok(());
+        }
+        if std::str::from_utf8(&folder.raw)
+            .ok()
+            .and_then(client::quote)
+            .is_none()
+        {
+            // Not modified UTF-7 as IMAP4rev1 requires: record it, go on
+            let mut item = Item::new(ItemStatus::Error, folder.name.clone());
+            item.kind = Some("folder".into());
+            item.account = Some(self.args.user.clone());
+            item.reason = Some(
+                "the server lists this folder under a name that cannot be sent back as a quoted string; not opened"
+                    .into(),
+            );
+            self.collection.add(item)?;
             return Ok(());
         }
         let (uidvalidity, exists) = self.examine(folder)?;
@@ -741,7 +770,7 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
             "greeting": greeting_text.join(" "),
             "capabilities": caps_after,
             "tls": tls_json,
-        }));
+        }))?;
         for folder in session.list()? {
             if stop.load(Ordering::Relaxed) {
                 bail!("stopped by a signal");

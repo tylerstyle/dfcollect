@@ -312,3 +312,28 @@ fn refuses_unsafe_destinations_and_bad_arguments() {
     // Nothing was created by any refused run
     assert!(!out.exists());
 }
+
+#[test]
+fn a_container_name_collision_fails_one_item_not_the_collection() {
+    let s = Scratch::new("collide");
+    std::fs::write(
+        s.src().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")),
+        b"latin1",
+    )
+    .unwrap();
+    s.write("caf%E9.txt", b"literal");
+    s.write("z.txt", b"after");
+    let (code, summary, err) = files(&s, &[]);
+    assert_eq!(code, 7, "{summary} {err}");
+    assert_eq!(summary["acquired"], 2, "{summary}");
+    assert_eq!(summary["errors"], 1, "{summary}");
+    let it = items(&s.out());
+    let failed: Vec<_> = it.iter().filter(|i| i["status"] == "error").collect();
+    assert!(failed[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("already has the container name"));
+    let out = s.out();
+    let (code, _, _) = dfcollect(&s, &["verify", out.to_str().unwrap()]);
+    assert_eq!(code, 0);
+}

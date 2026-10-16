@@ -8,7 +8,7 @@
 //! manifest holds every time at full precision either way.
 
 use crate::meta::Stamps;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use digest::Digest;
 use std::{
     collections::HashSet,
@@ -109,12 +109,14 @@ impl Hasher {
     }
 }
 
-/// Why copying a member failed: the source could not be read (the item fails,
-/// the collection goes on) or the container could not be written (the
-/// collection cannot go on).
+/// Why copying a member failed: the source could not be read, or the name is
+/// taken (the item fails, the collection goes on), or the container could not
+/// be written (the collection cannot go on).
 #[derive(Debug)]
 pub enum CopyError {
     Source(std::io::Error),
+    /// Another entry already has this member name
+    Duplicate(String),
     Container(anyhow::Error),
 }
 
@@ -171,9 +173,9 @@ impl Container {
         Ok(options)
     }
 
-    fn claim(&mut self, name: &str) -> Result<()> {
+    fn claim(&mut self, name: &str) -> std::result::Result<(), CopyError> {
         if !self.names.insert(name.to_string()) {
-            bail!("{name}: already in the container");
+            return Err(CopyError::Duplicate(name.to_string()));
         }
         Ok(())
     }
@@ -187,7 +189,7 @@ impl Container {
         source: &mut impl Read,
         hasher: &mut Hasher,
     ) -> std::result::Result<u64, CopyError> {
-        self.claim(name).map_err(CopyError::Container)?;
+        self.claim(name)?;
         let options = self.options(mode, stamps).map_err(CopyError::Container)?;
         self.zip
             .start_file(name, options)
@@ -220,12 +222,18 @@ impl Container {
     }
 
     /// A directory entry (`name` ends with '/'), so its times reach the suites.
-    pub fn add_directory(&mut self, name: &str, mode: u32, stamps: &Stamps) -> Result<()> {
+    pub fn add_directory(
+        &mut self,
+        name: &str,
+        mode: u32,
+        stamps: &Stamps,
+    ) -> std::result::Result<(), CopyError> {
         self.claim(name)?;
-        let options = self.options(mode, stamps)?;
+        let options = self.options(mode, stamps).map_err(CopyError::Container)?;
         self.zip
             .add_directory(name, options)
             .with_context(|| format!("Cannot add directory {name}"))
+            .map_err(CopyError::Container)
     }
 
     /// Write the central directory and sync the file.
@@ -330,7 +338,7 @@ mod tests {
                 &mut &b"again"[..],
                 &mut Hasher::new(false, false)
             ),
-            Err(CopyError::Container(_))
+            Err(CopyError::Duplicate(_))
         ));
         // A source that fails after some bytes leaves no partial member
         struct Failing(usize);

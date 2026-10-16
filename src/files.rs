@@ -324,11 +324,20 @@ impl Walk<'_> {
         match self.decide(rel, time_of(stamps, self.args.scope.time_basis)) {
             Decision::OutOfScope(_) => {}
             Decision::InScope => {
-                if let Err(e) = self
+                match self
                     .container
                     .add_directory(&format!("{rel}/"), md.mode(), stamps)
                 {
-                    return Ok(Step::Fatal(format!("{e:#}")));
+                    Ok(()) => {}
+                    Err(CopyError::Container(e)) => return Ok(Step::Fatal(format!("{e:#}"))),
+                    Err(CopyError::Duplicate(name)) => {
+                        self.error_item(rel, Kind::Directory, duplicate_reason(&name))?;
+                        return Ok(Step::Continue);
+                    }
+                    Err(CopyError::Source(e)) => {
+                        self.error_item(rel, Kind::Directory, format!("{e}"))?;
+                        return Ok(Step::Continue);
+                    }
                 }
                 let mut item = Item::new(ItemStatus::Acquired, rel);
                 item.kind = Kind::Directory.item_kind();
@@ -368,6 +377,10 @@ impl Walk<'_> {
             Ok(n) => n,
             Err(CopyError::Source(e)) => {
                 self.error_item(rel, Kind::File, format!("read error: {e}"))?;
+                return Ok(Step::Continue);
+            }
+            Err(CopyError::Duplicate(name)) => {
+                self.error_item(rel, Kind::File, duplicate_reason(&name))?;
                 return Ok(Step::Continue);
             }
             Err(CopyError::Container(e)) => return Ok(Step::Fatal(format!("{e:#}"))),
@@ -416,6 +429,14 @@ impl Walk<'_> {
         self.collection.add(item)?;
         Ok(Step::Continue)
     }
+}
+
+/// Two source names can map to one container name when one of them is not
+/// UTF-8 and the other spells its `%XX` escape literally.
+fn duplicate_reason(name: &str) -> String {
+    format!(
+        "another entry already has the container name {name} (names that are not UTF-8 are stored with %XX escapes)"
+    )
 }
 
 /// Entries of a directory, sorted by their bytes so every run walks in the
