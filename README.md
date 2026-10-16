@@ -7,7 +7,8 @@ that records what was taken, what was left out and how.
 dfcollect is part of the dfnix tool suite, alongside dfdisk (disk imaging),
 dfmount (read-only mounts), dfnet (network shares and streams) and dfcore
 (shared safety core and audit log). Where dfdisk images whole devices,
-dfcollect acquires files, and later mail, cloud data and databases.
+dfcollect acquires files and mailboxes (IMAP, Microsoft 365), and later cloud
+data and databases.
 
 ## What `dfcollect files` does
 
@@ -84,6 +85,63 @@ dfcollect imap mail.example.org --user anna@example.org --password-file /run/pw 
 
 Logging in can make the provider notify the account owner ("new sign-in"),
 which can tip off a suspect. Prefer provider orders where that matters.
+
+## What `dfcollect graph` does
+
+Microsoft 365 (Exchange Online) mailboxes through Microsoft Graph. Exchange Web
+Services is being switched off in Exchange Online, so EWS-based tools stop
+working; Graph is the way in.
+
+```bash
+dfcollect graph --client-id 00000000-0000-0000-0000-000000000000 --tenant contoso.onmicrosoft.com \
+  -o /media/target/case01/anna-m365 \
+  -C "VG 12345/26" -E mail02 -e "KHK Muster" \
+  --exclude "Junk Email/**" \
+  --not-before 2026-01-01T00:00:00+01:00 --not-after 2026-07-01T00:00:00+02:00
+```
+
+1. **Sign-in.** You need an app registration of your own (the client id):
+   - `--auth device` (the default): someone signs in as the account holder with
+     a device code, on any device with a browser. The registration must allow
+     public client flows and have the delegated permission `Mail.Read`. The
+     token is renewed with `offline_access` during long runs.
+   - `--auth app`: with the tenant's cooperation. The admin grants the
+     application permission `Mail.Read`; give `--tenant`,
+     `--mailbox user@domain` and the secret with `--client-secret-file`.
+   - `--auth token`: an access token from `--token-file`, obtained some other
+     way. It is not renewed.
+
+   Tokens and secrets stay in memory. The record holds the method, the client,
+   the tenant, the granted scopes, and the claims in the token that name the
+   account and the app.
+2. **Read-only by API.** Only GET requests go to Graph, so nothing in the
+   mailbox changes, `isRead` included. dfcollect sends the token to the Graph
+   endpoint only; a paging link to another host is refused.
+3. **Every folder.** All levels and hidden folders, plus Recoverable Items
+   (deletions). Search folders are skipped, since they only point at other
+   folders.
+4. **Scope before download.** Each folder's message metadata is fetched first.
+   Every message is then decided on its folder and its `receivedDateTime` before
+   its body is fetched. Patterns match `<folder>/<received>Z-<id hash>`, with
+   `/` between folder levels; a `/` inside a folder name is written `%2F`.
+5. **What is stored.** Each body is stored as Exchange's MIME rendition
+   (`/messages/{id}/$value`), as `<folder>/<received>Z-<id hash>.eml`. Exchange
+   converts the stored item to MIME, so the bytes need not be those once
+   received; the manifest says so. Each item carries Graph's metadata:
+   - the immutable id, so it stays stable when a message moves;
+   - Internet message id, sender and recipients, the times, `isRead`, flags and
+     categories;
+   - Exchange's own size of the item.
+6. **The connection is evidence too.** The TLS sessions with their
+   certificates (saved under `tls/`) are recorded, and so are the requests and
+   the bytes in both directions. So are the waits when Graph throttles (429,
+   `Retry-After`) and the token renewals.
+7. **National clouds.** `--graph-endpoint` and `--login-endpoint`.
+
+On the tenant's side the sign-in is logged, and Exchange may log
+MailItemsAccessed in the Unified Audit Log. A sign-in as the account holder can
+notify them. Prefer provider orders or the tenant's cooperation where that
+matters.
 
 ## The collection directory
 

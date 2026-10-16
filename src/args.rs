@@ -22,6 +22,8 @@ pub enum Command {
     Files(Box<FilesArgs>),
     /// Acquire a mailbox over IMAP, read-only by protocol (EXAMINE, BODY.PEEK[])
     Imap(Box<ImapArgs>),
+    /// Acquire a Microsoft 365 mailbox through Microsoft Graph (GET only)
+    Graph(Box<GraphArgs>),
     /// Re-check a collection: records, container members and audit anchors
     Verify(VerifyArgs),
 }
@@ -245,6 +247,103 @@ pub struct ImapArgs {
 
     /// Scope: --include/--exclude match `<folder>/<uid>` (folders with `/`
     /// between levels, e.g. `INBOX/**`); the time window applies to INTERNALDATE
+    #[command(flatten)]
+    pub scope: ScopeArgs,
+
+    #[command(flatten)]
+    pub clock: ClockArgs,
+
+    /// Also compute MD5 for every message
+    #[arg(long, help_heading = "Hashes")]
+    pub md5: bool,
+
+    /// Also compute SHA-1 for every message
+    #[arg(long, help_heading = "Hashes")]
+    pub sha1: bool,
+
+    /// Deflate the container members
+    #[arg(long, help_heading = "Output")]
+    pub compress: bool,
+
+    /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
+    #[arg(long, help_heading = "Safety")]
+    pub allow_tmpfs: bool,
+
+    /// Print the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct GraphArgs {
+    /// Mailbox: `me` (the account signed in with --auth device) or a user's
+    /// address, UPN or id
+    #[arg(
+        long,
+        default_value = "me",
+        value_name = "MAILBOX",
+        help_heading = "Account"
+    )]
+    pub mailbox: String,
+
+    /// device: sign in as the account (device code, delegated Mail.Read);
+    /// app: application permission Mail.Read, with the tenant's cooperation;
+    /// token: an access token from --token-file
+    #[arg(long, value_enum, default_value = "device", help_heading = "Account")]
+    pub auth: crate::graph::GraphAuth,
+
+    /// Tenant id or domain (`organizations`: any work or school account)
+    #[arg(long, default_value = "organizations", help_heading = "Account")]
+    pub tenant: String,
+
+    /// Application (client) id of your app registration (public client flows
+    /// allowed for --auth device)
+    #[arg(long, value_name = "ID", help_heading = "Account")]
+    pub client_id: Option<String>,
+
+    /// File whose first line is the client secret (--auth app; default: asked
+    /// on the terminal)
+    #[arg(long, value_name = "FILE", help_heading = "Account")]
+    pub client_secret_file: Option<PathBuf>,
+
+    /// File whose first line is an access token for Graph (--auth token)
+    #[arg(long, value_name = "FILE", help_heading = "Account")]
+    pub token_file: Option<PathBuf>,
+
+    /// Graph endpoint (national clouds: https://graph.microsoft.us,
+    /// https://dod-graph.microsoft.us, https://microsoftgraph.chinacloudapi.cn)
+    #[arg(
+        long,
+        default_value = "https://graph.microsoft.com",
+        value_name = "URL",
+        help_heading = "Connection"
+    )]
+    pub graph_endpoint: String,
+
+    /// Identity platform (national clouds: https://login.microsoftonline.us,
+    /// https://login.chinacloudapi.cn)
+    #[arg(
+        long,
+        default_value = "https://login.microsoftonline.com",
+        value_name = "URL",
+        help_heading = "Connection"
+    )]
+    pub login_endpoint: String,
+
+    /// Network timeout in seconds
+    #[arg(long, default_value = "120", help_heading = "Connection")]
+    pub timeout: u64,
+
+    /// New collection directory (on a target drive)
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub case: CaseArgs,
+
+    /// Scope: --include/--exclude match `<folder>/<received>Z-<id hash>`
+    /// (folders with `/` between levels, e.g. `Inbox/**`); the time window
+    /// applies to receivedDateTime
     #[command(flatten)]
     pub scope: ScopeArgs,
 

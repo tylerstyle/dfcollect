@@ -32,6 +32,7 @@
         checks = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           vm = import ./tests/vm.nix { inherit pkgs dfcollect; };
           imap = import ./tests/imap.nix { inherit pkgs dfcollect; };
+          graph = import ./tests/graph.nix { inherit pkgs dfcollect; };
         };
 
         devShells.default = pkgs.mkShell {

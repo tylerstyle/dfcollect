@@ -1,0 +1,133 @@
+# dfcollect graph against a mock of Microsoft Graph and the identity platform
+# (tests/graph-mock.py), over TLS checked against the system CAs:
+# - device-code sign-in (one pending poll), folders over two pages, a hidden
+#   child folder with "/" in its name, a search folder (skipped), Recoverable
+#   Items deletions; the scope takes a time window and excludes Junk Email,
+#   whose messages are never listed;
+# - a 429 is waited out, a revoked token renewed with the refresh token;
+# - only GET requests reach Graph, all with immutable ids; the stored .eml
+#   files are the served bytes;
+# - a nextLink to another host never gets the token; a wrong client secret
+#   aborts before anything is read.
+#
+#   nix-build tests/graph.nix          (dfcore from ../dfcore)
+{ pkgs ? import <nixpkgs> { }
+, dfcollect ? pkgs.callPackage ../package.nix { }
+}:
+
+let
+  certs = pkgs.runCommand "dfcollect-graph-certs" { nativeBuildInputs = [ pkgs.openssl ]; } ''
+    mkdir $out && cd $out
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=dfcollect-test-ca \
+      -keyout ca-key.pem -out ca.pem 2>/dev/null
+    openssl req -newkey rsa:2048 -nodes -subj /CN=server -keyout key.pem -out server.csr 2>/dev/null
+    printf 'basicConstraints=CA:FALSE\nsubjectAltName=DNS:server\nextendedKeyUsage=serverAuth\n' > ext
+    openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 3650 \
+      -extfile ext -out leaf.pem 2>/dev/null
+    cat leaf.pem ca.pem > cert.pem
+  '';
+in
+pkgs.testers.runNixOSTest {
+  name = "dfcollect-graph";
+
+  nodes.server = {
+    networking.firewall.enable = false;
+    systemd.services.graph-mock = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${./graph-mock.py} 8443 ${certs}/cert.pem ${certs}/key.pem /var/lib/requests.jsonl /var/lib/bodies.json";
+    };
+  };
+
+  nodes.client = {
+    networking.firewall.enable = false;
+    security.pki.certificateFiles = [ "${certs}/ca.pem" ];
+    environment.systemPackages = [ dfcollect pkgs.python3 ];
+  };
+
+  testScript = ''
+    import base64, hashlib, json
+
+    def run(out, *extra):
+        return client.execute(
+            f"dfcollect graph --graph-endpoint https://server:8443 --login-endpoint https://server:8443"
+            f" --tenant tenant1 --client-id test-client -o {out} -C CASE-GRAPH -E mbx01 -e tester"
+            " --exclude 'Junk Email/**' --not-before 2026-02-01T00:00:00Z --not-after 2026-06-01T00:00:00Z"
+            " --json " + " ".join(extra)
+        )
+
+    def requests():
+        return [json.loads(l) for l in server.succeed("cat /var/lib/requests.jsonl").splitlines()]
+
+    start_all()
+    server.wait_for_unit("graph-mock.service")
+    server.wait_for_open_port(8443)
+    client.wait_for_unit("multi-user.target")
+    client.succeed("mkdir -p /target")
+    bodies = json.loads(server.succeed("cat /var/lib/bodies.json"))
+
+    with subtest("device code sign-in; only in-scope messages are fetched, byte for byte"):
+        code, stdout = run("/target/dev")
+        assert code == 0, (code, stdout)
+        summary = json.loads(stdout)
+        assert summary["messages"] == 5, summary
+        items = [json.loads(l) for l in client.succeed("cat /target/dev/items.jsonl").splitlines()]
+        got = {i["metadata"]["subject"]: i for i in items}
+        assert sorted(got) == ["m1", "m2", "m4", "m6 sent", "m7 deleted"], sorted(got)
+        for subject, item in got.items():
+            want = hashlib.sha256(base64.b64decode(bodies[subject])).hexdigest()
+            assert item["hashes"]["sha256"] == want, (subject, item)
+            assert item["status"] == "acquired", item
+        assert got["m4"]["path"].startswith("Inbox/Projekte%2F2026/20260501T100000Z-"), got["m4"]
+        assert got["m7 deleted"]["path"].startswith("Recoverable Items/Deletions/"), got["m7 deleted"]
+        assert got["m2"]["metadata"]["isRead"] is False and got["m1"]["metadata"]["isRead"] is True
+        assert got["m2"]["account"] == "alice@contoso.test", got["m2"]
+        assert got["m2"]["metadata"]["exchange_size"] > 1000, got["m2"]
+        assert "@odata.etag" not in got["m2"]["metadata"], got["m2"]
+        manifest = json.loads(client.succeed("cat /target/dev/manifest.json"))
+        assert manifest["source"]["kind"] == "microsoft-graph", manifest["source"]
+        ident = manifest["source"]["identity"]
+        assert ident["user"]["userPrincipalName"] == "alice@contoso.test", ident
+        assert ident["auth"]["method"] == "device code (delegated)", ident["auth"]
+        assert ident["auth"]["claims"]["upn"] == "alice@contoso.test", ident["auth"]
+        assert ident["tls"]["server:8443"]["verified_by"].startswith("system CA"), ident["tls"]
+        counted = manifest["totals"]["unlisted_out_of_scope"]
+        assert counted == {
+            "receivedDateTime before the time window": 1,
+            "folder excluded by Junk Email/**": 1,
+        }, counted
+        footprint = [json.loads(l) for l in client.succeed("cat /target/dev/footprint.jsonl").splitlines()]
+        last = [f for f in footprint if f["kind"] == "disconnect"][0]["detail"]
+        assert last["throttled_waits"] == 1 and last["token_renewals"] == 1, last
+        client.succeed("dfcollect verify /target/dev")
+        names = json.loads(client.succeed(
+            "python3 -c \"import zipfile,json; print(json.dumps(zipfile.ZipFile('/target/dev/data.zip').namelist()))\""
+        ))
+        assert sorted(n for n in names if n.endswith(".eml")) == sorted(i["member"] for i in items), names
+        # Graph saw only GETs (the POSTs went to the identity platform), all with immutable ids
+        reqs = requests()
+        graph = [r for r in reqs if r["path"].startswith("/v1.0/")]
+        assert {r["method"] for r in graph} == {"GET"}, graph
+        assert all(r["prefer"] == 'IdType="ImmutableId"' for r in graph), graph
+        assert {r["path"].split("?")[0] for r in reqs if r["method"] == "POST"} == {
+            "/tenant1/oauth2/v2.0/devicecode", "/tenant1/oauth2/v2.0/token"}, reqs
+        assert not any("/mailFolders/junk/messages" in r["path"] for r in reqs), "Junk was listed"
+        assert not any("/mailFolders/search/" in r["path"] for r in reqs), "a search folder was read"
+
+    with subtest("a nextLink to another host never gets the token"):
+        before = len(requests())
+        code, stdout = run("/target/evil", "--auth app --mailbox mallory@contoso.test",
+                           "--client-secret-file <(echo s3cret)")
+        assert code == 6, (code, stdout)
+        manifest = json.loads(client.succeed("cat /target/evil/manifest.json"))
+        assert "refusing to send the token to https://evil.test" in " ".join(manifest["errors"]), manifest
+        assert manifest["source"]["identity"]["auth"]["method"].startswith("client credentials"), manifest
+
+    with subtest("a wrong client secret aborts before anything is read"):
+        code, stdout = run("/target/badsecret", "--auth app --mailbox alice@contoso.test",
+                           "--client-secret-file <(echo wrong)")
+        assert code == 4, (code, stdout)
+        manifest = json.loads(client.succeed("cat /target/badsecret/manifest.json"))
+        assert "invalid_client" in " ".join(manifest["errors"]), manifest
+        assert manifest["totals"]["acquired"] == 0, manifest
+  '';
+}

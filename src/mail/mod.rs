@@ -9,7 +9,7 @@
 //! - Every message is stored byte for byte as `<folder>/<uid>.eml` in the
 //!   container, with UIDVALIDITY, UID, flags, INTERNALDATE and size in its item.
 
-mod client;
+pub(crate) mod client;
 mod parse;
 mod utf7;
 
@@ -61,7 +61,7 @@ enum Secret {
     Token(String),
 }
 
-fn first_line(path: &Path) -> Result<String> {
+pub(crate) fn first_line(path: &Path) -> Result<String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| Usage(format!("{}: {e}", path.display())))?;
     let line = text.lines().next().unwrap_or_default().to_string();
@@ -72,7 +72,7 @@ fn first_line(path: &Path) -> Result<String> {
 }
 
 /// Ask on the terminal without echo.
-fn prompt_secret(prompt: &str) -> Result<String> {
+pub(crate) fn prompt_secret(prompt: &str) -> Result<String> {
     use std::io::{BufRead, Write};
     use std::os::fd::AsRawFd;
     let tty = std::fs::OpenOptions::new()
@@ -172,7 +172,7 @@ fn folder_name(raw: &[u8], delimiter: Option<char>) -> String {
 
 /// Whether a folder needs opening at all: not removed by an exclude
 /// pattern `X/**`, and some include pattern can match a message in it.
-fn folder_scope(rules: &ScopeRules, name: &str) -> Option<String> {
+pub(crate) fn folder_scope(rules: &ScopeRules, name: &str) -> Option<String> {
     let scope = rules.scope();
     if let Some(p) = scope
         .exclude

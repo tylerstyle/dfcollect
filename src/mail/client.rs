@@ -178,7 +178,7 @@ pub struct Connection {
     pub received: u64,
 }
 
-fn upgrade(
+pub(crate) fn upgrade(
     tcp: TcpStream,
     host: &str,
     pin: Option<&str>,
@@ -413,7 +413,7 @@ impl Connection {
     }
 }
 
-fn connect_tcp(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
+pub(crate) fn connect_tcp(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
     let addrs: Vec<SocketAddr> = (host, port)
         .to_socket_addrs()
         .with_context(|| format!("Cannot resolve {host}"))?
