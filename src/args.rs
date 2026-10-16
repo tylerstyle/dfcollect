@@ -24,6 +24,9 @@ pub enum Command {
     Imap(Box<ImapArgs>),
     /// Acquire a Microsoft 365 mailbox through Microsoft Graph (GET only)
     Graph(Box<GraphArgs>),
+    /// Acquire files from a cloud or remote service through rclone (lsjson
+    /// and cat only), checked against the provider's own hashes
+    Cloud(Box<CloudArgs>),
     /// Acquire a Microsoft 365 tenant's sign-in logs, directory audits and
     /// Unified Audit Log for a time window through Microsoft Graph
     #[command(name = "m365-logs")]
@@ -447,6 +450,64 @@ pub struct M365LogsArgs {
     pub md5: bool,
 
     /// Also compute SHA-1 for every log file
+    #[arg(long, help_heading = "Hashes")]
+    pub sha1: bool,
+
+    /// Deflate the container members
+    #[arg(long, help_heading = "Output")]
+    pub compress: bool,
+
+    /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
+    #[arg(long, help_heading = "Safety")]
+    pub allow_tmpfs: bool,
+
+    /// Print the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CloudArgs {
+    /// The rclone remote and path: REMOTE: or REMOTE:path (configure it with
+    /// read-only scopes, e.g. Drive `scope = drive.readonly`)
+    #[arg(value_name = "REMOTE:PATH")]
+    pub source: String,
+
+    /// rclone configuration file (default: rclone's own)
+    #[arg(long, value_name = "FILE", help_heading = "rclone")]
+    pub rclone_config: Option<PathBuf>,
+
+    /// An extra rclone option for every call (repeatable), e.g.
+    /// --rclone-arg=--drive-export-formats=docx,xlsx,pptx,pdf; recorded,
+    /// secret-looking values removed
+    #[arg(
+        long = "rclone-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        help_heading = "rclone"
+    )]
+    pub rclone_args: Vec<String>,
+
+    /// New collection directory (on a target drive)
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub case: CaseArgs,
+
+    /// Scope: --include/--exclude match the path below REMOTE:PATH; the time
+    /// window applies to the modification time
+    #[command(flatten)]
+    pub scope: ScopeArgs,
+
+    #[command(flatten)]
+    pub clock: ClockArgs,
+
+    /// Also compute MD5 for every file
+    #[arg(long, help_heading = "Hashes")]
+    pub md5: bool,
+
+    /// Also compute SHA-1 for every file
     #[arg(long, help_heading = "Hashes")]
     pub sha1: bool,
 

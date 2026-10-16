@@ -2,6 +2,7 @@
 //! manifest and audit records (dfcore).
 
 mod args;
+mod cloud;
 mod common;
 mod container;
 mod files;
@@ -11,6 +12,7 @@ mod m365logs;
 mod mail;
 mod meta;
 mod oauth;
+mod provider_hash;
 mod scope;
 mod verify;
 
@@ -82,6 +84,10 @@ fn main() -> ExitCode {
             o.code
         }),
         args::Command::Graph(a) => graph::run(a, &STOP).map(|o| {
+            print(a.json, &o.summary);
+            o.code
+        }),
+        args::Command::Cloud(a) => cloud::run(a, &STOP).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),

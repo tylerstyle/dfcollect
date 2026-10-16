@@ -1,6 +1,8 @@
 { lib
 , rustPlatform
 , runCommand
+, makeWrapper
+, rclone
   # dfcore is a sibling path dependency (../dfcore); flakes pass their input
 , dfcoreSrc ? ../dfcore
 }:
@@ -28,6 +30,13 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ./Cargo.lock;
   };
+
+  nativeBuildInputs = [ makeWrapper ];
+
+  # dfcollect cloud runs rclone
+  postInstall = ''
+    wrapProgram $out/bin/dfcollect --suffix PATH : ${lib.makeBinPath [ rclone ]}
+  '';
 
   # The CLI tests run in /dev/shm, which the Nix sandbox provides
   meta = with lib; {

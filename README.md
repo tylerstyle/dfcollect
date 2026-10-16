@@ -7,8 +7,8 @@ that records what was taken, what was left out and how.
 dfcollect is part of the dfnix tool suite, alongside dfdisk (disk imaging),
 dfmount (read-only mounts), dfnet (network shares and streams) and dfcore
 (shared safety core and audit log). Where dfdisk images whole devices,
-dfcollect acquires files, mailboxes (IMAP, Microsoft 365) and Microsoft 365
-logs, and later cloud data and databases.
+dfcollect acquires files, mailboxes (IMAP, Microsoft 365), Microsoft 365 logs
+and cloud data, and later databases.
 
 ## What `dfcollect files` does
 
@@ -180,6 +180,41 @@ dfcollect m365-logs --auth app --tenant contoso.onmicrosoft.com --client-id <app
 5. **One refusal doesn't stop the rest.** A log the tenant refuses (missing
    licence or permission) fails as its own item; the other logs are still
    read, and the collection ends complete with errors.
+
+## What `dfcollect cloud` does
+
+Files from cloud and remote services through rclone: OneDrive, SharePoint,
+Google Drive, Dropbox, S3, WebDAV/Nextcloud, SFTP, Box and rclone's other
+backends. Configure the remote first with read-only access where the provider
+offers it: Drive `scope = drive.readonly`; OneDrive `access_scopes = Files.Read
+Files.Read.All Sites.Read.All offline_access`; read-only S3 credentials.
+
+```bash
+dfcollect cloud evidence-drive:Projects --rclone-config /media/target/case01/rclone.conf \
+  -o /media/target/case01/drive -C "VG 12345/26" -E cloud01 -e "KHK Muster" \
+  --not-before 2026-01-01T00:00:00+01:00 --not-after 2026-07-01T00:00:00+02:00
+```
+
+1. **Read only.** Only `rclone lsjson` and `rclone cat` touch the remote, and
+   both only read. rclone's version and the remote's configuration are
+   recorded; tokens, secrets, passwords and keys are removed.
+2. **Listed before and after.** `lsjson -R --hash --metadata` lists the remote
+   with the provider's hashes, IDs and metadata before and after the
+   acquisition. Both listings are members of `data.zip` (`rclone/`). Files
+   added, removed or changed in between are recorded, and the collection ends
+   complete with errors.
+3. **Scope before download.** Include and exclude patterns match the path
+   below the given remote path; the time window applies to the modification
+   time. Out-of-scope files are never read.
+4. **Checked against the provider.** Each file is streamed from `rclone cat`
+   into `files/<path>`. On the way dfcollect computes SHA-256 (MD5 and SHA-1 on
+   request) and every provider hash it knows: MD5, SHA-1, OneDrive's
+   QuickXorHash, Dropbox's content hash. It compares them with the listing; a
+   difference, a size mismatch or a failed `rclone cat` makes the file's item
+   an error, which says what differed.
+5. **Google-native documents** (Docs, Sheets, Slides) are exported by rclone.
+   Pass the formats with `--rclone-arg=--drive-export-formats=docx,xlsx,pptx,pdf`.
+   Every extra rclone option is recorded.
 
 ## The collection directory
 
