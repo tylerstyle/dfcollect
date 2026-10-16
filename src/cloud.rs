@@ -72,12 +72,25 @@ pub fn remote_path(remote: &str, base: &str, rel: &str) -> String {
     }
 }
 
+/// Words that mark a configuration key or an option as holding a secret
+/// (Azure SAS URLs carry their signature; headers and cookies can carry auth)
+const SECRET_WORDS: [&str; 8] = [
+    "token",
+    "secret",
+    "pass",
+    "key",
+    "credential",
+    "sas_url",
+    "cookie",
+    "header",
+];
+
 /// Config lines with secret values removed (tokens, secrets, passwords, keys)
 pub fn redact_config(text: &str) -> String {
     text.lines()
         .map(|l| match l.split_once('=') {
             Some((k, _))
-                if ["token", "secret", "pass", "key", "credential"]
+                if SECRET_WORDS
                     .iter()
                     .any(|w| k.trim().to_ascii_lowercase().contains(w)) =>
             {
@@ -93,9 +106,7 @@ pub fn redact_config(text: &str) -> String {
 pub fn redact_args(args: &[String]) -> Vec<String> {
     let secret = |a: &str| {
         let l = a.to_ascii_lowercase();
-        ["token", "secret", "pass", "key"]
-            .iter()
-            .any(|w| l.contains(w))
+        SECRET_WORDS.iter().any(|w| l.contains(w))
     };
     let mut out = Vec::new();
     let mut hide_next = false;
@@ -123,6 +134,7 @@ pub fn listing_changes(before: &[Value], after: &[Value]) -> Value {
     let key = |e: &Value| {
         e["ID"]
             .as_str()
+            .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| e["Path"].as_str().unwrap_or("").to_string())
     };
@@ -570,10 +582,13 @@ mod tests {
 
     #[test]
     fn secrets_are_removed() {
-        let cfg = "[od]\ntype = onedrive\ntoken = {\"access_token\":\"x\"}\nclient_secret = s\ndrive_type = business\naccess_key_id = AK\n";
+        let cfg = "[od]\ntype = onedrive\ntoken = {\"access_token\":\"x\"}\nclient_secret = s\ndrive_type = business\naccess_key_id = AK\nsas_url = https://x?sig=SIG\n";
         let r = redact_config(cfg);
         assert!(
-            !r.contains("access_token") && !r.contains("= s\n") && !r.contains("AK"),
+            !r.contains("access_token")
+                && !r.contains("= s\n")
+                && !r.contains("AK")
+                && !r.contains("SIG"),
             "{r}"
         );
         assert!(r.contains("drive_type = business"), "{r}");

@@ -3,6 +3,8 @@
 , runCommand
 , makeWrapper
 , rclone
+, postgresql
+, mariadb
   # dfcore is a sibling path dependency (../dfcore); flakes pass their input
 , dfcoreSrc ? ../dfcore
 }:
@@ -33,9 +35,10 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [ makeWrapper ];
 
-  # dfcollect cloud runs rclone
+  # dfcollect cloud runs rclone, dfcollect db the engines' clients (appended,
+  # so a system's own tools come first)
   postInstall = ''
-    wrapProgram $out/bin/dfcollect --suffix PATH : ${lib.makeBinPath [ rclone ]}
+    wrapProgram $out/bin/dfcollect --suffix PATH : ${lib.makeBinPath [ rclone postgresql mariadb.client ]}
   '';
 
   # The CLI tests run in /dev/shm, which the Nix sandbox provides

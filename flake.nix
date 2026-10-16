@@ -34,6 +34,7 @@
           imap = import ./tests/imap.nix { inherit pkgs dfcollect; };
           graph = import ./tests/graph.nix { inherit pkgs dfcollect; };
           cloud = import ./tests/cloud.nix { inherit pkgs dfcollect; };
+          db = import ./tests/db.nix { inherit pkgs dfcollect; };
         };
 
         devShells.default = pkgs.mkShell {

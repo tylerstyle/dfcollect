@@ -27,6 +27,9 @@ pub enum Command {
     /// Acquire files from a cloud or remote service through rclone (lsjson
     /// and cat only), checked against the provider's own hashes
     Cloud(Box<CloudArgs>),
+    /// Dump PostgreSQL or MariaDB/MySQL databases with their own tools,
+    /// consistently, with the server's clock and settings recorded
+    Db(Box<DbArgs>),
     /// Acquire a Microsoft 365 tenant's sign-in logs, directory audits and
     /// Unified Audit Log for a time window through Microsoft Graph
     #[command(name = "m365-logs")]
@@ -508,6 +511,82 @@ pub struct CloudArgs {
     pub md5: bool,
 
     /// Also compute SHA-1 for every file
+    #[arg(long, help_heading = "Hashes")]
+    pub sha1: bool,
+
+    /// Deflate the container members
+    #[arg(long, help_heading = "Output")]
+    pub compress: bool,
+
+    /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
+    #[arg(long, help_heading = "Safety")]
+    pub allow_tmpfs: bool,
+
+    /// Print the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DbArgs {
+    /// postgres or mariadb (also MySQL)
+    #[arg(value_enum, value_name = "ENGINE")]
+    pub engine: crate::db::Engine,
+
+    /// Server host name or address
+    #[arg(long, help_heading = "Server")]
+    pub host: String,
+
+    /// Port (default: 5432 / 3306)
+    #[arg(long, help_heading = "Server")]
+    pub port: Option<u16>,
+
+    /// User to connect as (read access to every database to dump)
+    #[arg(long, short = 'u', help_heading = "Server")]
+    pub user: String,
+
+    /// File whose first line is the password (default: asked on the terminal)
+    #[arg(long, value_name = "FILE", help_heading = "Server")]
+    pub password_file: Option<PathBuf>,
+
+    /// Connect without a password (peer, certificate or trust authentication)
+    #[arg(long, conflicts_with = "password_file", help_heading = "Server")]
+    pub no_password: bool,
+
+    #[arg(long, value_enum, default_value = "prefer", help_heading = "Server")]
+    pub tls: crate::db::Tls,
+
+    /// Only this database (repeatable; default: all of them)
+    #[arg(long = "database", value_name = "NAME", help_heading = "Scope")]
+    pub databases: Vec<String>,
+
+    /// Legal basis of the acquisition (order, date)
+    #[arg(long, value_name = "TEXT", help_heading = "Scope")]
+    pub legal_basis: Option<String>,
+
+    /// PostgreSQL: a serializable, deferrable snapshot (waits for a safe moment)
+    #[arg(long, help_heading = "Dump")]
+    pub serializable: bool,
+
+    /// MariaDB/MySQL: record the binary-log position (takes a brief global read lock)
+    #[arg(long, help_heading = "Dump")]
+    pub binlog_position: bool,
+
+    /// New collection directory (on a target drive)
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub case: CaseArgs,
+
+    #[command(flatten)]
+    pub clock: ClockArgs,
+
+    /// Also compute MD5 for every dump
+    #[arg(long, help_heading = "Hashes")]
+    pub md5: bool,
+
+    /// Also compute SHA-1 for every dump
     #[arg(long, help_heading = "Hashes")]
     pub sha1: bool,
 

@@ -5,6 +5,7 @@ mod args;
 mod cloud;
 mod common;
 mod container;
+mod db;
 mod files;
 mod graph;
 mod http;
@@ -88,6 +89,10 @@ fn main() -> ExitCode {
             o.code
         }),
         args::Command::Cloud(a) => cloud::run(a, &STOP).map(|o| {
+            print(a.json, &o.summary);
+            o.code
+        }),
+        args::Command::Db(a) => db::run(a, &STOP).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),

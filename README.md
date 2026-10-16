@@ -7,8 +7,8 @@ that records what was taken, what was left out and how.
 dfcollect is part of the dfnix tool suite, alongside dfdisk (disk imaging),
 dfmount (read-only mounts), dfnet (network shares and streams) and dfcore
 (shared safety core and audit log). Where dfdisk images whole devices,
-dfcollect acquires files, mailboxes (IMAP, Microsoft 365), Microsoft 365 logs
-and cloud data, and later databases.
+dfcollect acquires files, mailboxes (IMAP, Microsoft 365), Microsoft 365 logs,
+cloud data and databases.
 
 ## What `dfcollect files` does
 
@@ -215,6 +215,42 @@ dfcollect cloud evidence-drive:Projects --rclone-config /media/target/case01/rcl
 5. **Google-native documents** (Docs, Sheets, Slides) are exported by rclone.
    Pass the formats with `--rclone-arg=--drive-export-formats=docx,xlsx,pptx,pdf`.
    Every extra rclone option is recorded.
+
+## What `dfcollect db` does
+
+Consistent logical dumps of PostgreSQL and MariaDB/MySQL servers, made with the
+database's own tools:
+
+```bash
+dfcollect db postgres --host db.example.org --user examiner --password-file /run/pw \
+  -o /media/target/case01/db -C "VG 12345/26" -E db01 -e "KHK Muster"
+dfcollect db mariadb --host 10.0.0.5 --user examiner --database shop --tls require ...
+```
+
+1. **Consistent dumps.**
+   - PostgreSQL: `pg_dump --format=custom` per database, one read-only
+     snapshot each (restore with `pg_restore`; `--serializable` waits for a
+     safe snapshot), and `pg_dumpall --globals-only` for roles and tablespaces,
+     without role password hashes.
+   - MariaDB/MySQL: `mariadb-dump --single-transaction --routines --triggers
+     --events --hex-blob` per database, consistent for InnoDB without locks.
+     `--binlog-position` adds the binary-log coordinates at the cost of a brief
+     global read lock.
+2. **The server is recorded:** version, time zone and clock (`now()` on the
+   server, next to dfnix's), start time, databases with sizes, encodings and
+   collations, and the number of sessions.
+3. **Streamed.** Each dump goes straight into `data.zip`
+   (`postgres/<db>.dump`, `mariadb/<db>.sql`) and is hashed. A tool that fails
+   leaves an error item that says why.
+4. **The password** comes from `--password-file` or the terminal. It reaches
+   the tools in a 0600 file in a private directory in RAM (`.pgpass` / an option
+   file), never on the command line or the target drive, and is deleted
+   afterwards.
+5. **Footprint.** The connections appear in the server's logs and session
+   views. pg_dump holds ACCESS SHARE locks, so DDL waits while it runs.
+6. **What a dump doesn't show.** A logical dump shows the current state only.
+   Deleted rows survive in data files and in WAL/binlog. For those, add a
+   file-level copy (from a filesystem snapshot) or the disk image.
 
 ## The collection directory
 

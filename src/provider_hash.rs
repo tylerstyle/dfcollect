@@ -130,6 +130,7 @@ impl DropboxHash {
 pub enum Provider {
     Md5(md5::Md5),
     Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
     QuickXor(QuickXor),
     Dropbox(Box<DropboxHash>),
 }
@@ -140,6 +141,7 @@ impl Provider {
         Some(match name {
             "md5" => Provider::Md5(md5::Md5::new()),
             "sha1" => Provider::Sha1(sha1::Sha1::new()),
+            "sha256" => Provider::Sha256(sha2::Sha256::new()),
             "quickxor" => Provider::QuickXor(QuickXor::new()),
             "dropbox" => Provider::Dropbox(Box::default()),
             _ => return None,
@@ -150,6 +152,7 @@ impl Provider {
         match self {
             Provider::Md5(h) => h.update(bytes),
             Provider::Sha1(h) => h.update(bytes),
+            Provider::Sha256(h) => h.update(bytes),
             Provider::QuickXor(h) => h.update(bytes),
             Provider::Dropbox(h) => h.update(bytes),
         }
@@ -160,6 +163,7 @@ impl Provider {
         let bytes: Vec<u8> = match self {
             Provider::Md5(h) => h.finalize().to_vec(),
             Provider::Sha1(h) => h.finalize().to_vec(),
+            Provider::Sha256(h) => h.finalize().to_vec(),
             Provider::QuickXor(h) => h.finish().to_vec(),
             Provider::Dropbox(h) => h.finish().to_vec(),
         };
@@ -251,6 +255,12 @@ mod tests {
         let mut p = Provider::for_name("md5").unwrap();
         p.update(b"hello");
         assert_eq!(p.finish(), "5d41402abc4b2a76b9719d911017c592");
+        let mut p = Provider::for_name("sha256").unwrap();
+        p.update(b"hello");
+        assert_eq!(
+            p.finish(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
         assert!(Provider::for_name("whirlpool").is_none());
     }
 }
