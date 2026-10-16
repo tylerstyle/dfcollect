@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+result
+result-*
+*.swp
+*~
+.DS_Store
+.direnv

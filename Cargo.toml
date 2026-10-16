@@ -1,0 +1,27 @@
+[package]
+name = "dfcollect"
+version = "0.1.0"
+edition = "2021"
+authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
+description = "Logical forensic acquisition with scope, per-item hashes, manifest and audit records"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tylerstyle/dfcollect"
+homepage = "https://github.com/tylerstyle/dfcollect"
+readme = "README.md"
+keywords = ["forensics", "dfir", "acquisition", "evidence", "manifest"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+dfcore = { path = "../dfcore" }
+clap = { version = "4.6", features = ["derive", "cargo"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+digest = "0.11"
+md-5 = "0.11"
+sha1 = "0.11"
+sha2 = "0.11"
+libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
