@@ -185,17 +185,21 @@ impl Session<'_> {
             birth: None,
         };
         let mut hasher = Hasher::new(self.args.md5, self.args.sha1);
-        let mut file = std::fs::File::open(&tmp)?;
-        let size = match self
-            .container
-            .add_file(&member, 0o644, &stamps, &mut file, &mut hasher)
-        {
+        let added = std::fs::File::open(&tmp)
+            .map_err(CopyError::Source)
+            .and_then(|mut file| {
+                self.container
+                    .add_file(&member, 0o644, &stamps, &mut file, &mut hasher)
+            });
+        // The temporary file goes whatever happened to the container
+        let removed = std::fs::remove_file(&tmp);
+        let size = match added {
             Ok(n) => n,
             Err(CopyError::Container(e)) => return Err(e),
             Err(CopyError::Source(e)) => return Err(e.into()),
             Err(CopyError::Duplicate(n)) => bail!("{n} is in the container already"),
         };
-        std::fs::remove_file(&tmp)?;
+        removed?;
         md["records"] = json!(count);
         self.records += count;
         let mut item = Item::new(ItemStatus::Acquired, path);
@@ -308,7 +312,11 @@ impl Session<'_> {
             if Instant::now() > deadline {
                 break format!("still {s} after {} min", self.args.ual_wait);
             }
-            std::thread::sleep(poll);
+            // In short steps, so Ctrl-C is noticed at once
+            let until = Instant::now() + poll;
+            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250).min(poll));
+            }
         };
         self.collection.footprint(FootprintEntry::new(
             "audit_log_query",
