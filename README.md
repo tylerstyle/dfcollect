@@ -8,7 +8,7 @@ dfcollect is part of the dfnix tool suite, alongside dfdisk (disk imaging),
 dfmount (read-only mounts), dfnet (network shares and streams) and dfcore
 (shared safety core and audit log). Where dfdisk images whole devices,
 dfcollect acquires files, mailboxes (IMAP, Microsoft 365, Gmail), Microsoft 365
-logs, cloud data and databases.
+logs, cloud data and databases, and takes in provider deliveries.
 
 ## What `dfcollect files` does
 
@@ -306,6 +306,30 @@ dfcollect gmail --auth service-account --key-file /run/sa.json \
 6. **Footprint.** Google Workspace logs OAuth token grants for service accounts
    in the Token Audit Log; an `installed` sign-in can send a "new sign-in" or
    "third-party access" alert to the account holder.
+
+## What `dfcollect ingest` does
+
+Takes a data package a provider delivered into a verifiable collection: a
+European Production Order answered under Regulation (EU) 2023/1543 (in force
+since 18 August 2026), a provider export, a delivery on media.
+
+```bash
+dfcollect ingest /media/evidence/delivery-0815 --hashes /media/evidence/delivery-0815.sha256 \
+  --provider "Example Mail GmbH" --received-at 2026-10-16T10:00:00+02:00 \
+  --channel "e-Evidence decentralised IT system" --reference "EPOC 2026/123" \
+  -o /media/target/case01/delivery -C "VG 12345/26" -E prov01 -e "KHK Muster"
+```
+
+1. **The receipt** is recorded: provider, time of receipt, channel, reference,
+   examiner.
+2. **Every file of the package**, a directory or a single delivered file, is
+   stored in `data.zip` (`package/<path>`), as it is, and hashed. Symlinks are
+   recorded, not followed.
+3. **The provider's hash lists** (`sha256sum`, `md5sum`, `sha1sum`, `sha512sum`
+   output, or BSD `SHA256 (path) = …`) are stored as `provider/<name>`, and
+   every file is checked against them. A file that differs or is missing is an
+   error. So is a file the lists don't name, unless `--allow-unlisted`. The
+   summary counts verified, mismatched, missing and unlisted files.
 
 ## The collection directory
 

@@ -337,3 +337,134 @@ fn a_container_name_collision_fails_one_item_not_the_collection() {
     let (code, _, _) = dfcollect(&s, &["verify", out.to_str().unwrap()]);
     assert_eq!(code, 0);
 }
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn ingest(s: &Scratch, extra: &[&str]) -> (i32, Value, String) {
+    let (src, out) = (s.src(), s.out());
+    let mut args = vec![
+        "ingest",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-C",
+        "CASE",
+        "-E",
+        "prov01",
+        "-e",
+        "tester",
+        "--provider",
+        "Example Mail GmbH",
+        "--received-at",
+        "2026-10-16T10:00:00+02:00",
+        "--channel",
+        "SFTP",
+        "--reference",
+        "EPOC-2026-1",
+        "--allow-tmpfs",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    dfcollect(s, &args)
+}
+
+#[test]
+fn ingest_checks_a_delivery_against_the_providers_hashes() {
+    let s = Scratch::new("ingest");
+    s.write("mail/a.eml", b"hello");
+    s.write("mail/b.eml", b"world");
+    s.write("extra.txt", b"not listed");
+    let list = s.root.join("SHA256SUMS");
+    std::fs::write(
+        &list,
+        format!(
+            "{}  mail/a.eml\n{}  ./mail/b.eml\n{}  missing.eml\n",
+            sha256_hex(b"hello"),
+            sha256_hex(b"WRONG"),
+            sha256_hex(b"x")
+        ),
+    )
+    .unwrap();
+    let (code, j, err) = ingest(&s, &["--hashes", list.to_str().unwrap()]);
+    assert_ne!(code, 0, "{err}");
+    assert_eq!(j["status"], "complete_with_errors", "{j}");
+    assert_eq!(
+        (
+            &j["verified"],
+            &j["mismatched"],
+            &j["missing"],
+            &j["unlisted"]
+        ),
+        (&1.into(), &1.into(), &1.into(), &1.into()),
+        "{j}"
+    );
+    let all = items(&s.out());
+    let by = |p: &str| all.iter().find(|i| i["path"] == p).cloned().unwrap();
+    assert_eq!(by("mail/a.eml")["status"], "acquired");
+    assert!(by("mail/b.eml")["reason"]
+        .as_str()
+        .unwrap()
+        .contains("sha256 differs"));
+    assert!(by("missing.eml")["reason"]
+        .as_str()
+        .unwrap()
+        .contains("not in the package"));
+    assert!(by("extra.txt")["reason"]
+        .as_str()
+        .unwrap()
+        .contains("not in the provider"));
+    assert_eq!(by("provider/SHA256SUMS")["kind"], "hash_list");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(s.out().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["source"]["details"]["channel"], "SFTP",
+        "{manifest}"
+    );
+    assert_eq!(
+        manifest["source"]["details"]["received_at"],
+        "2026-10-16T08:00:00.000000000Z"
+    );
+    let (vcode, _, verr) = dfcollect(&s, &["verify", s.out().to_str().unwrap()]);
+    assert_eq!(vcode, 0, "{verr}");
+}
+
+#[test]
+fn ingest_allows_unlisted_files_on_request_and_reads_bsd_lists() {
+    let s = Scratch::new("ingest2");
+    s.write("a.bin", b"hello");
+    s.write("b.bin", b"other");
+    std::os::unix::fs::symlink("a.bin", s.src().join("link.bin")).unwrap();
+    let list = s.root.join("checksums.txt");
+    std::fs::write(
+        &list,
+        format!(
+            "SHA256 (a.bin) = {}\nSHA256 (link.bin) = {}\n",
+            sha256_hex(b"hello").to_uppercase(),
+            sha256_hex(b"hello")
+        ),
+    )
+    .unwrap();
+    let (code, j, err) = ingest(
+        &s,
+        &["--hashes", list.to_str().unwrap(), "--allow-unlisted"],
+    );
+    // the symlink a list names as a file is an error; the rest passes
+    assert_ne!(code, 0, "{err} {j}");
+    assert_eq!(
+        (&j["verified"], &j["unlisted"], &j["mismatched"]),
+        (&1.into(), &1.into(), &1.into()),
+        "{j}"
+    );
+    let all = items(&s.out());
+    let link = all.iter().find(|i| i["path"] == "link.bin").unwrap();
+    assert!(
+        link["reason"].as_str().unwrap().contains("it is a symlink"),
+        "{link}"
+    );
+}

@@ -10,6 +10,7 @@ mod files;
 mod gmail;
 mod graph;
 mod http;
+mod ingest;
 mod m365logs;
 mod mail;
 mod meta;
@@ -102,6 +103,10 @@ fn main() -> ExitCode {
             o.code
         }),
         args::Command::Gmail(a) => gmail::run(a, &STOP).map(|o| {
+            print(a.json, &o.summary);
+            o.code
+        }),
+        args::Command::Ingest(a) => ingest::run(a, &STOP).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),

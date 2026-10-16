@@ -36,6 +36,9 @@ pub enum Command {
     /// Unified Audit Log for a time window through Microsoft Graph
     #[command(name = "m365-logs")]
     M365Logs(Box<M365LogsArgs>),
+    /// Take a provider's delivered data package (e-Evidence production orders,
+    /// provider exports) into a collection, checked against the provider's hashes
+    Ingest(Box<IngestArgs>),
     /// Re-check a collection: records, container members and audit anchors
     Verify(VerifyArgs),
 }
@@ -697,6 +700,73 @@ pub struct GmailArgs {
     pub md5: bool,
 
     /// Also compute SHA-1 for every message
+    #[arg(long, help_heading = "Hashes")]
+    pub sha1: bool,
+
+    /// Deflate the container members
+    #[arg(long, help_heading = "Output")]
+    pub compress: bool,
+
+    /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
+    #[arg(long, help_heading = "Safety")]
+    pub allow_tmpfs: bool,
+
+    /// Print the result as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct IngestArgs {
+    /// The delivered package: a directory, or a single file (an archive as delivered)
+    #[arg(value_name = "PACKAGE")]
+    pub package: PathBuf,
+
+    /// Who delivered it (the provider)
+    #[arg(long, help_heading = "Receipt")]
+    pub provider: String,
+
+    /// When it was received (RFC 3339)
+    #[arg(long, value_name = "TIME", help_heading = "Receipt")]
+    pub received_at: String,
+
+    /// How it was received, e.g. "e-Evidence decentralised IT system", "SFTP",
+    /// "courier, USB stick sealed 4711"
+    #[arg(long, help_heading = "Receipt")]
+    pub channel: String,
+
+    /// The order's or the provider's reference
+    #[arg(long, help_heading = "Receipt")]
+    pub reference: Option<String>,
+
+    /// A hash list the provider supplied (sha256sum/md5sum/sha1sum/sha512sum
+    /// or BSD format; repeatable)
+    #[arg(long = "hashes", value_name = "FILE", help_heading = "Checks")]
+    pub hashes: Vec<PathBuf>,
+
+    /// Accept files the hash lists don't name (otherwise they are errors)
+    #[arg(long, help_heading = "Checks")]
+    pub allow_unlisted: bool,
+
+    /// Legal basis (the order, its date)
+    #[arg(long, value_name = "TEXT", help_heading = "Receipt")]
+    pub legal_basis: Option<String>,
+
+    /// New collection directory (on a target drive)
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output: PathBuf,
+
+    #[command(flatten)]
+    pub case: CaseArgs,
+
+    #[command(flatten)]
+    pub clock: ClockArgs,
+
+    /// Also compute MD5 for every file
+    #[arg(long, help_heading = "Hashes")]
+    pub md5: bool,
+
+    /// Also compute SHA-1 for every file
     #[arg(long, help_heading = "Hashes")]
     pub sha1: bool,
 
