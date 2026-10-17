@@ -53,7 +53,15 @@ pub fn split_source(source: &str) -> Result<(String, String)> {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "_-. ".contains(c)) =>
         {
-            Ok((remote.to_string(), path.trim_matches('/').to_string()))
+            // A leading '/' stays: `local:/x` and `sftp:/x` are absolute,
+            // `sftp:x` is below the login's home; `REMOTE:/` is the root
+            let trimmed = path.trim_end_matches('/');
+            let path = if trimmed.is_empty() && path.starts_with('/') {
+                "/"
+            } else {
+                trimmed
+            };
+            Ok((remote.to_string(), path.to_string()))
         }
         _ => Err(Usage(format!(
             "{source}: give an rclone remote, REMOTE: or REMOTE:path (a local directory is for dfcollect files)"
@@ -64,11 +72,16 @@ pub fn split_source(source: &str) -> Result<(String, String)> {
 
 /// The remote path of a listed file
 pub fn remote_path(remote: &str, base: &str, rel: &str) -> String {
-    if base.is_empty() {
-        format!("{remote}:{rel}")
-    } else {
-        format!("{remote}:{base}/{rel}")
+    match base {
+        "" => format!("{remote}:{rel}"),
+        "/" => format!("{remote}:/{rel}"),
+        _ => format!("{remote}:{base}/{rel}"),
     }
+}
+
+/// What rclone lists: `REMOTE:`, `REMOTE:/` or `REMOTE:path`
+pub fn listing_target(remote: &str, base: &str) -> String {
+    format!("{remote}:{base}")
 }
 
 /// Words that mark a configuration key or an option as holding a secret
@@ -254,8 +267,7 @@ impl Session<'_> {
     }
 
     fn listing(&mut self, member: &str) -> Result<Vec<Value>> {
-        let target = remote_path(&self.remote, &self.base, "");
-        let target = target.trim_end_matches('/').to_string();
+        let target = listing_target(&self.remote, &self.base);
         let raw = self.run_rclone(&[
             "lsjson",
             "-R",
@@ -561,8 +573,7 @@ pub fn preview(args: &CloudArgs, ctx: &RunCtx) -> Result<CloudPreview> {
     let (_, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
     ctx.set_phase(Phase::Listing);
     ctx.set_stage("listing the remote (rclone lsjson)");
-    let target = remote_path(&remote, &base, "");
-    let target = target.trim_end_matches('/').to_string();
+    let target = listing_target(&remote, &base);
     let mut cmd = rclone(args);
     cmd.args(["lsjson", "-R", "--hash", "--files-only", &target]);
     let mut pv = CloudPreview {
@@ -750,6 +761,20 @@ mod tests {
         assert!(split_source(":local").is_err());
         assert_eq!(remote_path("od", "", "a/b.txt"), "od:a/b.txt");
         assert_eq!(remote_path("od", "Docs", "a.txt"), "od:Docs/a.txt");
+        // Absolute paths (local, sftp) keep their leading '/'; the root stays the root
+        assert_eq!(
+            split_source("local:/media/share/").unwrap(),
+            ("local".into(), "/media/share".into())
+        );
+        assert_eq!(split_source("sftp:/").unwrap(), ("sftp".into(), "/".into()));
+        assert_eq!(
+            remote_path("local", "/media/share", "a.txt"),
+            "local:/media/share/a.txt"
+        );
+        assert_eq!(remote_path("sftp", "/", "etc/x"), "sftp:/etc/x");
+        assert_eq!(listing_target("sftp", "/"), "sftp:/");
+        assert_eq!(listing_target("od", "Docs"), "od:Docs");
+        assert_eq!(listing_target("drive", ""), "drive:");
     }
 
     #[test]
