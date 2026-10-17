@@ -202,10 +202,26 @@ fn main() -> ExitCode {
             print(a.json, &o.summary);
             o.code
         }),
+        args::Command::Cloud(a) if a.dry_run => {
+            cloud::preview(a, &RunCtx::cli(&STOP, None)).map(|pv| {
+                print(a.json, &pv.summary());
+                pv.stopped.as_ref().map_or(0, |_| 8)
+            })
+        }
         args::Command::Cloud(a) => cloud::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
+        args::Command::Db(a) if a.dry_run => {
+            db::preview(a, &RunCtx::cli(&STOP, None)).map(|(pv, _)| {
+                print(a.json, &pv.summary());
+                if pv.missing.is_empty() {
+                    0
+                } else {
+                    2
+                }
+            })
+        }
         args::Command::Db(a) => db::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
@@ -218,6 +234,12 @@ fn main() -> ExitCode {
             print(a.json, &o.summary);
             o.code
         }),
+        args::Command::Ingest(a) if a.dry_run => {
+            ingest::preview(a, &RunCtx::cli(&STOP, None)).map(|pv| {
+                print(a.json, &pv.summary());
+                pv.stopped.as_ref().map_or(0, |_| 8)
+            })
+        }
         args::Command::Ingest(a) => ingest::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
@@ -231,6 +253,12 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(code) => ExitCode::from(code),
+        // Stopped before a collection existed (a preview, a query, a sign-in)
+        Err(_) if STOP.is_set() => {
+            let (reason, code) = STOP.reason().unwrap_or_else(|| ("stopped".into(), 8));
+            eprintln!("Stopped: {reason}");
+            ExitCode::from(code)
+        }
         Err(e) => {
             let code = if e.downcast_ref::<Usage>().is_some() {
                 2

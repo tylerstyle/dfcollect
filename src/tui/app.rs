@@ -1469,7 +1469,8 @@ impl App {
                 progress: Some(&progress_worker),
                 argv: Some(argv_worker),
                 interactive: true,
-                preview_at_ns: None,
+                preview: None,
+                credential: Default::default(),
                 reference_entered_ns: None,
                 console: Arc::new(QuietConsole::default()),
             };
@@ -1577,7 +1578,7 @@ impl App {
         };
         let args = data.args.clone();
         let argv = data.argv.clone();
-        let preview_at_ns = Some(data.preview.at_ns);
+        let preview = Some(data.preview.note());
         let reference_entered_ns = self.files_form.reference_entered_ns;
         let expected_files = data.preview.files;
         let expected_bytes = data.preview.bytes;
@@ -1595,7 +1596,8 @@ impl App {
                 progress: Some(&progress_worker),
                 argv: Some(argv_worker),
                 interactive: true,
-                preview_at_ns,
+                preview,
+                credential: Default::default(),
                 reference_entered_ns,
                 console: Arc::new(QuietConsole::default()),
             };
@@ -1859,7 +1861,8 @@ impl App {
                 progress: Some(&progress_worker),
                 argv: Some(argv),
                 interactive: true,
-                preview_at_ns: None,
+                preview: None,
+                credential: Default::default(),
                 reference_entered_ns: None,
                 console: Arc::new(QuietConsole::default()),
             };

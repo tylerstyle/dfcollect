@@ -534,6 +534,12 @@ pub struct CloudArgs {
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
 
+    /// Only preview: list the remote once (rclone lsjson), decide every file
+    /// by the scope and print what would be acquired. Reads no file and
+    /// writes nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Print the result as JSON
     #[arg(long)]
     pub json: bool,
@@ -609,6 +615,12 @@ pub struct DbArgs {
     /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
+
+    /// Only preview: connect, ask the server for its version, clock and
+    /// databases with their sizes, and print what would be dumped. Dumps
+    /// nothing and writes nothing
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Print the result as JSON
     #[arg(long)]
@@ -784,6 +796,12 @@ pub struct IngestArgs {
     /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
+
+    /// Only preview: list the package, read the hash lists and print what
+    /// would be taken (names and sizes). Reads no file content and writes
+    /// nothing
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Print the result as JSON
     #[arg(long)]

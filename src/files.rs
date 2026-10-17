@@ -839,11 +839,19 @@ pub struct Preview {
     pub target_free: Option<u64>,
     /// Why the preview ended early
     pub stopped: Option<String>,
-    /// When the preview started listing (Unix ns), for [`RunCtx::preview_at_ns`]
+    /// When the preview started listing (Unix ns), for [`Preview::note`]
     pub at_ns: i128,
 }
 
 impl Preview {
+    /// For the run's footprint
+    pub fn note(&self) -> crate::common::PreviewNote {
+        crate::common::PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview listed the source before the acquisition (directory listings and lstat, no file opened)".into(),
+        }
+    }
+
     /// The run's `acquired` total: files, directories and symlinks
     pub fn acquired(&self) -> u64 {
         self.files + self.directories + self.symlinks
@@ -1100,7 +1108,8 @@ mod tests {
             progress: Some(&progress),
             argv: Some(argv.clone()),
             interactive: true,
-            preview_at_ns: Some(pv.at_ns),
+            preview: Some(pv.note()),
+            credential: Default::default(),
             reference_entered_ns: Some(1_800_000_000_000_000_000),
             console: std::sync::Arc::new(crate::console::QuietConsole::default()),
         };

@@ -145,6 +145,24 @@ impl Progress {
     }
 }
 
+/// A preview that went before a run: when, and what it did to the source
+/// (recorded in the run's footprint)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewNote {
+    pub at_ns: i128,
+    pub what: String,
+}
+
+/// What a preview signed in or connected with, handed to the run so the
+/// examiner is not asked again (and the account holder not notified twice).
+/// Opaque outside the library.
+pub struct Credential(pub(crate) CredentialKind);
+
+pub(crate) enum CredentialKind {
+    /// A password the examiner typed for the preview
+    Password(zeroize::Zeroizing<String>),
+}
+
 /// How a run is started: by the CLI or by the TUI.
 pub struct RunCtx<'a> {
     pub stop: &'static Stop,
@@ -156,8 +174,10 @@ pub struct RunCtx<'a> {
     pub argv: Option<Vec<String>>,
     /// Started from the TUI (recorded in the footprint)
     pub interactive: bool,
-    /// When a preview listed the source before this run (Unix ns)
-    pub preview_at_ns: Option<i128>,
+    /// A preview that went before this run
+    pub preview: Option<PreviewNote>,
+    /// A credential from that preview, taken by the run (None: ask)
+    pub credential: Mutex<Option<Credential>>,
     /// When the examiner entered the reference time (Unix ns). None: when
     /// the run starts, as on the command line.
     pub reference_entered_ns: Option<i128>,
@@ -171,7 +191,8 @@ impl<'a> RunCtx<'a> {
             console: Arc::new(TermConsole::default()),
             argv: None,
             interactive: false,
-            preview_at_ns: None,
+            preview: None,
+            credential: Mutex::new(None),
             reference_entered_ns: None,
         }
     }
@@ -193,12 +214,12 @@ impl<'a> RunCtx<'a> {
                 }),
             ));
         }
-        if let Some(ns) = self.preview_at_ns {
+        if let Some(p) = &self.preview {
             out.push(dfcore::manifest::FootprintEntry::new(
                 "info",
                 serde_json::json!({
-                    "what": "a preview listed the source before the acquisition (directory listings and lstat, no file opened)",
-                    "at": host::rfc3339_utc_ns(ns),
+                    "what": p.what,
+                    "at": host::rfc3339_utc_ns(p.at_ns),
                 }),
             ));
         }
@@ -207,6 +228,11 @@ impl<'a> RunCtx<'a> {
 }
 
 impl RunCtx<'_> {
+    /// The preview's credential, once
+    pub(crate) fn take_credential(&self) -> Option<Credential> {
+        self.credential.lock().ok()?.take()
+    }
+
     pub fn set_phase(&self, phase: Phase) {
         if let Some(p) = self.progress {
             p.set_phase(phase);

@@ -18,7 +18,7 @@
 
 use crate::{
     args::CloudArgs,
-    common::{self, Counting, Phase, RunCtx, Stopped},
+    common::{self, Counting, Phase, PreviewNote, RunCtx, Stopped},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     meta::Stamps,
@@ -177,6 +177,37 @@ impl<R: Read> Read for Tee<R> {
     }
 }
 
+/// rclone with the configuration file and the extra options of the command line
+fn rclone(args: &CloudArgs) -> Command {
+    let mut c = Command::new("rclone");
+    if let Some(cfg) = &args.rclone_config {
+        c.arg("--config").arg(cfg);
+    }
+    c.args(&args.rclone_args);
+    c
+}
+
+/// The scope and its rules; a cloud time window applies to the modification time
+fn scope_rules(args: &CloudArgs) -> Result<(dfcore::manifest::Scope, ScopeRules)> {
+    let mut scope = scope::build(&args.scope)?;
+    if scope.not_before.is_some() || scope.not_after.is_some() {
+        if args.scope.scope.is_none() {
+            scope.time_basis = Some("modified".into());
+        } else if !scope
+            .time_basis
+            .as_deref()
+            .is_some_and(|b| b.eq_ignore_ascii_case("modified"))
+        {
+            return Err(Usage(
+                "a cloud scope's time window applies to the modification time; set \"time_basis\": \"modified\"".into(),
+            )
+            .into());
+        }
+    }
+    let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
+    Ok((scope, rules))
+}
+
 struct Session<'a> {
     args: &'a CloudArgs,
     ctx: &'a RunCtx<'a>,
@@ -191,12 +222,7 @@ struct Session<'a> {
 
 impl Session<'_> {
     fn rclone(&self) -> Command {
-        let mut c = Command::new("rclone");
-        if let Some(cfg) = &self.args.rclone_config {
-            c.arg("--config").arg(cfg);
-        }
-        c.args(&self.args.rclone_args);
-        c
+        rclone(self.args)
     }
 
     fn run_rclone(&mut self, args: &[&str]) -> Result<Vec<u8>> {
@@ -475,24 +501,141 @@ fn header(args: &CloudArgs, scope: dfcore::manifest::Scope, ctx: &RunCtx) -> Res
     })
 }
 
-pub fn run_with(args: &CloudArgs, ctx: &RunCtx) -> Result<Outcome> {
-    let (remote, base) = split_source(&args.source)?;
-    let mut scope = scope::build(&args.scope)?;
-    if scope.not_before.is_some() || scope.not_after.is_some() {
-        if args.scope.scope.is_none() {
-            scope.time_basis = Some("modified".into());
-        } else if !scope
-            .time_basis
-            .as_deref()
-            .is_some_and(|b| b.eq_ignore_ascii_case("modified"))
-        {
-            return Err(Usage(
-                "a cloud scope's time window applies to the modification time; set \"time_basis\": \"modified\"".into(),
-            )
-            .into());
+/// What a run would take: one listing of the remote decided by the scope;
+/// no file is read
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudPreview {
+    /// Files the listing has
+    pub listed: u64,
+    /// In scope
+    pub files: u64,
+    pub bytes: u64,
+    /// Out of scope, by reason
+    pub out_of_scope: BTreeMap<String, u64>,
+    /// The provider hashes the listing carries (checked by the run where dfcollect computes them)
+    pub hash_types: Vec<String>,
+    /// The first in-scope paths and their sizes
+    pub sample: Vec<(String, u64)>,
+    pub target_free: Option<u64>,
+    pub stopped: Option<String>,
+    pub at_ns: i128,
+}
+
+/// How many in-scope paths a preview keeps
+pub const PREVIEW_SAMPLE: usize = 1000;
+
+impl CloudPreview {
+    /// For the run's footprint
+    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 1)
+    pub fn note(&self) -> PreviewNote {
+        PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview listed the remote with rclone lsjson before the acquisition (no file read)".into(),
         }
     }
-    let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
+
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|f| f < self.bytes)
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "listed": self.listed,
+            "files": self.files,
+            "bytes": self.bytes,
+            "out_of_scope": self.out_of_scope,
+            "hash_types": self.hash_types,
+            "target_free": self.target_free,
+            "short_of_space": self.short_of_space(),
+            "stopped": self.stopped,
+        })
+    }
+}
+
+/// List the remote once and decide every file by the scope; write nothing
+pub fn preview(args: &CloudArgs, ctx: &RunCtx) -> Result<CloudPreview> {
+    let at_ns = dfcore::host::unix_now_ns();
+    let (remote, base) = split_source(&args.source)?;
+    let (_, rules) = scope_rules(args)?;
+    let (_, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage("listing the remote (rclone lsjson)");
+    let target = remote_path(&remote, &base, "");
+    let target = target.trim_end_matches('/').to_string();
+    let mut cmd = rclone(args);
+    cmd.args(["lsjson", "-R", "--hash", "--files-only", &target]);
+    let mut pv = CloudPreview {
+        listed: 0,
+        files: 0,
+        bytes: 0,
+        out_of_scope: BTreeMap::new(),
+        hash_types: Vec::new(),
+        sample: Vec::new(),
+        target_free: common::free_bytes(&ancestor),
+        stopped: None,
+        at_ns,
+    };
+    let out = match common::output_unless_stopped(cmd, ctx.stop) {
+        Ok(o) => o,
+        Err(e) if e.downcast_ref::<Stopped>().is_some() => {
+            pv.stopped = ctx.stop.reason().map(|(r, _)| r);
+            return Ok(pv);
+        }
+        Err(e) => return Err(e.context("Cannot run rclone")),
+    };
+    if !out.status.success() {
+        bail!(
+            "rclone lsjson: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let entries: Vec<Value> =
+        serde_json::from_slice(&out.stdout).context("rclone lsjson output is not JSON")?;
+    let mut hashes = std::collections::BTreeSet::new();
+    for entry in &entries {
+        pv.listed += 1;
+        ctx.count(|p| &p.entries, 1);
+        let rel = entry["Path"].as_str().unwrap_or_default();
+        let ns = entry["ModTime"]
+            .as_str()
+            .and_then(|t| dfcore::host::parse_rfc3339(t).ok());
+        match rules.decide(&Candidate {
+            path: rel,
+            account: None,
+            time_ns: ns,
+        }) {
+            Decision::InScope => {
+                let size = entry["Size"].as_u64().unwrap_or(0);
+                pv.files += 1;
+                pv.bytes += size;
+                ctx.count(|p| &p.files, 1);
+                ctx.count(|p| &p.bytes, size);
+                if pv.sample.len() < PREVIEW_SAMPLE {
+                    pv.sample.push((rel.to_string(), size));
+                }
+                if let Some(h) = entry["Hashes"].as_object() {
+                    hashes.extend(
+                        h.iter()
+                            .filter(|(_, v)| v.as_str().is_some_and(|s| !s.is_empty()))
+                            .map(|(k, _)| k.clone()),
+                    );
+                }
+            }
+            Decision::OutOfScope(reason) => {
+                ctx.count(|p| &p.out_of_scope, 1);
+                *pv.out_of_scope.entry(reason).or_default() += 1;
+            }
+        }
+    }
+    pv.hash_types = hashes.into_iter().collect();
+    ctx.set_phase(Phase::Done);
+    Ok(pv)
+}
+
+pub fn run_with(args: &CloudArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let (remote, base) = split_source(&args.source)?;
+    let (scope, rules) = scope_rules(args)?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
 
     let mut collection = Collection::create(&output, header(args, scope, ctx)?)?;

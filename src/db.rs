@@ -17,7 +17,9 @@
 
 use crate::{
     args::DbArgs,
-    common::{self, Counting, Phase, RunCtx, Stopped},
+    common::{
+        self, Counting, Credential, CredentialKind, Phase, PreviewNote, RunCtx, Stop, Stopped,
+    },
     console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
@@ -31,11 +33,13 @@ use dfcore::manifest::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use zeroize::Zeroizing;
 
 const AUDIT_ACTION: &str = "database_acquisition";
 
@@ -75,7 +79,10 @@ impl Secrets {
         } else {
             std::env::temp_dir()
         };
-        let dir = base.join(format!("dfcollect-db-{}", std::process::id()));
+        // One per connection: a preview and its run in the same process
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = base.join(format!("dfcollect-db-{}-{n}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
         Ok(Self { dir })
     }
@@ -133,18 +140,88 @@ pub fn member_name(db: &str) -> String {
         .collect()
 }
 
-struct Session<'a> {
+/// How the clients reach the server: their environment and arguments (the
+/// password only in the files these point to, removed with the connection)
+struct Conn<'a> {
     args: &'a DbArgs,
-    ctx: &'a RunCtx<'a>,
-    collection: Collection,
-    container: Container,
+    stop: &'static Stop,
     env: Vec<(String, String)>,
     base_args: Vec<String>,
-    dumps: u64,
-    failed: u64,
+    _secrets: Secrets,
 }
 
-impl Session<'_> {
+impl<'a> Conn<'a> {
+    fn new(args: &'a DbArgs, password: Option<&str>, stop: &'static Stop) -> Result<Self> {
+        let port = port(args);
+        let secrets = Secrets::new()?;
+        let mut env = Vec::new();
+        let mut base_args: Vec<String> = Vec::new();
+        match args.engine {
+            Engine::Postgres => {
+                env.push(("PGHOST".into(), args.host.clone()));
+                env.push(("PGPORT".into(), port.to_string()));
+                env.push(("PGUSER".into(), args.user.clone()));
+                env.push(("PGCONNECT_TIMEOUT".into(), "30".into()));
+                env.push((
+                    "PGSSLMODE".into(),
+                    match args.tls {
+                        Tls::Prefer => "prefer",
+                        Tls::Off => "disable",
+                        Tls::Require => "require",
+                        Tls::Verify => "verify-full",
+                    }
+                    .into(),
+                ));
+                if args.tls == Tls::Verify {
+                    env.push(("PGSSLROOTCERT".into(), "system".into()));
+                }
+                let pass = match &password {
+                    Some(pw) => secrets.write(
+                        "pgpass",
+                        &zeroize::Zeroizing::new(pgpass_line(&args.host, port, &args.user, pw)),
+                    )?,
+                    None => secrets.write("pgpass", "")?,
+                };
+                env.push(("PGPASSFILE".into(), pass.display().to_string()));
+                base_args.push("--no-password".into());
+            }
+            Engine::Mariadb => {
+                let cnf = secrets.write(
+                    "my.cnf",
+                    &zeroize::Zeroizing::new(mycnf(password.unwrap_or(""))),
+                )?;
+                // --defaults-extra-file must come first
+                base_args.push(format!("--defaults-extra-file={}", cnf.display()));
+                base_args.extend([
+                    format!("--host={}", args.host),
+                    format!("--port={port}"),
+                    format!("--user={}", args.user),
+                    "--protocol=TCP".into(),
+                ]);
+                // MariaDB 11.4's client defaults to TLS with certificate checks
+                // (MDEV-31855), so prefer and require switch the checks off
+                match args.tls {
+                    Tls::Prefer => base_args.push("--skip-ssl-verify-server-cert".into()),
+                    Tls::Off => base_args.push("--skip-ssl".into()),
+                    Tls::Require => {
+                        base_args.extend(["--ssl".into(), "--skip-ssl-verify-server-cert".into()])
+                    }
+                    Tls::Verify => {
+                        base_args.extend(["--ssl".into(), "--ssl-verify-server-cert".into()])
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            args,
+            stop,
+            env,
+            base_args,
+            _secrets: secrets,
+        })
+    }
+
     fn command(&self, program: &str) -> Command {
         let mut c = Command::new(program);
         for (k, v) in &self.env {
@@ -154,8 +231,62 @@ impl Session<'_> {
         c
     }
 
-    /// A query through the engine's client; tab-separated rows
-    fn query(&mut self, sql: &str, db: Option<&str>) -> Result<Vec<Vec<String>>> {
+    /// The server's version, clock, settings and databases; every query
+    /// handed to `record`
+    fn server(&self, record: &mut dyn FnMut(Value) -> Result<()>) -> Result<(Value, Vec<String>)> {
+        let mut q = |sql: &str| -> Result<Vec<Vec<String>>> {
+            let (rows, detail) = self.query(sql, None)?;
+            record(detail)?;
+            rows
+        };
+        match self.args.engine {
+            Engine::Postgres => {
+                let r = q("select version(), current_setting('TimeZone'), now(), current_setting('server_version_num'), \
+                     coalesce(inet_server_addr()::text, ''), coalesce(inet_server_port()::text, ''), current_user, \
+                     pg_postmaster_start_time()")?;
+                let f = r.first().cloned().unwrap_or_default();
+                let g = |i: usize| f.get(i).cloned().unwrap_or_default();
+                let dbs = q("select datname, pg_database_size(datname), pg_encoding_to_char(encoding), datcollate \
+                     from pg_database where datallowconn and not datistemplate order by 1")?;
+                let sessions = q("select count(*) from pg_stat_activity")?;
+                Ok((
+                    json!({
+                        "version": g(0), "time_zone": g(1), "server_now": g(2), "version_num": g(3),
+                        "address": g(4), "port": g(5), "user": g(6), "started": g(7),
+                        "databases": dbs.iter().map(|d| json!({ "name": d.first(), "bytes": d.get(1), "encoding": d.get(2), "collation": d.get(3) })).collect::<Vec<_>>(),
+                        "sessions": sessions.first().and_then(|r| r.first()).cloned(),
+                    }),
+                    dbs.iter().filter_map(|d| d.first().cloned()).collect(),
+                ))
+            }
+            Engine::Mariadb => {
+                let r = q("select version(), @@global.time_zone, @@system_time_zone, now(6), @@hostname, current_user(), @@port")?;
+                let f = r.first().cloned().unwrap_or_default();
+                let g = |i: usize| f.get(i).cloned().unwrap_or_default();
+                let dbs = q("show databases")?;
+                let sessions = q("select count(*) from information_schema.processlist")?;
+                let names: Vec<String> = dbs
+                    .iter()
+                    .filter_map(|d| d.first().cloned())
+                    .filter(|d| {
+                        !["information_schema", "performance_schema", "sys"].contains(&d.as_str())
+                    })
+                    .collect();
+                Ok((
+                    json!({
+                        "version": g(0), "time_zone": g(1), "system_time_zone": g(2), "server_now": g(3),
+                        "hostname": g(4), "user": g(5), "port": g(6), "databases": names,
+                        "sessions": sessions.first().and_then(|r| r.first()).cloned(),
+                    }),
+                    names,
+                ))
+            }
+        }
+    }
+
+    /// A query through the engine's client: tab-separated rows (or the
+    /// client's error), and what the footprint records about it
+    fn query(&self, sql: &str, db: Option<&str>) -> Result<(Result<Vec<Vec<String>>>, Value)> {
         let (program, args): (&str, Vec<String>) = match self.args.engine {
             Engine::Postgres => (
                 "psql",
@@ -187,77 +318,45 @@ impl Session<'_> {
         };
         let mut cmd = self.command(program);
         cmd.args(&args);
-        let out = common::output_unless_stopped(cmd, self.ctx.stop).map_err(|e| {
+        let out = common::output_unless_stopped(cmd, self.stop).map_err(|e| {
             if e.downcast_ref::<Stopped>().is_some() {
                 e
             } else {
                 e.context(format!("Cannot run {program}"))
             }
         })?;
-        self.collection.footprint(FootprintEntry::new(
-            "query",
-            json!({ "client": program, "sql": sql, "exit": out.status.code() }),
-        ))?;
+        let detail = json!({ "client": program, "sql": sql, "exit": out.status.code() });
         if !out.status.success() {
-            bail!("{program}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            let e = anyhow::anyhow!("{program}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            return Ok((Err(e), detail));
         }
-        Ok(rows(&String::from_utf8_lossy(&out.stdout)))
+        Ok((Ok(rows(&String::from_utf8_lossy(&out.stdout))), detail))
+    }
+}
+
+struct Session<'a> {
+    args: &'a DbArgs,
+    ctx: &'a RunCtx<'a>,
+    collection: Collection,
+    container: Container,
+    conn: Conn<'a>,
+    dumps: u64,
+    failed: u64,
+}
+
+impl Session<'_> {
+    fn command(&self, program: &str) -> Command {
+        self.conn.command(program)
     }
 
     fn server(&mut self) -> Result<(Value, Vec<String>)> {
-        match self.args.engine {
-            Engine::Postgres => {
-                let r = self.query(
-                    "select version(), current_setting('TimeZone'), now(), current_setting('server_version_num'), \
-                     coalesce(inet_server_addr()::text, ''), coalesce(inet_server_port()::text, ''), current_user, \
-                     pg_postmaster_start_time()",
-                    None,
-                )?;
-                let f = r.first().cloned().unwrap_or_default();
-                let g = |i: usize| f.get(i).cloned().unwrap_or_default();
-                let dbs = self.query(
-                    "select datname, pg_database_size(datname), pg_encoding_to_char(encoding), datcollate \
-                     from pg_database where datallowconn and not datistemplate order by 1",
-                    None,
-                )?;
-                let sessions = self.query("select count(*) from pg_stat_activity", None)?;
-                Ok((
-                    json!({
-                        "version": g(0), "time_zone": g(1), "server_now": g(2), "version_num": g(3),
-                        "address": g(4), "port": g(5), "user": g(6), "started": g(7),
-                        "databases": dbs.iter().map(|d| json!({ "name": d.first(), "bytes": d.get(1), "encoding": d.get(2), "collation": d.get(3) })).collect::<Vec<_>>(),
-                        "sessions": sessions.first().and_then(|r| r.first()).cloned(),
-                    }),
-                    dbs.iter().filter_map(|d| d.first().cloned()).collect(),
-                ))
-            }
-            Engine::Mariadb => {
-                let r = self.query(
-                    "select version(), @@global.time_zone, @@system_time_zone, now(6), @@hostname, current_user(), @@port",
-                    None,
-                )?;
-                let f = r.first().cloned().unwrap_or_default();
-                let g = |i: usize| f.get(i).cloned().unwrap_or_default();
-                let dbs = self.query("show databases", None)?;
-                let sessions =
-                    self.query("select count(*) from information_schema.processlist", None)?;
-                let names: Vec<String> = dbs
-                    .iter()
-                    .filter_map(|d| d.first().cloned())
-                    .filter(|d| {
-                        !["information_schema", "performance_schema", "sys"].contains(&d.as_str())
-                    })
-                    .collect();
-                Ok((
-                    json!({
-                        "version": g(0), "time_zone": g(1), "system_time_zone": g(2), "server_now": g(3),
-                        "hostname": g(4), "user": g(5), "port": g(6), "databases": names,
-                        "sessions": sessions.first().and_then(|r| r.first()).cloned(),
-                    }),
-                    names,
-                ))
-            }
-        }
+        let Session {
+            conn, collection, ..
+        } = self;
+        conn.server(&mut |detail| {
+            collection.footprint(FootprintEntry::new("query", detail))?;
+            Ok(())
+        })
     }
 
     /// Stream one dump tool's output into the container
@@ -408,83 +507,182 @@ fn port(args: &DbArgs) -> u16 {
     })
 }
 
-pub fn run_with(args: &DbArgs, ctx: &RunCtx) -> Result<Outcome> {
-    let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let password = match &args.password_file {
-        Some(p) => Some(zeroize::Zeroizing::new(first_line(p)?)),
-        None if args.no_password => None,
-        None => Some(need_secret(
-            ctx.console.as_ref(),
-            SecretAsk {
-                prompt: "Database password: ".into(),
-                file_flag: "--password-file",
-            },
-        )?),
-    };
-    let port = port(args);
-    let secrets = Secrets::new()?;
-    let mut env = Vec::new();
-    let mut base_args: Vec<String> = Vec::new();
-    match args.engine {
-        Engine::Postgres => {
-            env.push(("PGHOST".into(), args.host.clone()));
-            env.push(("PGPORT".into(), port.to_string()));
-            env.push(("PGUSER".into(), args.user.clone()));
-            env.push(("PGCONNECT_TIMEOUT".into(), "30".into()));
-            env.push((
-                "PGSSLMODE".into(),
-                match args.tls {
-                    Tls::Prefer => "prefer",
-                    Tls::Off => "disable",
-                    Tls::Require => "require",
-                    Tls::Verify => "verify-full",
-                }
-                .into(),
-            ));
-            if args.tls == Tls::Verify {
-                env.push(("PGSSLROOTCERT".into(), "system".into()));
-            }
-            let pass = match &password {
-                Some(pw) => secrets.write(
-                    "pgpass",
-                    &zeroize::Zeroizing::new(pgpass_line(&args.host, port, &args.user, pw)),
-                )?,
-                None => secrets.write("pgpass", "")?,
-            };
-            env.push(("PGPASSFILE".into(), pass.display().to_string()));
-            base_args.push("--no-password".into());
-        }
-        Engine::Mariadb => {
-            let cnf = secrets.write(
-                "my.cnf",
-                &zeroize::Zeroizing::new(mycnf(password.as_deref().map_or("", String::as_str))),
-            )?;
-            // --defaults-extra-file must come first
-            base_args.push(format!("--defaults-extra-file={}", cnf.display()));
-            base_args.extend([
-                format!("--host={}", args.host),
-                format!("--port={port}"),
-                format!("--user={}", args.user),
-                "--protocol=TCP".into(),
-            ]);
-            // MariaDB 11.4's client defaults to TLS with certificate checks
-            // (MDEV-31855), so prefer and require switch the checks off
-            match args.tls {
-                Tls::Prefer => base_args.push("--skip-ssl-verify-server-cert".into()),
-                Tls::Off => base_args.push("--skip-ssl".into()),
-                Tls::Require => {
-                    base_args.extend(["--ssl".into(), "--skip-ssl-verify-server-cert".into()])
-                }
-                Tls::Verify => {
-                    base_args.extend(["--ssl".into(), "--ssl-verify-server-cert".into()])
-                }
-            }
+/// The password: from its file, none, the one typed for the preview
+/// (`true`), or asked now
+fn password(args: &DbArgs, ctx: &RunCtx) -> Result<(Option<Zeroizing<String>>, bool)> {
+    Ok(match &args.password_file {
+        Some(p) => (Some(Zeroizing::new(first_line(p)?)), false),
+        None if args.no_password => (None, false),
+        None => match ctx.take_credential() {
+            Some(Credential(CredentialKind::Password(pw))) => (Some(pw), true),
+            _ => (
+                Some(need_secret(
+                    ctx.console.as_ref(),
+                    SecretAsk {
+                        prompt: "Database password: ".into(),
+                        file_flag: "--password-file",
+                    },
+                )?),
+                false,
+            ),
+        },
+    })
+}
+
+/// What a preview found on the server; nothing is dumped
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbPreview {
+    /// The server's version string
+    pub server: String,
+    /// The server's clock when asked
+    pub server_time: String,
+    /// Every database: name, size in bytes if known, in scope
+    pub databases: Vec<(String, Option<u64>, bool)>,
+    /// --database names the server does not have (a run refuses them)
+    pub missing: Vec<String>,
+    /// The dump tools and their versions ("not found" when missing)
+    pub tools: Vec<(String, String)>,
+    pub target_free: Option<u64>,
+    pub at_ns: i128,
+}
+
+impl DbPreview {
+    /// For the run's footprint
+    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 1)
+    pub fn note(&self) -> PreviewNote {
+        PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview connected to the server before the acquisition (its version, clock and databases with their sizes were queried; nothing was dumped)".into(),
         }
     }
+
+    pub fn in_scope_bytes(&self) -> u64 {
+        self.databases
+            .iter()
+            .filter(|(_, _, in_scope)| *in_scope)
+            .filter_map(|(_, b, _)| *b)
+            .sum()
+    }
+
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|f| f < self.in_scope_bytes())
+    }
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "server": self.server,
+            "server_time": self.server_time,
+            "databases": self.databases.iter().map(|(n, b, s)| json!({ "name": n, "bytes": b, "in_scope": s })).collect::<Vec<_>>(),
+            "in_scope_bytes": self.in_scope_bytes(),
+            "missing": self.missing,
+            "tools": self.tools.iter().map(|(t, v)| json!({ "tool": t, "version": v })).collect::<Vec<_>>(),
+            "target_free": self.target_free,
+            "short_of_space": self.short_of_space(),
+        })
+    }
+}
+
+/// Connect, ask the server about itself and list its databases with their
+/// sizes. The same refusals as a run; a password asked for here is handed
+/// back for the run, so the examiner types it once.
+pub fn preview(args: &DbArgs, ctx: &RunCtx) -> Result<(DbPreview, Option<Credential>)> {
+    let at_ns = dfcore::host::unix_now_ns();
+    let (_, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
+    let (password, _) = password(args, ctx)?;
+    let asked = args.password_file.is_none() && !args.no_password;
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage("asking the server for its version, clock and databases");
+    let conn = Conn::new(args, password.as_deref().map(String::as_str), ctx.stop)?;
+    let (server, all) = conn.server(&mut |_| Ok(()))?;
+    let sizes: BTreeMap<String, u64> = match args.engine {
+        Engine::Postgres => server["databases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| {
+                Some((
+                    d["name"].as_str()?.to_string(),
+                    d["bytes"].as_str()?.parse().ok()?,
+                ))
+            })
+            .collect(),
+        Engine::Mariadb => {
+            let (rows, _) = conn.query(
+                "select table_schema, sum(data_length + index_length) from information_schema.tables group by table_schema",
+                None,
+            )?;
+            rows?
+                .into_iter()
+                .filter_map(|r| Some((r.first()?.clone(), r.get(1)?.parse().ok()?)))
+                .collect()
+        }
+    };
+    let databases = all
+        .iter()
+        .map(|d| {
+            (
+                d.clone(),
+                sizes.get(d).copied(),
+                args.databases.is_empty() || args.databases.contains(d),
+            )
+        })
+        .collect();
+    let missing = args
+        .databases
+        .iter()
+        .filter(|d| !all.contains(d))
+        .cloned()
+        .collect();
+    let tools = match args.engine {
+        Engine::Postgres => vec!["pg_dump", "pg_dumpall"],
+        Engine::Mariadb => vec!["mariadb-dump"],
+    }
+    .into_iter()
+    .map(|t| {
+        let mut c = Command::new(t);
+        c.arg("--version");
+        let version = common::output_unless_stopped(c, ctx.stop)
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "not found".into());
+        (t.to_string(), version)
+    })
+    .collect();
+    ctx.set_phase(Phase::Done);
+    let preview = DbPreview {
+        server: server["version"].as_str().unwrap_or_default().to_string(),
+        server_time: server["server_now"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        databases,
+        missing,
+        tools,
+        target_free: common::free_bytes(&ancestor),
+        at_ns,
+    };
+    let credential = match password {
+        Some(pw) if asked => Some(Credential(CredentialKind::Password(pw))),
+        _ => None,
+    };
+    Ok((preview, credential))
+}
+
+pub fn run_with(args: &DbArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
+    let (password, reused) = password(args, ctx)?;
+    let conn = Conn::new(args, password.as_deref().map(String::as_str), ctx.stop)?;
 
     let mut collection = Collection::create(&output, header(args, ctx)?)?;
     for entry in ctx.footprint() {
         collection.footprint(entry)?;
+    }
+    if reused {
+        collection.footprint(FootprintEntry::new(
+            "info",
+            json!({ "what": "the password typed for the preview was used; it was not asked again" }),
+        ))?;
     }
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
@@ -500,8 +698,7 @@ pub fn run_with(args: &DbArgs, ctx: &RunCtx) -> Result<Outcome> {
         ctx,
         collection,
         container,
-        env,
-        base_args,
+        conn,
         dumps: 0,
         failed: 0,
     };
@@ -596,7 +793,6 @@ pub fn run_with(args: &DbArgs, ctx: &RunCtx) -> Result<Outcome> {
         failed,
         ..
     } = session;
-    drop(secrets);
     let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));

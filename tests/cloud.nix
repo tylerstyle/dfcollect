@@ -60,6 +60,16 @@ pkgs.testers.runNixOSTest {
             " --not-before 2026-01-01T00:00:00Z --not-after 2026-07-01T00:00:00Z --json " + " ".join(extra)
         )
 
+    with subtest("a dry run lists what the run takes and writes nothing"):
+        code, stdout = run("/target/c0", "--dry-run")
+        assert code == 0, (code, stdout)
+        pv = json.loads(stdout)
+        assert pv["dry_run"] and pv["listed"] == 4 and pv["files"] == 2, pv
+        assert pv["bytes"] == len("alpha\n") + 3145728, pv
+        assert sum(pv["out_of_scope"].values()) == 2, pv
+        assert "md5" in [h.lower() for h in pv["hash_types"]], pv
+        client.fail("test -e /target/c0")
+
     with subtest("in-scope files arrive byte for byte and match the provider's MD5"):
         code, stdout = run("/target/c1")
         assert code == 0, (code, stdout)
@@ -82,6 +92,23 @@ pkgs.testers.runNixOSTest {
         assert "minio-secret-key" not in client.succeed("cat /target/c1/*.jsonl /target/c1/manifest.json")
         assert summary["remote_changes"]["added"] == [], summary
         client.succeed("dfcollect verify /target/c1")
+
+    with subtest("a stop ends rclone inside a file; the collection closes as aborted"):
+        client.succeed(
+            "systemd-run --unit c3 dfcollect cloud evidence:case --rclone-config /etc/rclone.conf"
+            " --rclone-arg=--bwlimit=100k -o /target/c3 -C CASE-CLOUD -E cloud03 -e tester"
+        )
+        # b.bin (3 MiB at 100 KiB/s) is being read when the stop comes
+        client.wait_until_succeeds("pgrep -f 'rclone.* cat .*b.bin'", timeout=60)
+        client.succeed("systemctl kill -s INT c3")
+        client.wait_until_fails("systemctl is-active c3", timeout=60)
+        manifest = json.loads(client.succeed("cat /target/c3/manifest.json"))
+        assert manifest["status"] == "aborted", manifest
+        assert any("stopped by a signal" in e for e in manifest["errors"]), manifest["errors"]
+        items = [json.loads(l) for l in client.succeed("cat /target/c3/items.jsonl").splitlines()]
+        assert "docs/b.bin" not in [i["path"] for i in items], items
+        client.fail("pgrep -x rclone")
+        client.succeed("dfcollect verify /target/c3")
 
     with subtest("a file uploaded during the acquisition shows as a remote change"):
         client.succeed("printf 'late\\n' > /root/late.txt && touch -d '2026-05-01 10:00:00Z' /root/late.txt")

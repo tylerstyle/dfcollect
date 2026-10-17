@@ -14,7 +14,7 @@
 
 use crate::{
     args::IngestArgs,
-    common::{self, Counting, Phase, RunCtx, Stopped},
+    common::{self, Counting, Phase, PreviewNote, RunCtx, Stopped},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     meta::Stamps,
@@ -258,14 +258,26 @@ fn header(args: &IngestArgs, received: &str, ctx: &RunCtx) -> Result<Header> {
     })
 }
 
-pub fn run_with(args: &IngestArgs, ctx: &RunCtx) -> Result<Outcome> {
+/// What a run and a preview both read before anything is written: the
+/// receipt time, the package's listing and the provider's hash lists
+struct Prepared {
+    received: String,
+    output: PathBuf,
+    /// The existing directory the collection will be created in
+    ancestor: PathBuf,
+    lists: Vec<(String, PathBuf, String)>,
+    listed: BTreeMap<String, Vec<Listed>>,
+    files: Vec<(String, PathBuf, &'static str)>,
+}
+
+fn prepare(args: &IngestArgs) -> Result<Prepared> {
     let received = dfcore::host::parse_rfc3339(&args.received_at)
         .map(dfcore::host::rfc3339_utc_ns)
         .map_err(|e| Usage(format!("--received-at: {e:#}")))?;
     let package = std::path::absolute(&args.package)?;
     let meta = std::fs::symlink_metadata(&package)
         .with_context(|| format!("Cannot read {}", package.display()))?;
-    let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
+    let (output, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
     if output.starts_with(&package) {
         return Err(Usage("the collection directory must not be inside the package".into()).into());
     }
@@ -296,6 +308,154 @@ pub fn run_with(args: &IngestArgs, ctx: &RunCtx) -> Result<Outcome> {
         return Err(Usage(format!("{}: a directory or a file", package.display())).into());
     };
 
+    Ok(Prepared {
+        received,
+        output,
+        ancestor,
+        lists,
+        listed,
+        files,
+    })
+}
+
+/// What a run would take: the package's files against the provider's hash
+/// lists, by name and size; no file content is read
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestPreview {
+    pub files: u64,
+    pub bytes: u64,
+    pub symlinks: u64,
+    /// Special files (a run records them as errors)
+    pub special: u64,
+    /// Files a hash list names
+    pub listed_present: u64,
+    /// Files no hash list names (errors unless --allow-unlisted); the first 1000
+    pub unlisted: Vec<String>,
+    pub unlisted_count: u64,
+    /// Names the hash lists give that the package lacks; the first 1000
+    pub missing: Vec<String>,
+    pub missing_count: u64,
+    /// Each hash list and its number of entries
+    pub lists: Vec<(String, u64)>,
+    pub target_free: Option<u64>,
+    pub stopped: Option<String>,
+    pub at_ns: i128,
+}
+
+/// How many names a preview keeps of each kind
+pub const PREVIEW_NAMES: usize = 1000;
+
+impl IngestPreview {
+    /// For the run's footprint
+    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 1)
+    pub fn note(&self) -> PreviewNote {
+        PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview listed the package and read the provider's hash lists before the acquisition (names and sizes; no file content read)".into(),
+        }
+    }
+
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|f| f < self.bytes)
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "files": self.files,
+            "bytes": self.bytes,
+            "symlinks": self.symlinks,
+            "special": self.special,
+            "listed_present": self.listed_present,
+            "unlisted": self.unlisted_count,
+            "missing": self.missing_count,
+            "hash_lists": self.lists.iter().map(|(n, c)| json!({ "name": n, "entries": c })).collect::<Vec<_>>(),
+            "target_free": self.target_free,
+            "short_of_space": self.short_of_space(),
+            "stopped": self.stopped,
+        })
+    }
+}
+
+/// Look at the package and the hash lists; write nothing
+pub fn preview(args: &IngestArgs, ctx: &RunCtx) -> Result<IngestPreview> {
+    let at_ns = dfcore::host::unix_now_ns();
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage("listing the package");
+    let p = prepare(args)?;
+    let mut pv = IngestPreview {
+        files: 0,
+        bytes: 0,
+        symlinks: 0,
+        special: 0,
+        listed_present: 0,
+        unlisted: Vec::new(),
+        unlisted_count: 0,
+        missing: Vec::new(),
+        missing_count: 0,
+        lists: p
+            .lists
+            .iter()
+            .map(|(name, _, text)| {
+                let n =
+                    parse_list(text, name).map_or(0, |l| l.values().map(Vec::len).sum::<usize>());
+                (name.clone(), n as u64)
+            })
+            .collect(),
+        target_free: common::free_bytes(&p.ancestor),
+        stopped: None,
+        at_ns,
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for (rel, full, kind) in &p.files {
+        if ctx.stop.is_set() {
+            pv.stopped = ctx.stop.reason().map(|(r, _)| r);
+            break;
+        }
+        ctx.count(|p| &p.entries, 1);
+        let key = normalize(rel);
+        seen.insert(key.clone());
+        match *kind {
+            "symlink" => pv.symlinks += 1,
+            "file" => {
+                pv.files += 1;
+                let size = std::fs::symlink_metadata(full).map_or(0, |m| m.len());
+                pv.bytes += size;
+                ctx.count(|p| &p.files, 1);
+                ctx.count(|p| &p.bytes, size);
+                if p.listed.contains_key(&key) {
+                    pv.listed_present += 1;
+                } else if !p.lists.is_empty() {
+                    pv.unlisted_count += 1;
+                    if pv.unlisted.len() < PREVIEW_NAMES {
+                        pv.unlisted.push(rel.clone());
+                    }
+                }
+            }
+            _ => pv.special += 1,
+        }
+    }
+    if pv.stopped.is_none() {
+        for path in p.listed.keys().filter(|k| !seen.contains(*k)) {
+            pv.missing_count += 1;
+            if pv.missing.len() < PREVIEW_NAMES {
+                pv.missing.push(path.clone());
+            }
+        }
+    }
+    ctx.set_phase(Phase::Done);
+    Ok(pv)
+}
+
+pub fn run_with(args: &IngestArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let Prepared {
+        received,
+        output,
+        lists,
+        listed,
+        files,
+        ..
+    } = prepare(args)?;
     let mut collection = Collection::create(&output, header(args, &received, ctx)?)?;
     let mut container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
@@ -609,7 +769,8 @@ mod tests {
             console: console.clone(),
             argv: Some(argv.clone()),
             interactive: true,
-            preview_at_ns: None,
+            preview: None,
+            credential: Default::default(),
             reference_entered_ns: None,
         };
         let out = run_with(&a, &ctx).unwrap();
@@ -630,6 +791,52 @@ mod tests {
         let m = manifest(&root.join("out"));
         assert_eq!(m["status"], "aborted");
         assert!(m.to_string().contains("stopped by the examiner"), "{m}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_preview_counts_what_the_run_takes_and_writes_nothing() {
+        use crate::common::Stop;
+        let root = package("preview");
+        // A listed file the package lacks, and an unlisted one
+        std::fs::write(
+            root.join("SHA256SUMS"),
+            format!(
+                "{}  a.txt\n{}  gone.txt\n",
+                crate::mail::client::sha256_hex(b"alpha"),
+                crate::mail::client::sha256_hex(b"gone")
+            ),
+        )
+        .unwrap();
+        let a = args(&root, &[]);
+        let stop: &'static Stop = Box::leak(Box::new(Stop::new()));
+        let pv = preview(&a, &RunCtx::cli(stop, None)).unwrap();
+        assert!(!root.join("out").exists(), "a preview wrote something");
+        assert_eq!((pv.files, pv.bytes), (2, 5 + (2 << 20)));
+        assert_eq!(pv.listed_present, 1);
+        assert_eq!(
+            (pv.unlisted_count, pv.unlisted.clone()),
+            (1, vec!["sub/b.bin".to_string()])
+        );
+        assert_eq!(
+            (pv.missing_count, pv.missing.clone()),
+            (1, vec!["gone.txt".to_string()])
+        );
+        assert_eq!(pv.lists, vec![("SHA256SUMS".to_string(), 2)]);
+        assert!(pv.stopped.is_none());
+
+        let ctx = RunCtx {
+            preview: Some(pv.note()),
+            interactive: true,
+            ..RunCtx::cli(stop, None)
+        };
+        let out = run_with(&a, &ctx).unwrap();
+        assert_eq!(out.summary["files"], 2);
+        assert_eq!(out.summary["verified"], pv.listed_present);
+        assert_eq!(out.summary["unlisted"], pv.unlisted_count);
+        assert_eq!(out.summary["missing"], pv.missing_count);
+        let fp = std::fs::read_to_string(root.join("out/footprint.jsonl")).unwrap();
+        assert!(fp.contains("a preview listed the package"), "{fp}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

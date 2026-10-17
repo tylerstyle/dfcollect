@@ -63,6 +63,27 @@ pkgs.testers.runNixOSTest {
             f"python3 -c \"import zipfile,sys; sys.stdout.buffer.write(zipfile.ZipFile('{out}/data.zip').read('{name}'))\" > /tmp/m && echo /tmp/m"
         ).strip()
 
+    with subtest("PostgreSQL: a dry run lists the databases with sizes and dumps nothing"):
+        code, stdout = client.execute(
+            "dfcollect db postgres --host server --user examiner --password-file /root/pgpw --tls off"
+            " -o /target/pgd -C CASE-DB -E db00 -e tester --dry-run --json"
+        )
+        assert code == 0, (code, stdout)
+        pv = json.loads(stdout)
+        dbs = {d["name"]: d for d in pv["databases"]}
+        assert {"postgres", "shop"} <= set(dbs), pv
+        assert dbs["shop"]["bytes"] > 0 and dbs["shop"]["in_scope"], pv
+        assert pv["server"].startswith("PostgreSQL") and pv["server_time"], pv
+        tools = {t["tool"]: t["version"] for t in pv["tools"]}
+        assert "pg_dump" in tools["pg_dump"], tools
+        client.fail("test -e /target/pgd")
+        client.fail("ls -d /dev/shm/dfcollect-db-*")
+        code, stdout = client.execute(
+            "dfcollect db postgres --host server --user examiner --password-file /root/pgpw --tls off"
+            " --database nosuch -o /target/pgd -C CASE-DB -E db00 -e tester --dry-run --json"
+        )
+        assert code == 2 and json.loads(stdout)["missing"] == ["nosuch"], (code, stdout)
+
     with subtest("PostgreSQL: a custom-format dump per database, restorable"):
         code, stdout = client.execute(
             "dfcollect db postgres --host server --user examiner --password-file /root/pgpw --tls off"
@@ -98,6 +119,19 @@ pkgs.testers.runNixOSTest {
             " -o /target/my0 -C CASE-DB -E db04 -e tester --json"
         )
         assert code == 0, (code, stdout)
+
+    with subtest("MariaDB: a dry run lists the databases with sizes"):
+        code, stdout = client.execute(
+            "dfcollect db mariadb --host server --user examiner --password-file /root/mypw --tls off"
+            " -o /target/myd -C CASE-DB -E db05 -e tester --dry-run --json"
+        )
+        assert code == 0, (code, stdout)
+        pv = json.loads(stdout)
+        dbs = {d["name"]: d for d in pv["databases"]}
+        assert "shop" in dbs and "information_schema" not in dbs, pv
+        assert dbs["shop"]["bytes"] is not None, pv
+        assert "MariaDB" in pv["server"], pv
+        client.fail("test -e /target/myd")
 
     with subtest("MariaDB: a consistent SQL dump per database"):
         code, stdout = client.execute(
