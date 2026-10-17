@@ -143,7 +143,7 @@ fn header(
     if plan.source_fs.read_only {
         primitives.insert(0, "read-only mount".into());
     }
-    let reference = common::reference(&args.clock)?;
+    let reference = common::reference_at(&args.clock, ctx.reference_entered_ns)?;
     Ok(Header {
         action: AUDIT_ACTION.into(),
         case: common::case(&args.case),
@@ -1035,8 +1035,7 @@ mod tests {
             std::fs::create_dir_all(root.join("src/d")).unwrap();
             std::fs::write(root.join("src/a.txt"), b"alpha").unwrap();
             std::fs::write(root.join("src/d/b.txt"), vec![0u8; 3 << 20]).unwrap();
-            // SAFETY: setting the audit log path before any collection is made in this process
-            std::env::set_var("DFNIX_AUDIT_LOG", root.join("audit.jsonl"));
+            common::test_audit_log();
             Self(root)
         }
 
@@ -1083,7 +1082,12 @@ mod tests {
     #[test]
     fn the_tui_records_its_command_line_and_the_preview() {
         let t = Tree::new("tui");
-        let args = t.args(&[]);
+        let args = t.args(&[
+            "--reference-time",
+            "2027-01-15T08:00:05Z",
+            "--reference-how",
+            "radio clock",
+        ]);
         let stop = Stop::new();
         let progress = Progress::default();
         let pv = preview(&args, &RunCtx::cli(&stop, Some(&progress))).unwrap();
@@ -1098,6 +1102,7 @@ mod tests {
             argv: Some(argv.clone()),
             interactive: true,
             preview_at_ns: Some(pv.at_ns),
+            reference_entered_ns: Some(1_800_000_000_000_000_000),
         };
         let progress_before = progress.bytes.load(Ordering::Relaxed);
         let out = run_with(&args, &ctx).unwrap();
@@ -1107,6 +1112,10 @@ mod tests {
         let fp = footprint(&t.0.join("out"));
         assert!(fp.contains("started from the dfcollect TUI"), "{fp}");
         assert!(fp.contains("a preview listed the source"), "{fp}");
+        // The reference time counts from when it was entered, not the start
+        let r = &m["clocks"]["reference"];
+        assert_eq!(r["local"], "2027-01-15T08:00:00.000000000Z", "{m}");
+        assert_eq!(r["offset_seconds"], 5.0, "{m}");
         // The run counted its bytes on top of the preview's
         assert_eq!(
             progress.bytes.load(Ordering::Relaxed) - progress_before,

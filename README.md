@@ -62,6 +62,60 @@ the preview in its footprint.
 **Progress.** On a terminal, `files` and `verify` show a progress line on
 stderr (not with `--json`).
 
+## Terminal UI
+
+Running `dfcollect` without arguments on a terminal opens the interactive TUI
+for `files` and `verify` (when `stdin` or `stdout` is not a terminal, `dfcollect`
+prints the command-line help and exits 2). The TUI uses the standard 16 ANSI
+colours and fits 80×24 serial and Linux virtual consoles without mouse capture,
+so paths and hashes stay selectable.
+
+1. **Home.** Choose **Acquire files from a mounted directory** (`dfcollect files`)
+   or **Verify a collection** (`dfcollect verify`). The network, cloud, database
+   and provider modes are listed with their `dfcollect <mode> --help` command.
+2. **Files form.** Fill in the case metadata, pick a read-only source mount
+   (dfmount evidence under `/media/evidence/*` first, then read-only dfnet shares,
+   or type a path with `F4`/`Tab` autocompletion), set the output collection
+   directory (auto-suggested under the first writable `/media/target/*` mount as
+   `/media/target/<mount>/<case>/<evidence>` with path-safe characters), and
+   define the warrant scope (legal basis, `--include` / `--exclude` glob lists,
+   RFC 3339 time window with live UTC hints, or a `--scope` JSON file), reference
+   clock (type the trusted clock's time a few seconds ahead and press `Enter`
+   when the clock shows it to stamp the local clock), hashes (`--md5`, `--sha1`),
+   compression, and safety overrides (`--allow-tmpfs`, `--allow-writable-source`,
+   each requiring confirmation). The bottom line shows the equivalent
+   `dfcollect files …` command live.
+3. **Preview (`F2` or `p`).** Runs `files` in dry-run mode on a background
+   thread (`Esc` or `s` stops early). Shows in-scope counts and total bytes,
+   target free space (with a warning when free space is smaller than the
+   in-scope bytes), out-of-scope counts by reason, unlisted excluded/unreachable
+   directory trees, other filesystems, walk errors, a scrollable sample of the
+   first 1000 in-scope paths (`[f]` file, `[d]` directory, `[l]` symlink, `[s]`
+   special), and the wrapped CLI command (`c` copies it via OSC 52). Names
+   outside the scope are never held or shown. Starting an acquisition (`Enter` →
+   `y`) is only possible when the preview is complete and matches the form.
+4. **Run.** Shows the phase (`Copying → Checking container → Finishing`), a
+   progress gauge on bytes copied (then on container bytes verified), files
+   acquired, out-of-scope and error counts, 5-second rolling transfer rate,
+   elapsed time, ETA and current path. Pressing `s` or `Ctrl+C` (confirmed with
+   `y`) stops the acquisition cleanly (`aborted`, `"stopped by the examiner"`,
+   exit 8); quitting directly with `q` is disabled while running.
+5. **Result & Verify.** Shows the final status and exit-code meaning, collection
+   path, totals, audit anchor, and scrollable problems/warnings. Press `v` to
+   verify the collection immediately, `n` to start the next acquisition in the
+   same case (keeping case, examiner, source, scope and options, and clearing
+   evidence, description, notes, reference clock and safety overrides), or `q`
+   to quit.
+
+**What it records.** A collection started from the TUI records the equivalent
+`dfcollect files …` command in `manifest.json` (`method.argv`), plus two
+`footprint.jsonl` entries: `"started from the dfcollect TUI; method.argv is the equivalent command line"`
+and `"a preview listed the source before the acquisition (directory listings and lstat, no file opened)"`
+with the preview timestamp (`at`). When a reference clock reading is given,
+pressing `Enter` on the field stamps the local clock at that moment
+(`clocks.reference.local`), so `offset_seconds` reflects the offset when the
+reading was taken rather than when the run started.
+
 ## What `dfcollect imap` does
 
 ```bash

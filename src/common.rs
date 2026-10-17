@@ -133,6 +133,9 @@ pub struct RunCtx<'a> {
     pub interactive: bool,
     /// When a preview listed the source before this run (Unix ns)
     pub preview_at_ns: Option<i128>,
+    /// When the examiner entered the reference time (Unix ns). None: when
+    /// the run starts, as on the command line.
+    pub reference_entered_ns: Option<i128>,
 }
 
 impl<'a> RunCtx<'a> {
@@ -143,6 +146,7 @@ impl<'a> RunCtx<'a> {
             argv: None,
             interactive: false,
             preview_at_ns: None,
+            reference_entered_ns: None,
         }
     }
 
@@ -276,9 +280,14 @@ pub fn case(args: &CaseArgs) -> Case {
 }
 
 pub fn reference(args: &ClockArgs) -> Result<Option<ReferenceTime>> {
+    reference_at(args, None)
+}
+
+/// The reference time, entered at `entered_ns` (None: now)
+pub fn reference_at(args: &ClockArgs, entered_ns: Option<i128>) -> Result<Option<ReferenceTime>> {
     match (&args.reference_time, &args.reference_how) {
         (Some(value), Some(how)) => Ok(Some(
-            ReferenceTime::new(value, how, host::unix_now_ns())
+            ReferenceTime::new(value, how, entered_ns.unwrap_or_else(host::unix_now_ns))
                 .map_err(|e| Usage(format!("{e:#}")))?,
         )),
         _ => Ok(None),
@@ -401,6 +410,24 @@ pub fn conclude_with(
         _ => 0,
     };
     Ok((code, finished, mismatches))
+}
+
+/// Set `DFNIX_AUDIT_LOG` once per test process to a per-process path so
+/// parallel tests do not race on the environment variable or delete another
+/// test's audit log while it is still writing.
+#[cfg(test)]
+pub(crate) fn test_audit_log() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let base = if Path::new("/dev/shm").is_dir() {
+            PathBuf::from("/dev/shm")
+        } else {
+            std::env::temp_dir()
+        };
+        let path = base.join(format!("dfcollect_test_audit_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var("DFNIX_AUDIT_LOG", path);
+    });
 }
 
 #[cfg(test)]

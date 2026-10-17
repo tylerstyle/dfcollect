@@ -17,6 +17,7 @@ mod meta;
 mod oauth;
 mod provider_hash;
 mod scope;
+mod tui;
 mod verify;
 
 use clap::{CommandFactory, Parser};
@@ -58,9 +59,12 @@ fn install_signal_handlers() {
     }
 }
 
-fn print(json: bool, summary: &serde_json::Value) {
+pub(crate) fn print(json: bool, summary: &serde_json::Value) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
     if json {
-        println!(
+        let _ = writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(summary).unwrap_or_default()
         );
@@ -72,7 +76,7 @@ fn print(json: bool, summary: &serde_json::Value) {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            println!("{k:>22}: {shown}");
+            let _ = writeln!(out, "{k:>22}: {shown}");
         }
     }
 }
@@ -160,7 +164,17 @@ fn main() -> ExitCode {
     let cli = args::Cli::parse();
     install_signal_handlers();
     let Some(command) = &cli.command else {
-        // The terminal UI comes with the TUI branch; until then the help
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return match tui::run(&STOP) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    // The terminal may be gone (hangup): don't panic on EIO
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr(), "Error: {e:#}");
+                    ExitCode::from(4)
+                }
+            };
+        }
         eprint!("{}", args::Cli::command().render_help());
         return ExitCode::from(2);
     };
