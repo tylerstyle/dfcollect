@@ -29,9 +29,12 @@ dfcollect files /media/evidence/sdb1/Users/anna \
    any of its content is read: path patterns (`*` and `?` within a folder, `**`
    across folders; excludes win), a time window on modified, accessed, changed
    or birth time, and the legal basis. An excluded folder tree
-   (`--exclude "X/**"`) is not even listed. Files outside the scope are only
-   counted by reason, so no names outside the warrant end up in the records.
-   `--list-out-of-scope` lists them by name instead.
+   (`--exclude "X/**"`) is not even listed, and neither is a folder that no
+   `--include` pattern can reach (with `--include "Documents/**"`, the folder
+   `Music` is counted once as "directory tree matches no include pattern").
+   Files outside the scope are only counted by reason, so no names outside the
+   warrant end up in the records. `--list-out-of-scope` lists them by name
+   instead.
 3. **Copies into one container.** In-scope files go into `data.zip` (ZIP64,
    stored, or deflated with `--compress`). Each member carries its modified,
    accessed and created times in the NTFS timestamp field, which the analysis
@@ -45,6 +48,19 @@ dfcollect files /media/evidence/sdb1/Users/anna \
 5. **Verifies.** When the copy is done, dfcollect reads the container back and
    hashes every member again.
 6. **Records everything.** See [The collection directory](#the-collection-directory).
+
+**Preview first: `--dry-run`.** The same command with `--dry-run` runs every
+check above, then walks the source with the same scope decisions and prints what
+a run would acquire: files, bytes, folders and symlinks in scope, everything
+else counted by reason, folders where another filesystem is mounted, entries
+that cannot be read, and whether the target has room. It reads only folder
+listings and file metadata, opens no file, and writes nothing: no collection
+directory, no audit record. Names outside the scope are never shown, whatever
+`--list-out-of-scope` says. A run started from the TUI after a preview notes
+the preview in its footprint.
+
+**Progress.** On a terminal, `files` and `verify` show a progress line on
+stderr (not with `--json`).
 
 ## What `dfcollect imap` does
 
@@ -381,7 +397,7 @@ is an error, never a silently wider scope:
 | 5 | The container or the records do not match |
 | 6 | Incomplete: the container could not be written (e.g. the target is full) |
 | 7 | Complete, but items failed (read errors, files changed while read) |
-| 8 | Stopped by a signal (Ctrl+C); everything acquired so far is recorded and verifiable |
+| 8 | Stopped by a signal (Ctrl+C) or, in the TUI, by the examiner; everything acquired so far is recorded and verifiable. A file being copied at that moment is left out, not recorded half |
 
 ## Building
 

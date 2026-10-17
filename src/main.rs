@@ -19,10 +19,13 @@ mod provider_hash;
 mod scope;
 mod verify;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use common::{human_bytes, Phase, Progress, RunCtx, Stop};
 use std::{
+    io::IsTerminal,
     process::ExitCode,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 
 pub const TOOL: &str = "dfcollect";
@@ -40,10 +43,10 @@ impl std::fmt::Display for Usage {
 
 impl std::error::Error for Usage {}
 
-static STOP: AtomicBool = AtomicBool::new(false);
+static STOP: Stop = Stop::new();
 
 extern "C" fn on_signal(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
+    STOP.signal.store(true, Ordering::Relaxed);
 }
 
 fn install_signal_handlers() {
@@ -74,46 +77,140 @@ fn print(json: bool, summary: &serde_json::Value) {
     }
 }
 
+/// Columns of the terminal on stderr, if it is one.
+fn stderr_columns() -> Option<usize> {
+    // SAFETY: a zeroed winsize is a valid out-parameter for TIOCGWINSZ
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and out-pointer
+    let ok = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
+    (ok && ws.ws_col > 0).then_some(ws.ws_col as usize)
+}
+
+/// The progress line: counts, then as much of the current path as fits.
+fn progress_line(p: &Progress, columns: usize) -> String {
+    let counts = match p.phase() {
+        Phase::Listing => format!(
+            "listing: {} entries, {} files in scope ({})",
+            p.entries.load(Ordering::Relaxed),
+            p.files.load(Ordering::Relaxed),
+            human_bytes(p.bytes.load(Ordering::Relaxed)),
+        ),
+        Phase::Copying => format!(
+            "{} files done, {} copied, {} out of scope, {} errors",
+            p.files.load(Ordering::Relaxed),
+            human_bytes(p.bytes.load(Ordering::Relaxed)),
+            p.out_of_scope.load(Ordering::Relaxed),
+            p.errors.load(Ordering::Relaxed),
+        ),
+        Phase::CheckingContainer => format!(
+            "checking the container: {} read",
+            human_bytes(p.check_bytes.load(Ordering::Relaxed))
+        ),
+        Phase::Finishing | Phase::Done => "closing the records".into(),
+    };
+    let mut line = counts;
+    if p.phase() == Phase::Copying {
+        let current = p.current();
+        let room = columns.saturating_sub(line.chars().count() + 3);
+        if room > 8 && !current.is_empty() {
+            let n = current.chars().count();
+            let shown: String = if n > room {
+                let tail: String = current.chars().skip(n - (room - 1)).collect();
+                format!("…{tail}")
+            } else {
+                current
+            };
+            line.push_str("  ");
+            line.push_str(&shown);
+        }
+    }
+    line.chars().take(columns.saturating_sub(1)).collect()
+}
+
+/// Run `work`, with a progress line on stderr when stderr is a terminal and
+/// the result is not JSON.
+fn with_progress<T>(json: bool, work: impl FnOnce(Option<&Progress>) -> T) -> T {
+    let columns = match stderr_columns() {
+        Some(c) if !json && std::io::stderr().is_terminal() => c,
+        _ => return work(None),
+    };
+    let progress = Progress::default();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let mut ticks = 0u32;
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                ticks += 1;
+                if ticks.is_multiple_of(5) {
+                    eprint!("\r\x1b[K{}", progress_line(&progress, columns));
+                }
+            }
+            if ticks >= 5 {
+                eprint!("\r\x1b[K");
+            }
+        });
+        let result = work(Some(&progress));
+        done.store(true, Ordering::Relaxed);
+        result
+    })
+}
+
 fn main() -> ExitCode {
     let cli = args::Cli::parse();
     install_signal_handlers();
-    let result = match &cli.command {
-        args::Command::Files(a) => files::run(a, &STOP).map(|o| {
+    let Some(command) = &cli.command else {
+        // The terminal UI comes with the TUI branch; until then the help
+        eprint!("{}", args::Cli::command().render_help());
+        return ExitCode::from(2);
+    };
+    let result = match command {
+        args::Command::Files(a) if a.dry_run => {
+            with_progress(a.json, |p| files::preview(a, &RunCtx::cli(&STOP, p))).map(|pv| {
+                print(a.json, &pv.summary());
+                pv.stopped.as_ref().map_or(0, |_| 8)
+            })
+        }
+        args::Command::Files(a) => {
+            with_progress(a.json, |p| files::run_with(a, &RunCtx::cli(&STOP, p))).map(|o| {
+                print(a.json, &o.summary);
+                o.code
+            })
+        }
+        args::Command::Imap(a) => mail::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Imap(a) => mail::run(a, &STOP).map(|o| {
+        args::Command::Graph(a) => graph::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Graph(a) => graph::run(a, &STOP).map(|o| {
+        args::Command::Cloud(a) => cloud::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Cloud(a) => cloud::run(a, &STOP).map(|o| {
+        args::Command::Db(a) => db::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Db(a) => db::run(a, &STOP).map(|o| {
+        args::Command::M365Logs(a) => m365logs::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::M365Logs(a) => m365logs::run(a, &STOP).map(|o| {
+        args::Command::Gmail(a) => gmail::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Gmail(a) => gmail::run(a, &STOP).map(|o| {
+        args::Command::Ingest(a) => ingest::run(a, &STOP.signal).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Ingest(a) => ingest::run(a, &STOP).map(|o| {
-            print(a.json, &o.summary);
-            o.code
-        }),
-        args::Command::Verify(a) => verify::run(&a.dir).map(|o| {
-            print(a.json, &o.summary);
-            o.code
-        }),
+        args::Command::Verify(a) => {
+            with_progress(a.json, |p| verify::run_with(&a.dir, &RunCtx::cli(&STOP, p))).map(|o| {
+                print(a.json, &o.summary);
+                o.code
+            })
+        }
     };
     match result {
         Ok(code) => ExitCode::from(code),

@@ -189,11 +189,123 @@ fn the_scope_decides_before_reading_and_names_stay_out() {
         "AG Musterstadt 12 Gs 34/26"
     );
     let unlisted = &manifest["totals"]["unlisted_out_of_scope"];
-    assert_eq!(unlisted["matches no include pattern"], 1, "{unlisted}");
+    // `other` cannot hold anything in scope: it is not even listed
+    assert_eq!(
+        unlisted["directory tree matches no include pattern"], 1,
+        "{unlisted}"
+    );
+    assert!(unlisted.get("matches no include pattern").is_none());
+    assert_eq!(summary["trees_outside_includes"], 1);
     assert_eq!(
         unlisted["directory tree excluded by docs/private/**"], 1,
         "{unlisted}"
     );
+}
+
+/// A tree with something of every kind and every way out of the scope
+fn mixed_tree(s: &Scratch) {
+    s.write("a.txt", b"alpha");
+    s.write("docs/report.txt", b"report");
+    s.write("docs/old.txt", b"old");
+    s.write("docs/private/diary.txt", b"diary");
+    s.write("docs/sub/deep.bin", &[1u8; 3000]);
+    s.write("unrelated/notes.txt", b"notes");
+    s.write("logs/x.log", b"log");
+    std::os::unix::fs::symlink("report.txt", s.src().join("docs/link")).unwrap();
+    let fifo = std::ffi::CString::new(s.src().join("docs/pipe").as_os_str().as_bytes()).unwrap();
+    // SAFETY: valid path
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    for f in [
+        "a.txt",
+        "docs/report.txt",
+        "docs/sub/deep.bin",
+        "unrelated/notes.txt",
+    ] {
+        set_mtime(&s.src().join(f), "2026-03-01T12:00:00Z");
+    }
+    set_mtime(&s.src().join("docs/old.txt"), "2025-01-01T00:00:00Z");
+}
+
+#[test]
+fn a_dry_run_shows_what_the_run_acquires_and_writes_nothing() {
+    let s = Scratch::new("dryrun");
+    mixed_tree(&s);
+    let scope: &[&str] = &[
+        "--include",
+        "docs/**",
+        "--include",
+        "a.txt",
+        "--exclude",
+        "docs/private/**",
+        "--exclude",
+        "docs/link",
+        "--not-before",
+        "2026-01-01T00:00:00Z",
+    ];
+    let mut args = scope.to_vec();
+    args.push("--dry-run");
+    let (code, dry, err) = files(&s, &args);
+    assert_eq!(code, 0, "{dry} {err}");
+    assert_eq!(dry["dry_run"], true);
+    // Nothing written: no collection directory, no audit record
+    assert!(!s.out().exists());
+    assert!(!s.log().exists());
+    // No name outside the scope in the output (the patterns themselves are
+    // the examiner's input and appear in the reasons)
+    let text = dry.to_string();
+    for name in ["diary", "notes", "old.txt", "x.log", "unrelated", "logs"] {
+        assert!(!text.contains(name), "{name} in {text}");
+    }
+
+    let (code, run, err) = files(&s, scope);
+    assert_eq!(code, 0, "{run} {err}");
+    for (d, r) in [
+        ("acquired", "acquired"),
+        ("in_scope_bytes", "bytes"),
+        ("excluded_trees", "excluded_trees"),
+        ("trees_outside_includes", "trees_outside_includes"),
+        ("in_scope_special", "skipped"),
+    ] {
+        assert_eq!(dry[d], run[r], "{d} vs {r}: {dry} {run}");
+    }
+    let manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(s.out().join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        dry["out_of_scope"], manifest["totals"]["unlisted_out_of_scope"],
+        "{dry}"
+    );
+    // a.txt, docs/report.txt, docs/sub, docs/sub/deep.bin ("docs/**" does not
+    // match docs itself)
+    assert_eq!(run["acquired"], 4, "{run}");
+    assert_eq!(dry["in_scope_files"], 3);
+}
+
+#[test]
+fn a_dry_run_refuses_like_a_run() {
+    let s = Scratch::new("dryrefuse");
+    s.write("a.txt", b"a");
+    let inside = s.src().join("out");
+    let (code, _, err) = dfcollect(
+        &s,
+        &[
+            "files",
+            s.src().to_str().unwrap(),
+            "-o",
+            inside.to_str().unwrap(),
+            "-C",
+            "C",
+            "-E",
+            "E",
+            "-e",
+            "x",
+            "--allow-writable-source",
+            "--allow-tmpfs",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("inside the source"), "{err}");
 }
 
 #[test]

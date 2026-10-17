@@ -11,8 +11,9 @@ use std::path::PathBuf;
     long_about = None
 )]
 pub struct Cli {
+    /// Without a command, dfcollect opens its terminal UI
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -44,7 +45,7 @@ pub enum Command {
 }
 
 /// Case and chain-of-custody fields. Case, evidence and examiner are required.
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct CaseArgs {
     /// Case number (required), e.g. "VG 12345/26"
     #[arg(
@@ -108,7 +109,7 @@ pub enum UnknownTimeArg {
 }
 
 /// The scope: given as a JSON file (`--scope`) or with the options below.
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ScopeArgs {
     /// Scope file (JSON, dfcore ScopeSpec); excludes the other scope options
     #[arg(long, value_name = "FILE", help_heading = "Scope")]
@@ -149,7 +150,7 @@ pub struct ScopeArgs {
     pub list_out_of_scope: bool,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct ClockArgs {
     /// Reference time read off a trusted clock when starting (RFC 3339)
     #[arg(
@@ -170,7 +171,7 @@ pub struct ClockArgs {
     pub reference_how: Option<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct FilesArgs {
     /// Directory to acquire, on a read-only mount
     #[arg(value_name = "SOURCE")]
@@ -208,6 +209,12 @@ pub struct FilesArgs {
     /// Acquire from a mount that is not read-only (recorded in the manifest)
     #[arg(long, help_heading = "Safety")]
     pub allow_writable_source: bool,
+
+    /// Run the checks and walk the source with the scope's decisions, then
+    /// print what would be acquired. Reads only directory listings and file
+    /// metadata, opens no file and writes nothing
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Print the result as JSON
     #[arg(long)]
@@ -783,7 +790,7 @@ pub struct IngestArgs {
     pub json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct VerifyArgs {
     /// Collection directory
     #[arg(value_name = "DIR")]

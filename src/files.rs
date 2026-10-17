@@ -4,7 +4,9 @@
 
 use crate::{
     args::{FilesArgs, TimeBasis},
-    common::{self, fs_info, FsInfo, RAMFS_MAGIC, TMPFS_MAGIC},
+    common::{
+        self, fs_info, Counting, FsInfo, Phase, Progress, RunCtx, Stop, RAMFS_MAGIC, TMPFS_MAGIC,
+    },
     container::{Container, CopyError, Hasher},
     meta::{self, Kind, Stamps},
     scope, Usage, TOOL, VERSION,
@@ -24,7 +26,6 @@ use std::{
     fs::{File, Metadata, OpenOptions},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub const CONTAINER: &str = "data.zip";
@@ -73,6 +74,9 @@ struct Plan {
     source: PathBuf,
     source_fs: FsInfo,
     mount: Option<sysfs::MountEntry>,
+    output: PathBuf,
+    /// The existing directory the collection directory will be created in
+    ancestor: PathBuf,
 }
 
 fn preflight(args: &FilesArgs) -> Result<Plan> {
@@ -116,10 +120,17 @@ fn preflight(args: &FilesArgs) -> Result<Plan> {
         source,
         source_fs,
         mount,
+        output,
+        ancestor,
     })
 }
 
-fn header(args: &FilesArgs, plan: &Plan, scope: dfcore::manifest::Scope) -> Result<Header> {
+fn header(
+    args: &FilesArgs,
+    plan: &Plan,
+    scope: dfcore::manifest::Scope,
+    ctx: &RunCtx,
+) -> Result<Header> {
     let kind = fs_kind(plan.source_fs.magic);
     let (mount_source, mount_point) = plan
         .mount
@@ -151,7 +162,7 @@ fn header(args: &FilesArgs, plan: &Plan, scope: dfcore::manifest::Scope) -> Resu
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: primitives,
             description: Some(format!(
                 "Directory tree walked without following symlinks and without leaving its filesystem; \
@@ -173,54 +184,51 @@ pub struct Outcome {
     pub summary: Value,
 }
 
-struct Walk<'a> {
-    args: &'a FilesArgs,
-    rules: ScopeRules,
-    collection: Collection,
-    container: Container,
+/// What the walk does with one entry. A run and a preview both decide through
+/// [`classify`], so the preview shows what the run acquires.
+enum Class {
+    /// `lstat` failed: only the path could be decided
+    NoMetadata {
+        error: std::io::Error,
+        decision: Decision,
+    },
+    /// A directory under an exclude pattern `<p>/**`: not walked at all
+    Pruned { pattern: String },
+    /// A directory no include pattern can match or reach below: not walked,
+    /// so nothing outside the scope is listed
+    OutsideIncludes,
+    /// A directory where another filesystem is mounted: not walked
+    OtherFilesystem,
+    /// A directory of the source's filesystem: walked, and recorded when in
+    /// scope
+    Directory {
+        decision: Decision,
+        md: Metadata,
+        stamps: Stamps,
+    },
+    /// A file, symlink or special file
+    Leaf {
+        kind: Kind,
+        decision: Decision,
+        md: Metadata,
+        stamps: Stamps,
+    },
+}
+
+/// The scope's rules and what the walk needs to apply them.
+struct Decider<'a> {
+    rules: &'a ScopeRules,
+    basis: TimeBasis,
     root_dev: u64,
-    atime_probes: u32,
-    atime_noted: bool,
-    noatime_denied: u64,
-    pruned: u64,
 }
 
-enum Step {
-    Continue,
-    /// The container cannot be written: stop
-    Fatal(String),
-}
-
-impl Walk<'_> {
+impl Decider<'_> {
     fn decide(&self, rel: &str, time_ns: Option<i128>) -> Decision {
         self.rules.decide(&Candidate {
             path: rel,
             account: None,
             time_ns,
         })
-    }
-
-    fn out_of_scope(
-        &mut self,
-        rel: &str,
-        reason: String,
-        kind: Kind,
-        md: Option<&Metadata>,
-    ) -> Result<()> {
-        if self.args.scope.list_out_of_scope {
-            let mut item = Item::out_of_scope(rel, reason);
-            item.kind = kind.item_kind();
-            if let Some(md) = md {
-                item.times = Stamps::of(md).times();
-                if kind == Kind::File {
-                    item.size = Some(md.len());
-                }
-            }
-            self.collection.add(item)?;
-        } else {
-            self.collection.count_out_of_scope(&reason);
-        }
-        Ok(())
     }
 
     /// An excluded directory tree (`<pattern>/**` matching the directory) is not
@@ -237,7 +245,296 @@ impl Walk<'_> {
             .cloned()
     }
 
+    /// Can the directory `rel` or anything below it be in scope by path?
+    fn reachable(&self, rel: &str) -> bool {
+        let include = &self.rules.scope().include;
+        include.is_empty()
+            || include
+                .iter()
+                .any(|p| dfcore::manifest::glob_match(p, rel) || could_match_below(p, rel))
+    }
+
+    /// Decide an entry from its metadata (`lstat`, never its content).
+    fn classify(&self, abs: &Path, rel: &str) -> Class {
+        let md = match std::fs::symlink_metadata(abs) {
+            Ok(md) => md,
+            Err(error) => {
+                return Class::NoMetadata {
+                    error,
+                    decision: self.decide(rel, None),
+                }
+            }
+        };
+        let kind = Kind::of(&md);
+        let stamps = Stamps::of(&md);
+        if kind == Kind::Directory {
+            if let Some(pattern) = self.pruned_by(rel) {
+                return Class::Pruned { pattern };
+            }
+            // Before the mount check, so an out-of-scope mount point is not
+            // named either
+            if !self.reachable(rel) {
+                return Class::OutsideIncludes;
+            }
+            if md.dev() != self.root_dev {
+                return Class::OtherFilesystem;
+            }
+            return Class::Directory {
+                decision: self.decide(rel, time_of(&stamps, self.basis)),
+                md,
+                stamps,
+            };
+        }
+        Class::Leaf {
+            kind,
+            decision: self.decide(rel, time_of(&stamps, self.basis)),
+            md,
+            stamps,
+        }
+    }
+}
+
+fn pruned_reason(pattern: &str) -> String {
+    format!("directory tree excluded by {pattern}")
+}
+
+const OUTSIDE_INCLUDES: &str = "directory tree matches no include pattern";
+
+/// Could `pattern` (dfcore glob syntax) match a path below the directory
+/// `dir`, i.e. `dir/<something>`? Patterns run against `dir/` as a prefix:
+/// `**` can take the rest, `*` and `?` stay within a segment.
+fn could_match_below(pattern: &str, dir: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = dir.chars().chain(std::iter::once('/')).collect();
+    let (n, m) = (p.len(), s.len());
+    // can[i][j]: p[i..] matches s[j..] followed by some non-empty rest
+    let mut can = vec![vec![false; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        // All of `dir/` consumed: any pattern left can match a name below
+        can[i][m] = true;
+        let double = p[i] == '*' && p.get(i + 1) == Some(&'*');
+        for j in (0..m).rev() {
+            can[i][j] = match p[i] {
+                '*' if double => true,
+                '*' => can[i + 1][j] || (s[j] != '/' && can[i][j + 1]),
+                '?' => s[j] != '/' && can[i + 1][j + 1],
+                c => s[j] == c && can[i + 1][j + 1],
+            };
+        }
+    }
+    n > 0 && can[0][0]
+}
+
+const OTHER_FILESYSTEM: &str = "another filesystem is mounted here; acquire it separately";
+
+enum Step {
+    Continue,
+    /// The container cannot be written: stop
+    Fatal(String),
+    /// [`Stop`] was set while a file was copied
+    Stopped,
+}
+
+/// One pass over the source: a run or a preview.
+trait Visitor {
+    /// One entry; a directory to descend into goes to `dirs`.
+    fn entry(&mut self, abs: &Path, rel: &str, dirs: &mut Vec<(PathBuf, String)>) -> Result<Step>;
+    /// A directory whose entries cannot be listed.
+    fn unlistable(&mut self, rel: &str, error: std::io::Error) -> Result<()>;
+}
+
+/// Walk the source depth-first in name order, without following symlinks.
+/// Returns why it stopped early, if it did.
+fn traverse(
+    source: &Path,
+    stop: &Stop,
+    visitor: &mut impl Visitor,
+) -> Result<Option<(String, u8)>> {
+    let mut dirs = vec![(source.to_path_buf(), String::new())];
+    while let Some((dir, rel_dir)) = dirs.pop() {
+        let names = match sorted_entries(&dir) {
+            Ok(n) => n,
+            Err(e) => {
+                let rel = if rel_dir.is_empty() {
+                    ".".to_string()
+                } else {
+                    rel_dir.clone()
+                };
+                visitor.unlistable(&rel, e)?;
+                continue;
+            }
+        };
+        // Depth-first in name order: push subdirectories in reverse
+        let mut subdirs = Vec::new();
+        for name in names {
+            if let Some(stopped) = stop.reason() {
+                return Ok(Some(stopped));
+            }
+            let display = meta::display_bytes(&name);
+            let rel = if rel_dir.is_empty() {
+                display
+            } else {
+                format!("{rel_dir}/{display}")
+            };
+            match visitor.entry(&dir.join(&name), &rel, &mut subdirs)? {
+                Step::Continue => {}
+                Step::Stopped => {
+                    return Ok(Some(stop.reason().unwrap_or_else(|| ("stopped".into(), 8))))
+                }
+                Step::Fatal(reason) => {
+                    return Ok(Some((
+                        format!("the container could not be written: {reason}"),
+                        6,
+                    )));
+                }
+            }
+        }
+        dirs.extend(subdirs.into_iter().rev());
+    }
+    Ok(None)
+}
+
+struct Walk<'a> {
+    args: &'a FilesArgs,
+    rules: ScopeRules,
+    collection: Collection,
+    container: Container,
+    root_dev: u64,
+    progress: Option<&'a Progress>,
+    stop: &'a Stop,
+    atime_probes: u32,
+    atime_noted: bool,
+    noatime_denied: u64,
+    pruned: u64,
+    outside_includes: u64,
+}
+
+impl Visitor for Walk<'_> {
+    fn entry(&mut self, abs: &Path, rel: &str, dirs: &mut Vec<(PathBuf, String)>) -> Result<Step> {
+        let class = Decider {
+            rules: &self.rules,
+            basis: self.args.scope.time_basis,
+            root_dev: self.root_dev,
+        }
+        .classify(abs, rel);
+        if let Some(p) = self.progress {
+            Progress::add(&p.entries, 1);
+        }
+        match class {
+            // Without metadata only the path can be decided
+            Class::NoMetadata { error, decision } => match decision {
+                Decision::OutOfScope(reason) => self.out_of_scope(rel, reason, Kind::File, None)?,
+                Decision::InScope => {
+                    self.error_item(rel, Kind::File, format!("cannot read metadata: {error}"))?
+                }
+            },
+            Class::Pruned { pattern } => {
+                self.pruned += 1;
+                self.count_out_of_scope(&pruned_reason(&pattern));
+            }
+            Class::OutsideIncludes => {
+                self.outside_includes += 1;
+                self.count_out_of_scope(OUTSIDE_INCLUDES);
+            }
+            Class::OtherFilesystem => {
+                let mut item = Item::new(ItemStatus::Skipped, rel);
+                item.kind = Kind::Directory.item_kind();
+                item.reason = Some(OTHER_FILESYSTEM.into());
+                self.collection.add(item)?;
+            }
+            Class::Directory {
+                decision,
+                md,
+                stamps,
+            } => return self.directory(abs, rel, decision, &md, &stamps, dirs),
+            Class::Leaf {
+                kind,
+                decision: Decision::OutOfScope(reason),
+                md,
+                ..
+            } => self.out_of_scope(rel, reason, kind, Some(&md))?,
+            Class::Leaf {
+                kind: Kind::File,
+                md,
+                stamps,
+                ..
+            } => return self.file(abs, rel, &md, &stamps),
+            Class::Leaf {
+                kind: Kind::Symlink,
+                md,
+                stamps,
+                ..
+            } => {
+                let mut item = Item::new(ItemStatus::Acquired, rel);
+                item.kind = Kind::Symlink.item_kind();
+                item.times = stamps.times();
+                item.metadata = meta::metadata(abs, &md, Kind::Symlink);
+                self.collection.add(item)?;
+            }
+            Class::Leaf {
+                kind: kind @ Kind::Special(what),
+                md,
+                stamps,
+                ..
+            } => {
+                let mut item = Item::new(ItemStatus::Skipped, rel);
+                item.kind = kind.item_kind();
+                item.times = stamps.times();
+                item.metadata = meta::metadata(abs, &md, kind);
+                item.reason = Some(format!("a {what} has no content to acquire"));
+                self.collection.add(item)?;
+            }
+            Class::Leaf {
+                kind: Kind::Directory,
+                ..
+            } => unreachable!("classify returns directories as Class::Directory"),
+        }
+        Ok(Step::Continue)
+    }
+
+    fn unlistable(&mut self, rel: &str, error: std::io::Error) -> Result<()> {
+        self.error_item(rel, Kind::Directory, format!("cannot list: {error}"))
+    }
+}
+
+impl Walk<'_> {
+    fn count_out_of_scope(&mut self, reason: &str) {
+        if let Some(p) = self.progress {
+            Progress::add(&p.out_of_scope, 1);
+        }
+        self.collection.count_out_of_scope(reason);
+    }
+
+    fn out_of_scope(
+        &mut self,
+        rel: &str,
+        reason: String,
+        kind: Kind,
+        md: Option<&Metadata>,
+    ) -> Result<()> {
+        if self.args.scope.list_out_of_scope {
+            if let Some(p) = self.progress {
+                Progress::add(&p.out_of_scope, 1);
+            }
+            let mut item = Item::out_of_scope(rel, reason);
+            item.kind = kind.item_kind();
+            if let Some(md) = md {
+                item.times = Stamps::of(md).times();
+                if kind == Kind::File {
+                    item.size = Some(md.len());
+                }
+            }
+            self.collection.add(item)?;
+        } else {
+            self.count_out_of_scope(&reason);
+        }
+        Ok(())
+    }
+
     fn error_item(&mut self, rel: &str, kind: Kind, reason: String) -> Result<()> {
+        if let Some(p) = self.progress {
+            Progress::add(&p.errors, 1);
+        }
         let mut item = Item::new(ItemStatus::Error, rel);
         item.kind = kind.item_kind();
         item.reason = Some(reason);
@@ -245,83 +542,21 @@ impl Walk<'_> {
         Ok(())
     }
 
-    fn entry(&mut self, abs: &Path, rel: &str, dirs: &mut Vec<(PathBuf, String)>) -> Result<Step> {
-        let md = match std::fs::symlink_metadata(abs) {
-            Ok(md) => md,
-            Err(e) => {
-                // Without metadata only the path can be decided
-                return match self.decide(rel, None) {
-                    Decision::OutOfScope(reason) => {
-                        self.out_of_scope(rel, reason, Kind::File, None)?;
-                        Ok(Step::Continue)
-                    }
-                    Decision::InScope => {
-                        self.error_item(rel, Kind::File, format!("cannot read metadata: {e}"))?;
-                        Ok(Step::Continue)
-                    }
-                };
-            }
-        };
-        let kind = Kind::of(&md);
-        let stamps = Stamps::of(&md);
-        if kind == Kind::Directory {
-            return self.directory(abs, rel, &md, &stamps, dirs);
-        }
-        let decision = self.decide(rel, time_of(&stamps, self.args.scope.time_basis));
-        if let Decision::OutOfScope(reason) = decision {
-            self.out_of_scope(rel, reason, kind, Some(&md))?;
-            return Ok(Step::Continue);
-        }
-        match kind {
-            Kind::File => self.file(abs, rel, &md, &stamps),
-            Kind::Symlink => {
-                let mut item = Item::new(ItemStatus::Acquired, rel);
-                item.kind = kind.item_kind();
-                item.times = stamps.times();
-                item.metadata = meta::metadata(abs, &md, kind);
-                self.collection.add(item)?;
-                Ok(Step::Continue)
-            }
-            Kind::Special(what) => {
-                let mut item = Item::new(ItemStatus::Skipped, rel);
-                item.kind = kind.item_kind();
-                item.times = stamps.times();
-                item.metadata = meta::metadata(abs, &md, kind);
-                item.reason = Some(format!("a {what} has no content to acquire"));
-                self.collection.add(item)?;
-                Ok(Step::Continue)
-            }
-            Kind::Directory => unreachable!("handled above"),
-        }
-    }
-
     fn directory(
         &mut self,
         abs: &Path,
         rel: &str,
+        decision: Decision,
         md: &Metadata,
         stamps: &Stamps,
         dirs: &mut Vec<(PathBuf, String)>,
     ) -> Result<Step> {
-        if let Some(pattern) = self.pruned_by(rel) {
-            self.pruned += 1;
-            self.collection
-                .count_out_of_scope(&format!("directory tree excluded by {pattern}"));
-            return Ok(Step::Continue);
-        }
-        if md.dev() != self.root_dev {
-            let mut item = Item::new(ItemStatus::Skipped, rel);
-            item.kind = Kind::Directory.item_kind();
-            item.reason = Some("another filesystem is mounted here; acquire it separately".into());
-            self.collection.add(item)?;
-            return Ok(Step::Continue);
-        }
-        // Descend in any case: include patterns can match below an
-        // out-of-scope directory
+        // Descend even when the directory itself is out of scope: an include
+        // pattern reaches below it (classify checked)
         dirs.push((abs.to_path_buf(), rel.to_string()));
         // A directory outside the scope is structure, not an item: neither
         // recorded nor counted
-        match self.decide(rel, time_of(stamps, self.args.scope.time_basis)) {
+        match decision {
             Decision::OutOfScope(_) => {}
             Decision::InScope => {
                 match self
@@ -350,7 +585,10 @@ impl Walk<'_> {
     }
 
     fn file(&mut self, abs: &Path, rel: &str, md: &Metadata, stamps: &Stamps) -> Result<Step> {
-        let (mut file, noatime) = match open_source(abs) {
+        if let Some(p) = self.progress {
+            p.set_current(rel);
+        }
+        let (file, noatime) = match open_source(abs) {
             Ok(f) => f,
             Err(e) => {
                 self.error_item(rel, Kind::File, format!("cannot open: {e}"))?;
@@ -370,11 +608,19 @@ impl Walk<'_> {
             return Ok(Step::Continue);
         }
         let mut hasher = Hasher::new(self.args.md5, self.args.sha1);
+        let mut source = Counting {
+            inner: file,
+            counter: self.progress.map(|p| &p.bytes),
+            stop: Some(self.stop),
+        };
         let size = match self
             .container
-            .add_file(rel, md.mode(), stamps, &mut file, &mut hasher)
+            .add_file(rel, md.mode(), stamps, &mut source, &mut hasher)
         {
             Ok(n) => n,
+            // The partial member is gone; an aborted collection does not
+            // list the file it was copying
+            Err(CopyError::Source(_)) if self.stop.is_set() => return Ok(Step::Stopped),
             Err(CopyError::Source(e)) => {
                 self.error_item(rel, Kind::File, format!("read error: {e}"))?;
                 return Ok(Step::Continue);
@@ -385,6 +631,10 @@ impl Walk<'_> {
             }
             Err(CopyError::Container(e)) => return Ok(Step::Fatal(format!("{e:#}"))),
         };
+        let file = source.inner;
+        if let Some(p) = self.progress {
+            Progress::add(&p.files, 1);
+        }
         let mut item = Item::new(ItemStatus::Acquired, rel);
         item.stored_as = Some(CONTAINER.into());
         item.member = Some(rel.to_string());
@@ -451,13 +701,22 @@ fn sorted_entries(dir: &Path) -> std::io::Result<Vec<OsString>> {
     Ok(names)
 }
 
-pub fn run(args: &FilesArgs, stop: &AtomicBool) -> Result<Outcome> {
+/// The scope's rules, checked once for the whole run
+fn rules(args: &FilesArgs) -> Result<(dfcore::manifest::Scope, ScopeRules)> {
     let scope = scope::build(&args.scope)?;
     let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
+    Ok((scope, rules))
+}
+
+pub fn run_with(args: &FilesArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let (scope, rules) = rules(args)?;
     let plan = preflight(args)?;
-    let header = header(args, &plan, scope)?;
-    let output = std::path::absolute(&args.output)?;
+    let header = header(args, &plan, scope, ctx)?;
+    let output = plan.output.clone();
     let mut collection = Collection::create(&output, header)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
     if !plan.source_fs.read_only {
         collection.footprint(FootprintEntry::new(
             "warning",
@@ -473,6 +732,9 @@ pub fn run(args: &FilesArgs, stop: &AtomicBool) -> Result<Outcome> {
             return Err(e);
         }
     };
+    if let Some(p) = ctx.progress {
+        p.set_phase(Phase::Copying);
+    }
     let root_dev = std::fs::metadata(&plan.source)?.dev();
     let mut walk = Walk {
         args,
@@ -480,56 +742,22 @@ pub fn run(args: &FilesArgs, stop: &AtomicBool) -> Result<Outcome> {
         collection,
         container,
         root_dev,
+        progress: ctx.progress,
+        stop: ctx.stop,
         atime_probes: 0,
         atime_noted: false,
         noatime_denied: 0,
         pruned: 0,
+        outside_includes: 0,
     };
-
-    let mut dirs = vec![(plan.source.clone(), String::new())];
-    let mut stopped: Option<(String, u8)> = None;
-    'walk: while let Some((dir, rel_dir)) = dirs.pop() {
-        let names = match sorted_entries(&dir) {
-            Ok(n) => n,
-            Err(e) => {
-                let rel = if rel_dir.is_empty() {
-                    ".".to_string()
-                } else {
-                    rel_dir.clone()
-                };
-                walk.error_item(&rel, Kind::Directory, format!("cannot list: {e}"))?;
-                continue;
-            }
-        };
-        // Depth-first in name order: push subdirectories in reverse
-        let mut subdirs = Vec::new();
-        for name in names {
-            if stop.load(Ordering::Relaxed) {
-                stopped = Some(("stopped by a signal".into(), 8));
-                break 'walk;
-            }
-            let display = meta::display_bytes(&name);
-            let rel = if rel_dir.is_empty() {
-                display
-            } else {
-                format!("{rel_dir}/{display}")
-            };
-            match walk.entry(&dir.join(&name), &rel, &mut subdirs)? {
-                Step::Continue => {}
-                Step::Fatal(reason) => {
-                    stopped = Some((format!("the container could not be written: {reason}"), 6));
-                    break 'walk;
-                }
-            }
-        }
-        dirs.extend(subdirs.into_iter().rev());
-    }
+    let mut stopped = traverse(&plan.source, ctx.stop, &mut walk)?;
 
     let Walk {
         mut collection,
         container,
         noatime_denied,
         pruned,
+        outside_includes,
         ..
     } = walk;
     if noatime_denied > 0 {
@@ -542,7 +770,11 @@ pub fn run(args: &FilesArgs, stop: &AtomicBool) -> Result<Outcome> {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
 
-    let (code, finished, mismatches) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, mismatches) =
+        common::conclude_with(collection, &output, stopped, ctx.progress, Some(ctx.stop))?;
+    if let Some(p) = ctx.progress {
+        p.set_phase(Phase::Done);
+    }
     let m = &finished.manifest;
     let unlisted: u64 = m.totals.unlisted_out_of_scope.values().sum();
     Ok(Outcome {
@@ -555,6 +787,7 @@ pub fn run(args: &FilesArgs, stop: &AtomicBool) -> Result<Outcome> {
             "out_of_scope_listed": m.totals.out_of_scope,
             "out_of_scope_counted": unlisted,
             "excluded_trees": pruned,
+            "trees_outside_includes": outside_includes,
             "errors": m.totals.errors,
             "skipped": m.totals.skipped,
             "container_mismatches": mismatches,
@@ -563,4 +796,355 @@ pub fn run(args: &FilesArgs, stop: &AtomicBool) -> Result<Outcome> {
             "warnings": finished.warnings,
         }),
     })
+}
+
+/// How many in-scope paths a preview keeps for display.
+pub const PREVIEW_SAMPLE: usize = 1000;
+
+/// One in-scope entry of a preview's sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleEntry {
+    pub kind: Kind,
+    pub path: String,
+    /// Files only
+    pub size: Option<u64>,
+}
+
+/// What a run with these arguments would do, from a walk that reads only
+/// directory listings and `lstat`. Names outside the scope are never kept:
+/// they are counted by reason, whatever `--list-out-of-scope` says.
+#[derive(Debug, Clone, Default)]
+pub struct Preview {
+    pub source: PathBuf,
+    pub output: PathBuf,
+    /// In scope: files and their bytes, directories, symlinks
+    pub files: u64,
+    pub bytes: u64,
+    pub directories: u64,
+    pub symlinks: u64,
+    /// Special files in scope (recorded as skipped: no content)
+    pub special: u64,
+    /// Out of scope, by the reason the manifest gives
+    pub out_of_scope: std::collections::BTreeMap<String, u64>,
+    pub excluded_trees: u64,
+    /// Directory trees no include pattern reaches (not listed)
+    pub trees_outside_includes: u64,
+    /// Directories where another filesystem is mounted (recorded as skipped)
+    pub other_filesystems: Vec<String>,
+    /// Entries a run records as errors: unlistable directories, unreadable
+    /// metadata in scope
+    pub errors: Vec<(String, String)>,
+    /// The first [`PREVIEW_SAMPLE`] in-scope entries, in walk order
+    pub sample: Vec<SampleEntry>,
+    /// Free bytes for an unprivileged writer where the collection goes
+    pub target_free: Option<u64>,
+    /// Why the preview ended early
+    pub stopped: Option<String>,
+    /// When the preview started listing (Unix ns), for [`RunCtx::preview_at_ns`]
+    pub at_ns: i128,
+}
+
+impl Preview {
+    /// The run's `acquired` total: files, directories and symlinks
+    pub fn acquired(&self) -> u64 {
+        self.files + self.directories + self.symlinks
+    }
+
+    /// Free space is known and smaller than the in-scope bytes. The container
+    /// adds headers to that.
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|free| free < self.bytes)
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "source": self.source,
+            "collection": self.output,
+            "acquired": self.acquired(),
+            "in_scope_files": self.files,
+            "in_scope_bytes": self.bytes,
+            "in_scope_directories": self.directories,
+            "in_scope_symlinks": self.symlinks,
+            "in_scope_special": self.special,
+            "out_of_scope": self.out_of_scope,
+            "excluded_trees": self.excluded_trees,
+            "trees_outside_includes": self.trees_outside_includes,
+            "other_filesystems": self.other_filesystems,
+            "errors": self.errors.iter().map(|(p, e)| format!("{p}: {e}")).collect::<Vec<_>>(),
+            "target_free_bytes": self.target_free,
+            "short_of_space": self.short_of_space(),
+            "stopped": self.stopped,
+        })
+    }
+}
+
+struct PreviewWalk<'a> {
+    decider: Decider<'a>,
+    preview: Preview,
+    progress: Option<&'a Progress>,
+}
+
+impl PreviewWalk<'_> {
+    fn sample(&mut self, kind: Kind, path: &str, size: Option<u64>) {
+        if self.preview.sample.len() < PREVIEW_SAMPLE {
+            self.preview.sample.push(SampleEntry {
+                kind,
+                path: path.to_string(),
+                size,
+            });
+        }
+    }
+
+    fn out_of_scope(&mut self, reason: String) {
+        if let Some(p) = self.progress {
+            Progress::add(&p.out_of_scope, 1);
+        }
+        *self.preview.out_of_scope.entry(reason).or_default() += 1;
+    }
+
+    fn error(&mut self, path: &str, message: String) {
+        if let Some(p) = self.progress {
+            Progress::add(&p.errors, 1);
+        }
+        self.preview.errors.push((path.to_string(), message));
+    }
+}
+
+impl Visitor for PreviewWalk<'_> {
+    fn entry(&mut self, abs: &Path, rel: &str, dirs: &mut Vec<(PathBuf, String)>) -> Result<Step> {
+        if let Some(p) = self.progress {
+            Progress::add(&p.entries, 1);
+        }
+        match self.decider.classify(abs, rel) {
+            Class::NoMetadata { error, decision } => match decision {
+                Decision::OutOfScope(reason) => self.out_of_scope(reason),
+                Decision::InScope => self.error(rel, format!("cannot read metadata: {error}")),
+            },
+            Class::Pruned { pattern } => {
+                self.preview.excluded_trees += 1;
+                self.out_of_scope(pruned_reason(&pattern));
+            }
+            Class::OutsideIncludes => {
+                self.preview.trees_outside_includes += 1;
+                self.out_of_scope(OUTSIDE_INCLUDES.into());
+            }
+            Class::OtherFilesystem => self.preview.other_filesystems.push(rel.to_string()),
+            Class::Directory { decision, .. } => {
+                dirs.push((abs.to_path_buf(), rel.to_string()));
+                if decision == Decision::InScope {
+                    self.preview.directories += 1;
+                    self.sample(Kind::Directory, rel, None);
+                }
+            }
+            Class::Leaf {
+                decision: Decision::OutOfScope(reason),
+                ..
+            } => self.out_of_scope(reason),
+            Class::Leaf { kind, md, .. } => {
+                let size = (kind == Kind::File).then_some(md.len());
+                match kind {
+                    Kind::File => {
+                        self.preview.files += 1;
+                        self.preview.bytes += md.len();
+                        if let Some(p) = self.progress {
+                            Progress::add(&p.files, 1);
+                            Progress::add(&p.bytes, md.len());
+                        }
+                    }
+                    Kind::Symlink => self.preview.symlinks += 1,
+                    _ => self.preview.special += 1,
+                }
+                self.sample(kind, rel, size);
+            }
+        }
+        Ok(Step::Continue)
+    }
+
+    fn unlistable(&mut self, rel: &str, error: std::io::Error) -> Result<()> {
+        self.error(rel, format!("cannot list: {error}"));
+        Ok(())
+    }
+}
+
+/// `dfcollect files --dry-run` and the TUI's preview: the preflight with all
+/// its refusals, then a walk with the run's own decisions that opens no file
+/// and writes nothing.
+pub fn preview(args: &FilesArgs, ctx: &RunCtx) -> Result<Preview> {
+    let (_, rules) = rules(args)?;
+    let plan = preflight(args)?;
+    if let Some(p) = ctx.progress {
+        p.set_phase(Phase::Listing);
+    }
+    let root_dev = std::fs::metadata(&plan.source)?.dev();
+    let mut walk = PreviewWalk {
+        decider: Decider {
+            rules: &rules,
+            basis: args.scope.time_basis,
+            root_dev,
+        },
+        preview: Preview {
+            source: plan.source.clone(),
+            output: plan.output.clone(),
+            target_free: common::free_bytes(&plan.ancestor),
+            at_ns: host::unix_now_ns(),
+            ..Default::default()
+        },
+        progress: ctx.progress,
+    };
+    let stopped = traverse(&plan.source, ctx.stop, &mut walk)?;
+    if let Some(p) = ctx.progress {
+        p.set_phase(Phase::Done);
+    }
+    let mut preview = walk.preview;
+    preview.stopped = stopped.map(|(reason, _)| reason);
+    Ok(preview)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::{Cli, Command};
+    use clap::Parser;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn patterns_reach_below_a_directory() {
+        assert!(could_match_below("docs/**", "docs"));
+        assert!(could_match_below("docs/**", "docs/sub"));
+        assert!(could_match_below("**/*.txt", "any/where"));
+        assert!(could_match_below("d*/x", "docs"));
+        assert!(could_match_below("docs/?/x", "docs/a"));
+        assert!(could_match_below("*/*.txt", "a"));
+        assert!(!could_match_below("docs/**", "other"));
+        assert!(!could_match_below("*.txt", "sub"));
+        assert!(!could_match_below("docs", "docs"));
+        assert!(!could_match_below("docs/a", "docs/a"));
+        assert!(!could_match_below("d*/x", "do/cs"));
+        assert!(!could_match_below("docs/?/x", "docs/ab"));
+        assert!(!could_match_below("", "docs"));
+    }
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(tag: &str) -> Self {
+            let root = PathBuf::from("/dev/shm")
+                .join(format!("dfcollect_files_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("src/d")).unwrap();
+            std::fs::write(root.join("src/a.txt"), b"alpha").unwrap();
+            std::fs::write(root.join("src/d/b.txt"), vec![0u8; 3 << 20]).unwrap();
+            // SAFETY: setting the audit log path before any collection is made in this process
+            std::env::set_var("DFNIX_AUDIT_LOG", root.join("audit.jsonl"));
+            Self(root)
+        }
+
+        fn args(&self, extra: &[&str]) -> FilesArgs {
+            let src = self.0.join("src");
+            let out = self.0.join("out");
+            let mut argv = vec![
+                "dfcollect",
+                "files",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "-C",
+                "C",
+                "-E",
+                "E",
+                "-e",
+                "x",
+                "--allow-writable-source",
+                "--allow-tmpfs",
+            ];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).unwrap().command {
+                Some(Command::Files(a)) => *a,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn manifest(dir: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    fn footprint(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("footprint.jsonl")).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_tui_records_its_command_line_and_the_preview() {
+        let t = Tree::new("tui");
+        let args = t.args(&[]);
+        let stop = Stop::new();
+        let progress = Progress::default();
+        let pv = preview(&args, &RunCtx::cli(&stop, Some(&progress))).unwrap();
+        assert_eq!((pv.files, pv.bytes), (2, 5 + (3 << 20)));
+        assert_eq!(progress.phase(), Phase::Done);
+        let argv: Vec<String> = ["dfcollect", "files", "(equivalent)"]
+            .map(String::from)
+            .to_vec();
+        let ctx = RunCtx {
+            stop: &stop,
+            progress: Some(&progress),
+            argv: Some(argv.clone()),
+            interactive: true,
+            preview_at_ns: Some(pv.at_ns),
+        };
+        let progress_before = progress.bytes.load(Ordering::Relaxed);
+        let out = run_with(&args, &ctx).unwrap();
+        assert_eq!(out.code, 0, "{}", out.summary);
+        let m = manifest(&t.0.join("out"));
+        assert_eq!(m["method"]["argv"], json!(argv));
+        let fp = footprint(&t.0.join("out"));
+        assert!(fp.contains("started from the dfcollect TUI"), "{fp}");
+        assert!(fp.contains("a preview listed the source"), "{fp}");
+        // The run counted its bytes on top of the preview's
+        assert_eq!(
+            progress.bytes.load(Ordering::Relaxed) - progress_before,
+            5 + (3 << 20)
+        );
+        assert!(progress.check_bytes.load(Ordering::Relaxed) >= 5 + (3 << 20));
+    }
+
+    #[test]
+    fn a_stop_by_the_examiner_is_recorded_as_such() {
+        let t = Tree::new("stop");
+        let args = t.args(&[]);
+        let stop = Stop::new();
+        stop.examiner.store(true, Ordering::Relaxed);
+        let out = run_with(&args, &RunCtx::cli(&stop, None)).unwrap();
+        assert_eq!(out.code, 8, "{}", out.summary);
+        let m = manifest(&t.0.join("out"));
+        assert_eq!(m["status"], "aborted", "{m}");
+        assert!(m.to_string().contains("stopped by the examiner"), "{m}");
+        stop.clear_examiner();
+        assert!(!stop.is_set());
+    }
+
+    #[test]
+    fn a_stop_ends_a_large_file_and_leaves_it_out() {
+        // A reader that sets the stop after its first block
+        let stop = Stop::new();
+        let data = vec![0u8; 3 << 20];
+        let mut counting = Counting {
+            inner: &data[..],
+            counter: None,
+            stop: Some(&stop),
+        };
+        let mut buf = vec![0u8; 1 << 20];
+        use std::io::Read;
+        assert_eq!(counting.read(&mut buf).unwrap(), 1 << 20);
+        stop.examiner.store(true, Ordering::Relaxed);
+        let e = counting.read(&mut buf).unwrap_err();
+        assert!(e.to_string().contains("stopped"));
+    }
 }

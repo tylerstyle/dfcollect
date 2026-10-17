@@ -7,7 +7,10 @@
 //! (modified, seconds) instead, so that no creation time is invented. The
 //! manifest holds every time at full precision either way.
 
-use crate::meta::Stamps;
+use crate::{
+    common::{Stop, Stopped},
+    meta::Stamps,
+};
 use anyhow::{Context, Result};
 use digest::Digest;
 use std::{
@@ -15,6 +18,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use zip::{
     write::{FullFileOptions, ZipWriter},
@@ -247,8 +251,13 @@ impl Container {
     }
 }
 
-/// Read every member back from the finished container and hash it.
-pub fn hash_members(path: &Path) -> Result<std::collections::HashMap<String, (u64, String)>> {
+/// Read every member back from the finished container and hash it. `read`
+/// counts the bytes read; a set `stop` ends it with [`Stopped`].
+pub fn hash_members(
+    path: &Path,
+    read: Option<&AtomicU64>,
+    stop: Option<&Stop>,
+) -> Result<std::collections::HashMap<String, (u64, String)>> {
     let file = File::open(path).with_context(|| format!("Cannot open {}", path.display()))?;
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("{} is not a readable ZIP", path.display()))?;
@@ -268,6 +277,9 @@ pub fn hash_members(path: &Path) -> Result<std::collections::HashMap<String, (u6
         let mut h = sha2::Sha256::new();
         let mut size = 0u64;
         loop {
+            if stop.is_some_and(Stop::is_set) {
+                return Err(Stopped.into());
+            }
             let n = member
                 .read(&mut buf)
                 .with_context(|| format!("{}: reading {name}", path.display()))?;
@@ -276,6 +288,9 @@ pub fn hash_members(path: &Path) -> Result<std::collections::HashMap<String, (u6
             }
             h.update(&buf[..n]);
             size += n as u64;
+            if let Some(r) = read {
+                r.fetch_add(n as u64, Ordering::Relaxed);
+            }
         }
         out.insert(name, (size, hex(&h.finalize())));
     }
@@ -367,7 +382,7 @@ mod tests {
         c.add_file("a/after.txt", 0o644, &stamps, &mut &b"after"[..], &mut h2)
             .unwrap();
         c.finish().unwrap();
-        let members = hash_members(&path).unwrap();
+        let members = hash_members(&path, None, None).unwrap();
         assert!(!members.contains_key("a/bad.bin"));
         assert_eq!(
             &members["a/after.txt"].1,

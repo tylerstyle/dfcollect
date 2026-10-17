@@ -1,7 +1,12 @@
 //! `dfcollect verify`: the records, the container members and the audit
 //! anchors of a finished collection.
 
-use crate::{container, files::CONTAINER, Usage};
+use crate::{
+    common::{Phase, RunCtx, Stopped},
+    container,
+    files::CONTAINER,
+    Usage,
+};
 use anyhow::Result;
 use dfcore::manifest::{self, ItemStatus};
 use serde_json::{json, Value};
@@ -12,7 +17,10 @@ pub struct Outcome {
     pub summary: Value,
 }
 
-pub fn run(dir: &Path) -> Result<Outcome> {
+/// Verify `dir`; reading the container back is counted in
+/// `ctx.progress.check_bytes` and ends early when `ctx.stop` is set (exit 8,
+/// nothing changed).
+pub fn run_with(dir: &Path, ctx: &RunCtx) -> Result<Outcome> {
     if !dir.join(manifest::MANIFEST).is_file() {
         return Err(Usage(format!(
             "{} holds no collection (no {})",
@@ -25,11 +33,32 @@ pub fn run(dir: &Path) -> Result<Outcome> {
     let mut members_ok = 0u64;
     let mut member_problems = Vec::new();
     let container_path = dir.join(CONTAINER);
+    if let Some(p) = ctx.progress {
+        p.set_phase(Phase::CheckingContainer);
+    }
+    let read = ctx.progress.map(|p| &p.check_bytes);
     let members = if container_path.exists() {
-        Some(container::hash_members(&container_path))
+        Some(container::hash_members(
+            &container_path,
+            read,
+            Some(ctx.stop),
+        ))
     } else {
         None
     };
+    if let Some(Err(e)) = &members {
+        if e.downcast_ref::<Stopped>().is_some() {
+            let (reason, code) = ctx.stop.reason().unwrap_or_else(|| ("stopped".into(), 8));
+            return Ok(Outcome {
+                code,
+                summary: json!({
+                    "collection": dir,
+                    "ok": false,
+                    "stopped": reason,
+                }),
+            });
+        }
+    }
     match members {
         Some(Err(e)) => member_problems.push(format!("{CONTAINER}: {e:#}")),
         Some(Ok(members)) => {
@@ -51,6 +80,9 @@ pub fn run(dir: &Path) -> Result<Outcome> {
             })?;
         }
         None => {}
+    }
+    if let Some(p) = ctx.progress {
+        p.set_phase(Phase::Done);
     }
     let ok = report.ok() && member_problems.is_empty();
     let code = if ok {
