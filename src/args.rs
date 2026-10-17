@@ -291,6 +291,12 @@ pub struct ImapArgs {
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
 
+    /// Only preview: sign in, list the folders and the messages' metadata
+    /// (EXAMINE, UID FETCH of UID, FLAGS, INTERNALDATE, RFC822.SIZE) and print
+    /// what would be acquired. Fetches no message body and writes nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Print the result as JSON
     #[arg(long)]
     pub json: bool,
@@ -394,6 +400,11 @@ pub struct GraphArgs {
     /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
+
+    /// Only preview: sign in, list the folders and the messages' metadata and
+    /// print what would be acquired. Fetches no message body and writes nothing
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Print the result as JSON
     #[arg(long)]
@@ -729,6 +740,12 @@ pub struct GmailArgs {
     /// Accept a collection directory on a RAM-backed filesystem (tmpfs)
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
+
+    /// Only preview: sign in, list the messages and their metadata
+    /// (format=minimal) and print what would be acquired. Fetches no message
+    /// body and writes nothing
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Print the result as JSON
     #[arg(long)]

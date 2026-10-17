@@ -161,6 +161,11 @@ pub struct Credential(pub(crate) CredentialKind);
 pub(crate) enum CredentialKind {
     /// A password the examiner typed for the preview
     Password(zeroize::Zeroizing<String>),
+    /// The preview's sign-in (its tokens renew as needed) and its record
+    OAuth {
+        auth: Box<crate::oauth::Auth>,
+        record: serde_json::Value,
+    },
 }
 
 /// How a run is started: by the CLI or by the TUI.
@@ -231,6 +236,14 @@ impl RunCtx<'_> {
     /// The preview's credential, once
     pub(crate) fn take_credential(&self) -> Option<Credential> {
         self.credential.lock().ok()?.take()
+    }
+
+    /// A failed preview leaves its credential here, so the caller can still
+    /// hand it to the next preview or the run (no second sign-in)
+    pub(crate) fn keep_credential(&self, credential: Option<Credential>) {
+        if let (Some(c), Ok(mut slot)) = (credential, self.credential.lock()) {
+            *slot = Some(c);
+        }
     }
 
     pub fn set_phase(&self, phase: Phase) {
@@ -607,12 +620,10 @@ pub fn conclude(
 pub(crate) fn test_audit_log() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        let base = if Path::new("/dev/shm").is_dir() {
-            PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
-        let path = base.join(format!("dfcollect_test_audit_{}.jsonl", std::process::id()));
+        // Under target/ (removed with `cargo clean`), one per test process
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let _ = std::fs::create_dir_all(&base);
+        let path = base.join(format!("test-audit-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         std::env::set_var("DFNIX_AUDIT_LOG", path);
     });

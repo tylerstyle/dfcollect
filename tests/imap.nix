@@ -109,6 +109,7 @@ pkgs.testers.runNixOSTest {
         assert code == 0, (code, stdout)
         summary = json.loads(stdout)
         assert summary["messages"] == 3, summary
+        tls_bytes = summary["bytes"]
         items = [json.loads(l) for l in client.succeed("cat /target/tls/items.jsonl").splitlines()]
         got = {i["path"]: i for i in items}
         assert sorted(got) == ["Entwürfe/1", "INBOX/1", "INBOX/2"], sorted(got)
@@ -149,6 +150,19 @@ pkgs.testers.runNixOSTest {
         manifest = json.loads(client.succeed("cat /target/wrongpin/manifest.json"))
         assert manifest["status"] == "aborted", manifest
         assert "pinned" in " ".join(manifest["errors"]), manifest
+
+    with subtest("a dry run counts what the run takes, fetches no body and writes nothing"):
+        code, stdout = run("/target/dry", "--dry-run")
+        assert code == 0, (code, stdout)
+        pv = json.loads(stdout)
+        assert pv["dry_run"] and pv["in_scope"] == 3 and pv["bytes"] == tls_bytes, (pv, tls_bytes)
+        assert pv["out_of_scope"] == {
+            "INTERNALDATE before the time window": 1,
+            "folder excluded by Spam/**": 1,
+            "folder matches no include pattern": 1,
+        }, pv
+        assert pv["auth_method"] in ("PLAIN", "LOGIN"), pv
+        client.fail("test -e /target/dry")
 
     with subtest("no flag changed on the server"):
         assert flags() == before, (before, flags())

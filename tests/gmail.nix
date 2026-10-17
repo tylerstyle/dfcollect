@@ -162,6 +162,24 @@ pkgs.testers.runNixOSTest {
         assert not any("messages/m3?format=raw" in r["path"] for r in gmail_reqs), "out-of-scope m3 fetched raw"
         assert not any("messages/m4?format=raw" in r["path"] for r in gmail_reqs), "excluded m4 fetched raw"
 
+    with subtest("a dry run counts what the run takes and fetches no message body"):
+        before = len(requests())
+        code, stdout = client.execute(
+            f"dfcollect gmail --auth service-account --key-file ${certs}/sa.json"
+            f" --mailbox alice@workspace.test -o /target/dry --dry-run {COMMON_ARGS}"
+        )
+        assert code == 0, (code, stdout)
+        pv = json.loads(stdout)
+        assert pv["in_scope"] == 5 and pv["errors"] == 1 and pv["bytes"] > 0, pv
+        assert pv["out_of_scope"] == {
+            "internalDate before the time window": 1,
+            "excluded by SPAM/**": 1,
+        }, pv
+        assert pv["auth_method"] == "service account (domain-wide delegation)", pv
+        new = requests()[before:]
+        assert new and not any("format=raw" in r["path"] for r in new), new
+        client.fail("test -e /target/dry")
+
     with subtest("installed sign-in via loopback listener (ignores probes without state, then curl -L)"):
         client.succeed(
             f"python3 - <<'PY'\n"

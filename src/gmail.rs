@@ -24,7 +24,7 @@
 
 use crate::{
     args::GmailArgs,
-    common::{self, Phase, RunCtx},
+    common::{self, Credential, Phase, PreviewNote, RunCtx},
     console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
@@ -32,7 +32,7 @@ use crate::{
     http::{encode, Client},
     mail::first_line,
     meta::Stamps,
-    oauth::{b64decode, pem_der, Auth, Flow},
+    oauth::{self, b64decode, pem_der, Auth, Flow, SignInWith},
     scope, Usage, TOOL, VERSION,
 };
 use anyhow::{bail, Context, Result};
@@ -276,14 +276,76 @@ struct Session<'a> {
     query: Option<String>,
     rules: ScopeRules,
     labels: LabelMap,
-    collection: Collection,
-    container: Container,
+    /// None: a preview (records nothing, stores nothing)
+    collection: Option<Collection>,
+    container: Option<Container>,
     ctx: &'a RunCtx<'a>,
     messages_listed: u64,
     bodies: u64,
 }
 
+const RUN_ONLY: &str = "a preview has no collection";
+
+/// A message's metadata (format=minimal) and where the run would store it
+struct Minimal {
+    m: Value,
+    label_ids: Vec<String>,
+    label_names: Vec<String>,
+    label_objects: Vec<Value>,
+    primary_label: String,
+    rfc3339: String,
+    ns: Option<i128>,
+    msg_name: String,
+    path: String,
+}
+
 impl Session<'_> {
+    /// The run's collection
+    fn rec(&mut self) -> Result<&mut Collection> {
+        self.collection.as_mut().context(RUN_ONLY)
+    }
+
+    /// GET format=minimal: the labels, date and size; `Err(reason)` when the
+    /// message could not be read
+    fn minimal(&mut self, id: &str) -> Result<std::result::Result<Minimal, String>> {
+        let min_url = format!("{}/messages/{}?format=minimal", self.base, encode(id));
+        let min_resp = self.api.get(&min_url, "application/json")?;
+        if min_resp.status != 200 {
+            return Ok(Err(format!(
+                "GET format=minimal: HTTP {}: {}",
+                min_resp.status,
+                min_resp.error_text()
+            )));
+        }
+        let m = match min_resp.json() {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(format!("GET format=minimal: {e:#}"))),
+        };
+        let label_ids: Vec<String> = m["labelIds"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (primary_label, label_names, label_objects) = self.labels.resolve(&label_ids);
+        let (rfc3339, ns) = parse_internal_date(&m[TIME_BASIS]);
+        let msg_name = message_name(&rfc3339, id);
+        let path = format!("{primary_label}/{msg_name}");
+        Ok(Ok(Minimal {
+            m,
+            label_ids,
+            label_names,
+            label_objects,
+            primary_label,
+            rfc3339,
+            ns,
+            msg_name,
+            path,
+        }))
+    }
+
     fn load_labels(&mut self) -> Result<()> {
         let url = format!("{}/labels", self.base);
         let v = self.api.get_json(&url)?;
@@ -294,7 +356,10 @@ impl Session<'_> {
             .values()
             .map(|l| json!({ "id": l.id, "name": l.name, "user": l.is_user }))
             .collect();
-        self.collection.footprint(FootprintEntry::new(
+        let Some(collection) = &mut self.collection else {
+            return Ok(());
+        };
+        collection.footprint(FootprintEntry::new(
             "request",
             json!({
                 "request": "GET users/me/labels",
@@ -344,7 +409,10 @@ impl Session<'_> {
             }
         }
         self.messages_listed = ids.len() as u64;
-        self.collection.footprint(FootprintEntry::new(
+        let Some(collection) = &mut self.collection else {
+            return Ok(ids);
+        };
+        collection.footprint(FootprintEntry::new(
             "request",
             json!({
                 "request": "GET users/me/messages?includeSpamTrash=true",
@@ -357,45 +425,28 @@ impl Session<'_> {
 
     fn message(&mut self, id: &str) -> Result<()> {
         self.ctx.set_current(id);
-        let min_url = format!("{}/messages/{}?format=minimal", self.base, encode(id));
-        let min_resp = self.api.get(&min_url, "application/json")?;
-        if min_resp.status != 200 {
-            let mut item = Item::new(ItemStatus::Error, id);
-            item.kind = Some("message".into());
-            item.account = Some(self.account.clone());
-            item.reason = Some(format!(
-                "GET format=minimal: HTTP {}: {}",
-                min_resp.status,
-                min_resp.error_text()
-            ));
-            item.metadata = json!({ "id": id });
-            common::record(&mut self.collection, item, self.ctx)?;
-            return Ok(());
-        }
-        let m = match min_resp.json() {
-            Ok(v) => v,
-            Err(e) => {
+        let Minimal {
+            m,
+            label_ids,
+            label_names,
+            label_objects,
+            primary_label,
+            rfc3339,
+            ns,
+            msg_name,
+            path,
+        } = match self.minimal(id)? {
+            Ok(mm) => mm,
+            Err(reason) => {
                 let mut item = Item::new(ItemStatus::Error, id);
                 item.kind = Some("message".into());
                 item.account = Some(self.account.clone());
-                item.reason = Some(format!("GET format=minimal: {e:#}"));
+                item.reason = Some(reason);
                 item.metadata = json!({ "id": id });
-                common::record(&mut self.collection, item, self.ctx)?;
+                common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
                 return Ok(());
             }
         };
-        let label_ids: Vec<String> = m["labelIds"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (primary_label, label_names, label_objects) = self.labels.resolve(&label_ids);
-        let (rfc3339, ns) = parse_internal_date(&m[TIME_BASIS]);
-        let msg_name = message_name(&rfc3339, id);
-        let path = format!("{primary_label}/{msg_name}");
         let times = Times {
             modified: (!rfc3339.is_empty()).then(|| rfc3339.clone()),
             ..Times::default()
@@ -427,9 +478,9 @@ impl Session<'_> {
                     item.account = Some(self.account.clone());
                     item.times = times;
                     item.metadata = metadata;
-                    common::record(&mut self.collection, item, self.ctx)?;
+                    common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
                 } else {
-                    self.collection.count_out_of_scope(&reason);
+                    self.rec()?.count_out_of_scope(&reason);
                     self.ctx.count(|p| &p.out_of_scope, 1);
                 }
                 return Ok(());
@@ -449,7 +500,7 @@ impl Session<'_> {
             ));
             item.times = times;
             item.metadata = metadata;
-            common::record(&mut self.collection, item, self.ctx)?;
+            common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
             return Ok(());
         }
         let raw_json = resp.json()?;
@@ -460,7 +511,7 @@ impl Session<'_> {
             item.reason = Some("GET format=raw response has no 'raw' field".into());
             item.times = times;
             item.metadata = metadata;
-            common::record(&mut self.collection, item, self.ctx)?;
+            common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
             return Ok(());
         };
         let Some(body) = b64decode(raw_b64) else {
@@ -470,7 +521,7 @@ impl Session<'_> {
             item.reason = Some("GET format=raw 'raw' field is not valid base64url".into());
             item.times = times;
             item.metadata = metadata;
-            common::record(&mut self.collection, item, self.ctx)?;
+            common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
             return Ok(());
         };
 
@@ -483,10 +534,13 @@ impl Session<'_> {
             birth: None,
         };
         let mut hasher = Hasher::new(self.args.md5, self.args.sha1);
-        match self
-            .container
-            .add_file(&member, 0o644, &stamps, &mut &body[..], &mut hasher)
-        {
+        match self.container.as_mut().context(RUN_ONLY)?.add_file(
+            &member,
+            0o644,
+            &stamps,
+            &mut &body[..],
+            &mut hasher,
+        ) {
             Ok(_) => {}
             Err(CopyError::Container(e)) => return Err(e),
             Err(CopyError::Source(e)) => return Err(e.into()),
@@ -498,7 +552,7 @@ impl Session<'_> {
                     "another message already has the container name {name}"
                 ));
                 item.metadata = metadata;
-                common::record(&mut self.collection, item, self.ctx)?;
+                common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
                 return Ok(());
             }
         }
@@ -512,7 +566,7 @@ impl Session<'_> {
         item.hashes = hasher.finish();
         item.times = times;
         item.metadata = metadata;
-        common::record(&mut self.collection, item, self.ctx)?;
+        common::record(self.collection.as_mut().context(RUN_ONLY)?, item, self.ctx)?;
         Ok(())
     }
 }
@@ -641,7 +695,9 @@ fn flow(args: &GmailArgs, ctx: &RunCtx) -> Result<Flow> {
     })
 }
 
-pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
+/// The scope (its time window applies to internalDate), the server-side
+/// list query it allows, and the checks of the endpoints
+fn prepare(args: &GmailArgs) -> Result<(dfcore::manifest::Scope, ScopeRules, Option<String>)> {
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
         if args.scope.scope.is_none() {
@@ -666,8 +722,199 @@ pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
     ] {
         crate::http::parse_url(url).map_err(|e| Usage(format!("{name}: {e:#}")))?;
     }
+    Ok((scope, rules, query))
+}
+
+/// What a run would take: the messages' metadata (format=minimal) decided
+/// by the scope; no message body is fetched
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmailPreview {
+    /// The mailbox's address
+    pub account: String,
+    pub auth_method: String,
+    /// Messages the list returned (the time window narrows it on the server)
+    pub messages: u64,
+    pub in_scope: u64,
+    /// Gmail's size estimate of the messages in scope
+    pub bytes: u64,
+    /// In scope by primary label: messages and size estimate
+    pub by_label: BTreeMap<String, (u64, u64)>,
+    pub out_of_scope: BTreeMap<String, u64>,
+    /// Messages whose metadata could not be read
+    pub errors: u64,
+    pub target_free: Option<u64>,
+    pub stopped: Option<String>,
+    pub at_ns: i128,
+}
+
+impl GmailPreview {
+    /// For the run's footprint
+    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 2)
+    pub fn note(&self) -> PreviewNote {
+        PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview signed in and read the labels and the messages' metadata (messages.list, messages.get format=minimal; no message body)".into(),
+        }
+    }
+
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|f| f < self.bytes)
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "account": self.account,
+            "auth_method": self.auth_method,
+            "messages": self.messages,
+            "in_scope": self.in_scope,
+            "bytes": self.bytes,
+            "by_label": self.by_label.iter().map(|(l, (n, b))| json!({ "label": l, "in_scope": n, "bytes": b })).collect::<Vec<_>>(),
+            "out_of_scope": self.out_of_scope,
+            "errors": self.errors,
+            "target_free": self.target_free,
+            "short_of_space": self.short_of_space(),
+            "stopped": self.stopped,
+        })
+    }
+}
+
+/// Sign in (or use the sign-in handed over), list the messages and decide
+/// each on its metadata; fetch no body and write nothing. The sign-in is
+/// handed back for the run.
+pub fn preview(args: &GmailArgs, ctx: &RunCtx) -> Result<(GmailPreview, Option<Credential>)> {
+    let at_ns = dfcore::host::unix_now_ns();
+    let (scope, rules, query) = prepare(args)?;
+    let (_, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
+    let gmail = args.gmail_endpoint.trim_end_matches('/').to_string();
+    let with = oauth::reuse_or(ctx, || flow(args, ctx))?;
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage("signing in");
+    let mut http = Client::new(Duration::from_secs(args.timeout)).for_run(ctx);
+    let (auth, record) = match with {
+        SignInWith::Preview(auth, record) => (*auth, record),
+        SignInWith::Flow(flow) => {
+            Auth::sign_in_google(&mut http, flow, &args.token_endpoint, GMAIL_SCOPE, ctx)?
+        }
+    };
+    let mut pv = GmailPreview {
+        account: args.mailbox.clone(),
+        auth_method: record["method"].as_str().unwrap_or_default().to_string(),
+        messages: 0,
+        in_scope: 0,
+        bytes: 0,
+        by_label: BTreeMap::new(),
+        out_of_scope: BTreeMap::new(),
+        errors: 0,
+        target_free: common::free_bytes(&ancestor),
+        stopped: None,
+        at_ns,
+    };
+    let mut session = Session {
+        args,
+        base: format!("{gmail}/gmail/v1/users/me"),
+        api: Api {
+            http,
+            auth,
+            graph: gmail,
+        },
+        account: args.mailbox.clone(),
+        query,
+        rules,
+        labels: LabelMap::default(),
+        collection: None,
+        container: None,
+        ctx,
+        messages_listed: 0,
+        bodies: 0,
+    };
+    let result = (|| -> Result<()> {
+        let profile = session.api.get_json(&format!("{}/profile", session.base))?;
+        if let Some(email) = profile["emailAddress"].as_str() {
+            session.account = email.to_string();
+        }
+        if !scope.accounts.is_empty()
+            && !scope
+                .accounts
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&session.account))
+        {
+            bail!(
+                "the mailbox {} is not among the scope's accounts",
+                session.account
+            );
+        }
+        session.load_labels()?;
+        ctx.set_stage("listing the messages");
+        let ids = session.list_message_ids()?;
+        pv.messages = ids.len() as u64;
+        ctx.set_total(pv.messages);
+        ctx.set_stage("reading the messages' metadata (format=minimal)");
+        for id in &ids {
+            if ctx.stop.is_set() {
+                pv.stopped = ctx.stop.reason().map(|(r, _)| r);
+                break;
+            }
+            ctx.count(|p| &p.entries, 1);
+            let mm = match session.minimal(id)? {
+                Ok(mm) => mm,
+                Err(_) => {
+                    pv.errors += 1;
+                    ctx.count(|p| &p.errors, 1);
+                    continue;
+                }
+            };
+            match decide_message(
+                &session.rules,
+                &mm.label_names,
+                &mm.primary_label,
+                &mm.msg_name,
+                &session.account,
+                mm.ns,
+            ) {
+                Decision::InScope => {
+                    let size = mm.m["sizeEstimate"].as_u64().unwrap_or(0);
+                    pv.in_scope += 1;
+                    pv.bytes += size;
+                    let e = pv.by_label.entry(mm.primary_label).or_default();
+                    e.0 += 1;
+                    e.1 += size;
+                    ctx.count(|p| &p.files, 1);
+                    ctx.count(|p| &p.bytes, size);
+                }
+                Decision::OutOfScope(reason) => {
+                    *pv.out_of_scope.entry(reason).or_default() += 1;
+                    ctx.count(|p| &p.out_of_scope, 1);
+                }
+            }
+        }
+        Ok(())
+    })();
+    let Session {
+        api: Api { auth, .. },
+        account,
+        ..
+    } = session;
+    pv.account = account;
+    // The sign-in goes back to the caller even when the listing failed: in
+    // the result, or left in the context (`RunCtx::credential`) with an error
+    let credential = auth.into_credential(record);
+    match result {
+        Ok(()) => {}
+        Err(_) if ctx.stop.is_set() => pv.stopped = ctx.stop.reason().map(|(r, _)| r),
+        Err(e) => {
+            ctx.keep_credential(credential);
+            return Err(e);
+        }
+    }
+    ctx.set_phase(Phase::Done);
+    Ok((pv, credential))
+}
+
+pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let (scope, rules, query) = prepare(args)?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let flow = flow(args, ctx)?;
+    let with = oauth::reuse_or(ctx, || flow(args, ctx))?;
     let gmail = args.gmail_endpoint.trim_end_matches('/').to_string();
     let accounts = scope.accounts.clone();
 
@@ -686,21 +933,32 @@ pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
     };
     let mut http = Client::new(Duration::from_secs(args.timeout)).for_run(ctx);
     ctx.set_stage("signing in");
-    let (auth, record) =
-        match Auth::sign_in_google(&mut http, flow, &args.token_endpoint, GMAIL_SCOPE, ctx) {
-            Ok(a) => a,
-            Err(e) => {
-                let (reason, code) = common::not_started(&e, ctx.stop);
-                collection.footprint(FootprintEntry::new("auth", json!({ "error": reason })))?;
-                container.finish()?;
-                let (code, finished, _) =
-                    common::conclude(collection, &output, Some((reason, code)), ctx)?;
-                return Ok(Outcome {
-                    code,
-                    summary: summary(&output, &finished, 0, 0),
-                });
-            }
-        };
+    let signed_in = match with {
+        SignInWith::Preview(auth, record) => {
+            collection.footprint(FootprintEntry::new(
+                "info",
+                json!({ "what": "the preview's sign-in was used; there was no new sign-in" }),
+            ))?;
+            Ok((*auth, record))
+        }
+        SignInWith::Flow(flow) => {
+            Auth::sign_in_google(&mut http, flow, &args.token_endpoint, GMAIL_SCOPE, ctx)
+        }
+    };
+    let (auth, record) = match signed_in {
+        Ok(a) => a,
+        Err(e) => {
+            let (reason, code) = common::not_started(&e, ctx.stop);
+            collection.footprint(FootprintEntry::new("auth", json!({ "error": reason })))?;
+            container.finish()?;
+            let (code, finished, _) =
+                common::conclude(collection, &output, Some((reason, code)), ctx)?;
+            return Ok(Outcome {
+                code,
+                summary: summary(&output, &finished, 0, 0),
+            });
+        }
+    };
     collection.footprint(FootprintEntry::new("auth", record.clone()))?;
 
     let mut session = Session {
@@ -715,8 +973,8 @@ pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
         query,
         rules,
         labels: LabelMap::default(),
-        collection,
-        container,
+        collection: Some(collection),
+        container: Some(container),
         ctx,
         messages_listed: 0,
         bodies: 0,
@@ -739,7 +997,7 @@ pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
         }
         session.load_labels()?;
         let tls = tls_records(&output, &session.api.http)?;
-        session.collection.set_source_identity(json!({
+        session.rec()?.set_source_identity(json!({
             "profile": profile,
             "auth": record,
             "tls": tls,
@@ -758,13 +1016,16 @@ pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
         Ok(())
     })();
     let Session {
-        mut collection,
+        collection,
         container,
         api: Api { http, auth, .. },
         messages_listed,
         bodies,
         ..
     } = session;
+    let (Some(mut collection), Some(container)) = (collection, container) else {
+        unreachable!("a run has its collection and container")
+    };
     collection.footprint(FootprintEntry {
         bytes_sent: Some(http.sent),
         bytes_received: Some(http.received),

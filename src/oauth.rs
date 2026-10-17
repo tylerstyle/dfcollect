@@ -51,6 +51,37 @@ fn expires_at(secs: u64) -> i128 {
     dfcore::host::unix_now_ns() + i128::from(secs) * 1_000_000_000
 }
 
+/// How a run or preview signs in: with the sign-in a preview handed over
+/// (no new sign-in, no new alert to the account holder), or anew with a flow
+pub(crate) enum SignInWith {
+    Preview(Box<Auth>, Value),
+    Flow(Flow),
+}
+
+/// The handed-over sign-in, else the flow `flow` builds (which may ask for a
+/// client secret, so only when needed)
+pub(crate) fn reuse_or(ctx: &RunCtx, flow: impl FnOnce() -> Result<Flow>) -> Result<SignInWith> {
+    match ctx.take_credential() {
+        Some(common::Credential(common::CredentialKind::OAuth { auth, record })) => {
+            Ok(SignInWith::Preview(auth, record))
+        }
+        _ => flow().map(SignInWith::Flow),
+    }
+}
+
+impl Auth {
+    /// For a run after its preview: worth handing over unless it is a token
+    /// from a file (the run reads the file again)
+    pub(crate) fn into_credential(self, record: Value) -> Option<common::Credential> {
+        self.can_renew().then(|| {
+            common::Credential(common::CredentialKind::OAuth {
+                auth: Box::new(self),
+                record,
+            })
+        })
+    }
+}
+
 pub enum Flow {
     Device {
         tenant: String,
@@ -769,6 +800,49 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn auth(flow: Flow) -> Auth {
+        Auth {
+            flow,
+            token_url: "https://login.example.test/t/oauth2/v2.0/token".into(),
+            scope: "https://graph.example.test/.default".into(),
+            access: "access".into(),
+            refresh: Some("refresh".into()),
+            expires: None,
+            renewals: 0,
+        }
+    }
+
+    #[test]
+    fn a_preview_sign_in_is_handed_to_the_run_once() {
+        let stop: &'static common::Stop = Box::leak(Box::new(common::Stop::new()));
+        let ctx = RunCtx::cli(stop, None);
+        let device = || Flow::Device {
+            tenant: "t".into(),
+            client_id: "c".into(),
+        };
+        let cred = auth(device())
+            .into_credential(json!({ "method": "device code (delegated)" }))
+            .expect("a device-code sign-in is worth handing over");
+        *ctx.credential.lock().unwrap() = Some(cred);
+        // Handed over: no flow is built (it could ask for a client secret)
+        match reuse_or(&ctx, || panic!("no new sign-in")).unwrap() {
+            SignInWith::Preview(a, record) => {
+                assert_eq!(a.access, "access");
+                assert_eq!(record["method"], "device code (delegated)");
+            }
+            SignInWith::Flow(_) => panic!("the preview's sign-in was not used"),
+        }
+        // Taken once: the next caller signs in anew
+        assert!(matches!(
+            reuse_or(&ctx, || Ok(device())).unwrap(),
+            SignInWith::Flow(Flow::Device { .. })
+        ));
+        // A token from a file is read again by the run, not handed over
+        assert!(auth(Flow::Token("t".into()))
+            .into_credential(json!({}))
+            .is_none());
+    }
 
     #[test]
     fn base64_both_alphabets() {

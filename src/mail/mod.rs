@@ -15,7 +15,7 @@ mod utf7;
 
 use crate::{
     args::ImapArgs,
-    common::{self, Phase, RunCtx},
+    common::{self, Credential, CredentialKind, Phase, PreviewNote, RunCtx},
     console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
@@ -32,6 +32,7 @@ use dfcore::manifest::{
 use parse::{fetch_attr, Token};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     collections::{BTreeSet, HashMap},
     path::Path,
     time::Duration,
@@ -72,24 +73,34 @@ pub(crate) fn first_line(path: &Path) -> Result<String> {
     Ok(line)
 }
 
-fn secret(args: &ImapArgs, ctx: &RunCtx) -> Result<Secret> {
+/// The secret: from its file, the password typed for the preview (`true`),
+/// or asked now
+fn secret(args: &ImapArgs, ctx: &RunCtx) -> Result<(Secret, bool)> {
     if let Some(path) = &args.token_file {
-        return Ok(Secret::Token(Zeroizing::new(first_line(path)?)));
+        return Ok((Secret::Token(Zeroizing::new(first_line(path)?)), false));
     }
     if args.auth == Auth::Xoauth2 {
         return Err(Usage("--auth xoauth2 needs --token-file".into()).into());
     }
-    match &args.password_file {
-        Some(path) => Ok(Secret::Password(Zeroizing::new(first_line(path)?))),
-        None => Ok(Secret::Password(need_secret(
-            ctx.console.as_ref(),
-            SecretAsk {
-                prompt: format!("IMAP password for {}: ", args.user),
-                file_flag: "--password-file",
-            },
-        )?)),
-    }
+    Ok(match &args.password_file {
+        Some(path) => (Secret::Password(Zeroizing::new(first_line(path)?)), false),
+        None => match ctx.take_credential() {
+            Some(Credential(CredentialKind::Password(pw))) => (Secret::Password(pw), true),
+            _ => (
+                Secret::Password(need_secret(
+                    ctx.console.as_ref(),
+                    SecretAsk {
+                        prompt: format!("IMAP password for {}: ", args.user),
+                        file_flag: "--password-file",
+                    },
+                )?),
+                false,
+            ),
+        },
+    })
 }
+
+const RUN_ONLY: &str = "a preview has no collection";
 
 fn host_port(server: &str, security: Security) -> Result<(String, u16)> {
     let default = if security == Security::Tls { 993 } else { 143 };
@@ -179,19 +190,41 @@ struct Session<'a> {
     args: &'a ImapArgs,
     rules: ScopeRules,
     conn: Connection,
-    collection: Collection,
-    container: Container,
+    /// None: a preview (records nothing, stores nothing)
+    collection: Option<Collection>,
+    container: Option<Container>,
     ctx: &'a RunCtx<'a>,
     folders_examined: u64,
 }
 
 /// A command for the footprint: what was sent (never a secret) and its result.
-fn footprint_command(c: &mut Collection, command: &str, extra: Value) -> Result<()> {
+/// A command for the footprint (a preview has no collection and records nothing)
+fn footprint_command(c: &mut Option<Collection>, command: &str, extra: Value) -> Result<()> {
+    let Some(c) = c else {
+        return Ok(());
+    };
     let mut detail = json!({ "command": command });
     if let (Some(d), Value::Object(e)) = (detail.as_object_mut(), extra) {
         d.extend(e);
     }
     c.footprint(FootprintEntry::new("command", detail))
+}
+
+/// Connect as `--security` says: the connection, its TLS session and the greeting
+fn connect(
+    args: &ImapArgs,
+    host: &str,
+    port: u16,
+) -> Result<(Connection, Option<TlsInfo>, Vec<Token>)> {
+    let timeout = Duration::from_secs(args.timeout);
+    match args.security {
+        Security::StartTls => {
+            client::connect_starttls(host, port, args.tls_sha256.as_deref(), timeout)
+                .map(|(c, tls, g)| (c, Some(tls), g))
+        }
+        Security::Tls => Connection::connect(host, port, true, args.tls_sha256.as_deref(), timeout),
+        Security::Plaintext => Connection::connect(host, port, false, None, timeout),
+    }
 }
 
 fn capabilities(tokens: &[Token]) -> Vec<String> {
@@ -223,6 +256,68 @@ fn tls_record(dir: &Path, tls: &TlsInfo) -> Result<Value> {
 }
 
 impl Session<'_> {
+    /// The run's collection
+    fn rec(&mut self) -> Result<&mut Collection> {
+        self.collection.as_mut().context(RUN_ONLY)
+    }
+
+    /// CAPABILITY, sign in with `secret` (the method from --auth and the
+    /// capabilities), CAPABILITY again: the method and the capabilities after
+    fn sign_in(&mut self, secret: &Secret) -> Result<(&'static str, Vec<String>)> {
+        let args = self.args;
+        let mut caps = Vec::new();
+        self.conn.command("CAPABILITY", "CAPABILITY", |t, _| {
+            caps.extend(capabilities(&t));
+            Ok(())
+        })?;
+        footprint_command(
+            &mut self.collection,
+            "CAPABILITY",
+            json!({ "capabilities": caps }),
+        )?;
+        let has = |c: &str| caps.iter().any(|x| x.eq_ignore_ascii_case(c));
+        let method = match (args.auth, secret) {
+            (Auth::Xoauth2, _) | (Auth::Auto, Secret::Token(_)) => "XOAUTH2",
+            (Auth::Plain, _) => "PLAIN",
+            (Auth::Login, _) => "LOGIN",
+            (Auth::Auto, Secret::Password(_)) if has("AUTH=PLAIN") => "PLAIN",
+            (Auth::Auto, Secret::Password(_)) => "LOGIN",
+        };
+        if method == "LOGIN" && has("LOGINDISABLED") {
+            bail!("the server disables LOGIN on this connection; use TLS or --auth plain");
+        }
+        match (method, secret) {
+            ("XOAUTH2", Secret::Token(token)) => {
+                let resp = Zeroizing::new(format!(
+                    "user={}\x01auth=Bearer {}\x01\x01",
+                    args.user,
+                    token.as_str()
+                ));
+                self.conn.authenticate("XOAUTH2", resp.as_bytes())?;
+            }
+            ("PLAIN", Secret::Password(pw)) => {
+                let resp = Zeroizing::new(format!("\0{}\0{}", args.user, pw.as_str()));
+                self.conn.authenticate("PLAIN", resp.as_bytes())?;
+            }
+            ("LOGIN", Secret::Password(pw)) => {
+                self.conn.login(&args.user, pw)?;
+            }
+            _ => bail!("--auth {method} does not fit the given secret"),
+        }
+        if let Some(c) = &mut self.collection {
+            c.footprint(FootprintEntry::new(
+                "auth",
+                json!({ "method": method, "user": args.user }),
+            ))?;
+        }
+        let mut caps_after = Vec::new();
+        self.conn.command("CAPABILITY", "CAPABILITY", |t, _| {
+            caps_after.extend(capabilities(&t));
+            Ok(())
+        })?;
+        Ok((method, caps_after))
+    }
+
     fn decide(&self, folder: &str, meta: &MessageMeta) -> Decision {
         self.rules.decide(&Candidate {
             path: &format!("{folder}/{}", meta.uid),
@@ -388,12 +483,9 @@ impl Session<'_> {
         let by_uid: HashMap<u64, &&MessageMeta> = batch.iter().map(|m| (m.uid, m)).collect();
         let mut stored = BTreeSet::new();
         let mut bytes = 0u64;
-        let (args, container, collection, ctx) = (
-            &self.args,
-            &mut self.container,
-            &mut self.collection,
-            self.ctx,
-        );
+        let (args, ctx) = (&self.args, self.ctx);
+        let container = self.container.as_mut().context(RUN_ONLY)?;
+        let collection = self.collection.as_mut().context(RUN_ONLY)?;
         self.conn.command(
             &command,
             &format!("UID FETCH <{} UIDs> (UID BODY.PEEK[])", set.len()),
@@ -493,14 +585,14 @@ impl Session<'_> {
                 Some("the server returned no body (expunged during the acquisition?)".into());
             item.metadata =
                 json!({ "folder": folder.name, "uidvalidity": uidvalidity, "uid": m.uid });
-            self.collection.add(item)?;
+            self.rec()?.add(item)?;
         }
         Ok(())
     }
 
     fn folder(&mut self, folder: &Folder) -> Result<()> {
         if let Some(reason) = self.folder_scope(&folder.name) {
-            self.collection.count_out_of_scope(&reason);
+            self.rec()?.count_out_of_scope(&reason);
             self.ctx.count(|p| &p.out_of_scope, 1);
             return Ok(());
         }
@@ -518,7 +610,7 @@ impl Session<'_> {
                 "the server lists this folder under a name that cannot be sent back as a quoted string; not opened"
                     .into(),
             );
-            self.collection.add(item)?;
+            self.rec()?.add(item)?;
             return Ok(());
         }
         let (uidvalidity, exists) = self.examine(folder)?;
@@ -542,9 +634,9 @@ impl Session<'_> {
                             ..Times::default()
                         };
                         item.metadata = json!({ "folder": folder.name, "uidvalidity": uidvalidity, "uid": m.uid });
-                        self.collection.add(item)?;
+                        self.rec()?.add(item)?;
                     } else {
-                        self.collection.count_out_of_scope(&reason);
+                        self.rec()?.count_out_of_scope(&reason);
                     }
                     self.ctx.count(|p| &p.out_of_scope, 1);
                 }
@@ -616,7 +708,9 @@ fn header(
     })
 }
 
-pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
+/// The scope and its rules: the time window applies to INTERNALDATE, and
+/// the account must be among the scope's
+fn scope_rules(args: &ImapArgs) -> Result<(dfcore::manifest::Scope, ScopeRules)> {
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
         if args.scope.scope.is_none() {
@@ -637,13 +731,212 @@ pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
         .into());
     }
     let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
+    Ok((scope, rules))
+}
+
+/// One folder in a preview
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderPreview {
+    pub name: String,
+    /// Messages in the folder (EXISTS)
+    pub messages: u64,
+    /// Messages in scope and their size (RFC822.SIZE)
+    pub in_scope: u64,
+    pub bytes: u64,
+    /// Why nothing of it is taken: out of scope, not selectable, a name that
+    /// cannot be sent back
+    pub skipped: Option<String>,
+}
+
+/// What a run would take: the folders and the messages' metadata decided by
+/// the scope; no message body is fetched
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImapPreview {
+    /// The server's greeting
+    pub server: String,
+    pub auth_method: String,
+    pub folders: Vec<FolderPreview>,
+    pub messages: u64,
+    pub in_scope: u64,
+    pub bytes: u64,
+    /// Out of scope, by reason (a folder out of scope counts once)
+    pub out_of_scope: BTreeMap<String, u64>,
+    pub target_free: Option<u64>,
+    pub stopped: Option<String>,
+    pub at_ns: i128,
+}
+
+impl ImapPreview {
+    /// For the run's footprint
+    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 2)
+    pub fn note(&self) -> PreviewNote {
+        PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview signed in and read the folder list and the messages' metadata (EXAMINE; UID FETCH of UID, FLAGS, INTERNALDATE and RFC822.SIZE; no message body)".into(),
+        }
+    }
+
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|f| f < self.bytes)
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "server": self.server,
+            "auth_method": self.auth_method,
+            "folders": self.folders.iter().map(|f| json!({
+                "name": f.name, "messages": f.messages, "in_scope": f.in_scope,
+                "bytes": f.bytes, "skipped": f.skipped,
+            })).collect::<Vec<_>>(),
+            "messages": self.messages,
+            "in_scope": self.in_scope,
+            "bytes": self.bytes,
+            "out_of_scope": self.out_of_scope,
+            "target_free": self.target_free,
+            "short_of_space": self.short_of_space(),
+            "stopped": self.stopped,
+        })
+    }
+}
+
+/// Sign in, list the folders and decide every message on its metadata;
+/// fetch no body and write nothing. A password asked for here is handed
+/// back for the run.
+pub fn preview(args: &ImapArgs, ctx: &RunCtx) -> Result<(ImapPreview, Option<Credential>)> {
+    let at_ns = dfcore::host::unix_now_ns();
+    let (_, rules) = scope_rules(args)?;
+    let (host, port) = host_port(&args.server, args.security)?;
+    let (_, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
+    let (secret, _) = secret(args, ctx)?;
+    let asked = args.token_file.is_none() && args.password_file.is_none();
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage(&format!("connecting to {host}:{port}"));
+    let (conn, _, greeting) = connect(args, &host, port)?;
+    let mut pv = ImapPreview {
+        server: greeting
+            .iter()
+            .skip(2)
+            .filter_map(Token::text)
+            .collect::<Vec<_>>()
+            .join(" "),
+        auth_method: String::new(),
+        folders: Vec::new(),
+        messages: 0,
+        in_scope: 0,
+        bytes: 0,
+        out_of_scope: BTreeMap::new(),
+        target_free: common::free_bytes(&ancestor),
+        stopped: None,
+        at_ns,
+    };
+    let mut session = Session {
+        args,
+        rules,
+        conn,
+        collection: None,
+        container: None,
+        ctx,
+        folders_examined: 0,
+    };
+    let mut signed_in = false;
+    let result = (|| -> Result<()> {
+        let (method, _) = session.sign_in(&secret)?;
+        signed_in = true;
+        pv.auth_method = method.into();
+        ctx.set_stage("listing the folders");
+        for folder in session.list()? {
+            if ctx.stop.is_set() {
+                pv.stopped = ctx.stop.reason().map(|(r, _)| r);
+                break;
+            }
+            ctx.set_current(&folder.name);
+            let mut f = FolderPreview {
+                name: folder.name.clone(),
+                messages: 0,
+                in_scope: 0,
+                bytes: 0,
+                skipped: None,
+            };
+            if folder.attributes.iter().any(|a| {
+                a.eq_ignore_ascii_case("\\Noselect") || a.eq_ignore_ascii_case("\\NonExistent")
+            }) {
+                f.skipped = Some("not selectable".into());
+            } else if let Some(reason) = session.folder_scope(&folder.name) {
+                *pv.out_of_scope.entry(reason.clone()).or_default() += 1;
+                ctx.count(|p| &p.out_of_scope, 1);
+                f.skipped = Some(reason);
+            } else if std::str::from_utf8(&folder.raw)
+                .ok()
+                .and_then(client::quote)
+                .is_none()
+            {
+                f.skipped =
+                    Some("a name that cannot be sent back as a quoted string; not opened".into());
+            } else {
+                let (_, exists) = session.examine(&folder)?;
+                f.messages = exists;
+                if exists > 0 {
+                    for m in session.message_metadata()? {
+                        ctx.count(|p| &p.entries, 1);
+                        match session.decide(&folder.name, &m) {
+                            Decision::InScope => {
+                                f.in_scope += 1;
+                                f.bytes += m.size;
+                                ctx.count(|p| &p.files, 1);
+                                ctx.count(|p| &p.bytes, m.size);
+                            }
+                            Decision::OutOfScope(reason) => {
+                                *pv.out_of_scope.entry(reason).or_default() += 1;
+                                ctx.count(|p| &p.out_of_scope, 1);
+                            }
+                        }
+                    }
+                }
+            }
+            pv.messages += f.messages;
+            pv.in_scope += f.in_scope;
+            pv.bytes += f.bytes;
+            pv.folders.push(f);
+        }
+        Ok(())
+    })();
+    let _ = session.conn.command("LOGOUT", "LOGOUT", |_, _| Ok(()));
+    // A password that signed in goes back to the caller, also when the
+    // listing failed (then left in the context); one that did not, never
+    let credential = match secret {
+        Secret::Password(pw) if asked && signed_in => {
+            Some(Credential(CredentialKind::Password(pw)))
+        }
+        _ => None,
+    };
+    match result {
+        Ok(()) => {}
+        Err(_) if ctx.stop.is_set() => pv.stopped = ctx.stop.reason().map(|(r, _)| r),
+        Err(e) => {
+            ctx.keep_credential(credential);
+            return Err(e);
+        }
+    }
+    ctx.set_phase(Phase::Done);
+    Ok((pv, credential))
+}
+
+pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let (scope, rules) = scope_rules(args)?;
     let (host, port) = host_port(&args.server, args.security)?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let secret = secret(args, ctx)?;
+    let (secret, reused) = secret(args, ctx)?;
 
     let mut collection = Collection::create(&output, header(args, &host, port, scope, ctx)?)?;
     for entry in ctx.footprint() {
         collection.footprint(entry)?;
+    }
+    if reused {
+        collection.footprint(FootprintEntry::new(
+            "info",
+            json!({ "what": "the password typed for the preview was used; it was not asked again" }),
+        ))?;
     }
     ctx.set_phase(Phase::Listing);
     ctx.set_stage(&format!("connecting to {host}:{port}"));
@@ -656,18 +949,7 @@ pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
             return Err(e);
         }
     };
-    let timeout = Duration::from_secs(args.timeout);
-    let connected = match args.security {
-        Security::StartTls => {
-            client::connect_starttls(&host, port, args.tls_sha256.as_deref(), timeout)
-                .map(|(c, tls, g)| (c, Some(tls), g))
-        }
-        Security::Tls => {
-            Connection::connect(&host, port, true, args.tls_sha256.as_deref(), timeout)
-        }
-        Security::Plaintext => Connection::connect(&host, port, false, None, timeout),
-    };
-    let (conn, tls, greeting) = match connected {
+    let (conn, tls, greeting) = match connect(args, &host, port) {
         Ok(c) => c,
         Err(e) => {
             let (reason, code) = common::not_started(&e, ctx.stop);
@@ -702,62 +984,16 @@ pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
         args,
         rules,
         conn,
-        collection,
-        container,
+        collection: Some(collection),
+        container: Some(container),
         ctx,
         folders_examined: 0,
     };
     let result = (|| -> Result<()> {
-        let mut caps = Vec::new();
-        session.conn.command("CAPABILITY", "CAPABILITY", |t, _| {
-            caps.extend(capabilities(&t));
-            Ok(())
-        })?;
-        footprint_command(
-            &mut session.collection,
-            "CAPABILITY",
-            json!({ "capabilities": caps }),
-        )?;
-        let has = |c: &str| caps.iter().any(|x| x.eq_ignore_ascii_case(c));
-        let method = match (args.auth, &secret) {
-            (Auth::Xoauth2, _) | (Auth::Auto, Secret::Token(_)) => "XOAUTH2",
-            (Auth::Plain, _) => "PLAIN",
-            (Auth::Login, _) => "LOGIN",
-            (Auth::Auto, Secret::Password(_)) if has("AUTH=PLAIN") => "PLAIN",
-            (Auth::Auto, Secret::Password(_)) => "LOGIN",
-        };
-        if method == "LOGIN" && has("LOGINDISABLED") {
-            bail!("the server disables LOGIN on this connection; use TLS or --auth plain");
-        }
-        match (method, &secret) {
-            ("XOAUTH2", Secret::Token(token)) => {
-                let resp = Zeroizing::new(format!(
-                    "user={}\x01auth=Bearer {}\x01\x01",
-                    args.user,
-                    token.as_str()
-                ));
-                session.conn.authenticate("XOAUTH2", resp.as_bytes())?;
-            }
-            ("PLAIN", Secret::Password(pw)) => {
-                let resp = Zeroizing::new(format!("\0{}\0{}", args.user, pw.as_str()));
-                session.conn.authenticate("PLAIN", resp.as_bytes())?;
-            }
-            ("LOGIN", Secret::Password(pw)) => {
-                session.conn.login(&args.user, pw)?;
-            }
-            _ => bail!("--auth {method} does not fit the given secret"),
-        }
-        session.collection.footprint(FootprintEntry::new(
-            "auth",
-            json!({ "method": method, "user": args.user }),
-        ))?;
-        let mut caps_after = Vec::new();
-        session.conn.command("CAPABILITY", "CAPABILITY", |t, _| {
-            caps_after.extend(capabilities(&t));
-            Ok(())
-        })?;
-        session.collection.set_source_identity(json!({
-            "peer": session.conn.peer.to_string(),
+        let (_, caps_after) = session.sign_in(&secret)?;
+        let peer = session.conn.peer.to_string();
+        session.rec()?.set_source_identity(json!({
+            "peer": peer,
             "greeting": greeting_text.join(" "),
             "capabilities": caps_after,
             "tls": tls_json,
@@ -779,12 +1015,15 @@ pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
     })();
     let _ = session.conn.command("LOGOUT", "LOGOUT", |_, _| Ok(()));
     let Session {
-        mut collection,
+        collection,
         container,
         conn,
         folders_examined,
         ..
     } = session;
+    let (Some(mut collection), Some(container)) = (collection, container) else {
+        unreachable!("a run has its collection and container")
+    };
     collection.footprint(FootprintEntry {
         bytes_sent: Some(conn.sent),
         bytes_received: Some(conn.received),

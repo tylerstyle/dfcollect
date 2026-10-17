@@ -17,14 +17,14 @@
 
 use crate::{
     args::{GraphArgs, GraphConnArgs},
-    common::{self, Phase, RunCtx, Stop},
+    common::{self, Credential, Phase, PreviewNote, RunCtx, Stop},
     console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     http::{encode, strip_query, Client, Response},
     mail::{client::sha256_hex, first_line, folder_scope},
     meta::Stamps,
-    oauth::{Auth, Flow},
+    oauth::{self, Auth, Flow, SignInWith},
     scope, Usage, TOOL, VERSION,
 };
 use anyhow::{bail, Context, Result};
@@ -33,7 +33,7 @@ use dfcore::manifest::{
     ScopeRules, Source, Times,
 };
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 use zeroize::Zeroizing;
 
 const AUDIT_ACTION: &str = "mail_acquisition";
@@ -200,14 +200,35 @@ struct Session<'a> {
     base: String,
     account: String,
     rules: ScopeRules,
-    collection: Collection,
-    container: Container,
+    /// None: a preview (records nothing, stores nothing)
+    collection: Option<Collection>,
+    container: Option<Container>,
     ctx: &'a RunCtx<'a>,
     folders_listed: u64,
     bodies: u64,
 }
 
+const RUN_ONLY: &str = "a preview has no collection";
+
 impl Session<'_> {
+    /// The run's collection
+    fn rec(&mut self) -> Result<&mut Collection> {
+        self.collection.as_mut().context(RUN_ONLY)
+    }
+
+    /// A folder's messages: metadata only, with Exchange's size
+    fn messages_url(&self, folder: &Folder) -> String {
+        format!(
+            "{}/mailFolders/{}/messages?$top={PAGE}&$select={}&$expand={}",
+            self.base,
+            encode(&folder.id),
+            encode(SELECT),
+            encode(&format!(
+                "singleValueExtendedProperties($filter=id eq '{SIZE_PROPERTY}')"
+            ))
+        )
+    }
+
     fn pages(&mut self, first: &str) -> Result<Vec<Value>> {
         self.api.pages(first, self.ctx.stop)
     }
@@ -270,7 +291,10 @@ impl Session<'_> {
             s => json!(format!("not available: HTTP {s}: {}", resp.error_text())),
         };
         out.sort_by(|a, b| a.path.cmp(&b.path));
-        self.collection.footprint(FootprintEntry::new(
+        let Some(collection) = &mut self.collection else {
+            return Ok(out);
+        };
+        collection.footprint(FootprintEntry::new(
             "request",
             json!({
                 "request": "GET mailFolders (all levels, hidden folders included)",
@@ -283,24 +307,16 @@ impl Session<'_> {
 
     fn folder(&mut self, folder: &Folder) -> Result<()> {
         if let Some(reason) = folder_scope(&self.rules, &folder.path) {
-            self.collection.count_out_of_scope(&reason);
+            self.rec()?.count_out_of_scope(&reason);
             return Ok(());
         }
         self.folders_listed += 1;
         if folder.total == Some(0) {
             return Ok(());
         }
-        let url = format!(
-            "{}/mailFolders/{}/messages?$top={PAGE}&$select={}&$expand={}",
-            self.base,
-            encode(&folder.id),
-            encode(SELECT),
-            encode(&format!(
-                "singleValueExtendedProperties($filter=id eq '{SIZE_PROPERTY}')"
-            ))
-        );
+        let url = self.messages_url(folder);
         let messages = self.pages(&url)?;
-        self.collection.footprint(FootprintEntry::new(
+        self.rec()?.footprint(FootprintEntry::new(
             "request",
             json!({ "request": "GET messages (metadata)", "folder": folder.path, "messages": messages.len() }),
         ))?;
@@ -348,9 +364,9 @@ impl Session<'_> {
                     item.account = Some(self.account.clone());
                     item.times = times;
                     item.metadata = metadata;
-                    self.collection.add(item)?;
+                    self.rec()?.add(item)?;
                 } else {
-                    self.collection.count_out_of_scope(&reason);
+                    self.rec()?.count_out_of_scope(&reason);
                 }
                 return Ok(());
             }
@@ -370,7 +386,7 @@ impl Session<'_> {
             ));
             item.times = times;
             item.metadata = metadata;
-            self.collection.add(item)?;
+            self.rec()?.add(item)?;
             return Ok(());
         }
         let member = format!("{path}.eml");
@@ -382,10 +398,13 @@ impl Session<'_> {
             birth: None,
         };
         let mut hasher = Hasher::new(self.args.md5, self.args.sha1);
-        match self
-            .container
-            .add_file(&member, 0o644, &stamps, &mut &resp.body[..], &mut hasher)
-        {
+        match self.container.as_mut().context(RUN_ONLY)?.add_file(
+            &member,
+            0o644,
+            &stamps,
+            &mut &resp.body[..],
+            &mut hasher,
+        ) {
             Ok(_) => {}
             Err(CopyError::Container(e)) => return Err(e),
             Err(CopyError::Source(e)) => return Err(e.into()),
@@ -398,7 +417,7 @@ impl Session<'_> {
                     "another message already has the container name {name}"
                 ));
                 item.metadata = metadata;
-                self.collection.add(item)?;
+                self.rec()?.add(item)?;
                 return Ok(());
             }
         }
@@ -414,7 +433,7 @@ impl Session<'_> {
         item.hashes = hasher.finish();
         item.times = times;
         item.metadata = metadata;
-        self.collection.add(item)?;
+        self.rec()?.add(item)?;
         Ok(())
     }
 }
@@ -536,7 +555,9 @@ pub(crate) fn check_endpoints(conn: &GraphConnArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
+/// The scope (its time window applies to receivedDateTime) and the checks of
+/// the endpoints and the mailbox
+fn prepare(args: &GraphArgs) -> Result<(dfcore::manifest::Scope, ScopeRules)> {
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
         if args.scope.scope.is_none() {
@@ -559,8 +580,218 @@ pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
             Usage("--auth app reads a named mailbox: give --mailbox <user@domain>".into()).into(),
         );
     }
+    Ok((scope, rules))
+}
+
+/// One folder in a preview
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphFolderPreview {
+    pub path: String,
+    /// Exchange's count (totalItemCount)
+    pub messages: Option<u64>,
+    pub in_scope: u64,
+    /// Exchange's size of the messages in scope
+    pub bytes: u64,
+    /// Why nothing of it is taken (out of scope)
+    pub skipped: Option<String>,
+}
+
+/// What a run would take: the folders and the messages' metadata decided by
+/// the scope; no message body is fetched
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphPreview {
+    /// The mailbox's user principal name
+    pub account: String,
+    pub auth_method: String,
+    pub folders: Vec<GraphFolderPreview>,
+    pub messages: u64,
+    pub in_scope: u64,
+    pub bytes: u64,
+    pub out_of_scope: BTreeMap<String, u64>,
+    pub target_free: Option<u64>,
+    pub stopped: Option<String>,
+    pub at_ns: i128,
+}
+
+impl GraphPreview {
+    /// For the run's footprint
+    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 2)
+    pub fn note(&self) -> PreviewNote {
+        PreviewNote {
+            at_ns: self.at_ns,
+            what: "a preview signed in and read the folder list and the messages' metadata (GET mailFolders and messages with $select; no message body)".into(),
+        }
+    }
+
+    pub fn short_of_space(&self) -> bool {
+        self.target_free.is_some_and(|f| f < self.bytes)
+    }
+
+    pub fn summary(&self) -> Value {
+        json!({
+            "dry_run": true,
+            "account": self.account,
+            "auth_method": self.auth_method,
+            "folders": self.folders.iter().map(|f| json!({
+                "path": f.path, "messages": f.messages, "in_scope": f.in_scope,
+                "bytes": f.bytes, "skipped": f.skipped,
+            })).collect::<Vec<_>>(),
+            "messages": self.messages,
+            "in_scope": self.in_scope,
+            "bytes": self.bytes,
+            "out_of_scope": self.out_of_scope,
+            "target_free": self.target_free,
+            "short_of_space": self.short_of_space(),
+            "stopped": self.stopped,
+        })
+    }
+}
+
+/// Sign in (or use the sign-in handed over), list the folders and decide
+/// every message on its metadata; fetch no body and write nothing. The
+/// sign-in is handed back for the run.
+pub fn preview(args: &GraphArgs, ctx: &RunCtx) -> Result<(GraphPreview, Option<Credential>)> {
+    let at_ns = dfcore::host::unix_now_ns();
+    let (scope, rules) = prepare(args)?;
+    let (_, ancestor) = common::check_output(&args.output, args.allow_tmpfs)?;
+    let graph = args.conn.graph_endpoint.trim_end_matches('/').to_string();
+    let with = oauth::reuse_or(ctx, || flow(&args.conn, ctx))?;
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage("signing in");
+    let mut http = Client::new(Duration::from_secs(args.conn.timeout)).for_run(ctx);
+    let (auth, record) = match with {
+        SignInWith::Preview(auth, record) => (*auth, record),
+        SignInWith::Flow(flow) => Auth::sign_in(
+            &mut http,
+            flow,
+            &args.conn.login_endpoint,
+            &graph,
+            &["Mail.Read"],
+            ctx,
+        )?,
+    };
+    let mut pv = GraphPreview {
+        account: args.mailbox.clone(),
+        auth_method: record["method"].as_str().unwrap_or_default().to_string(),
+        folders: Vec::new(),
+        messages: 0,
+        in_scope: 0,
+        bytes: 0,
+        out_of_scope: BTreeMap::new(),
+        target_free: common::free_bytes(&ancestor),
+        stopped: None,
+        at_ns,
+    };
+    let mut session = Session {
+        args,
+        base: format!("{graph}/v1.0/{}", who(&args.mailbox)),
+        api: Api { http, auth, graph },
+        account: args.mailbox.clone(),
+        rules,
+        collection: None,
+        container: None,
+        ctx,
+        folders_listed: 0,
+        bodies: 0,
+    };
+    let result = (|| -> Result<()> {
+        let url = format!("{}?$select=id,userPrincipalName", session.base);
+        let user = session.api.get_json(&url)?;
+        if let Some(upn) = user["userPrincipalName"].as_str() {
+            session.account = upn.to_string();
+        }
+        if !scope.accounts.is_empty()
+            && !scope
+                .accounts
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&session.account))
+        {
+            bail!(
+                "the mailbox {} is not among the scope's accounts",
+                session.account
+            );
+        }
+        ctx.set_stage("listing the mail folders");
+        for folder in session.folders()? {
+            if ctx.stop.is_set() {
+                pv.stopped = ctx.stop.reason().map(|(r, _)| r);
+                break;
+            }
+            ctx.set_current(&folder.path);
+            let mut f = GraphFolderPreview {
+                path: folder.path.clone(),
+                messages: folder.total,
+                in_scope: 0,
+                bytes: 0,
+                skipped: None,
+            };
+            if let Some(reason) = folder_scope(&session.rules, &folder.path) {
+                *pv.out_of_scope.entry(reason.clone()).or_default() += 1;
+                ctx.count(|p| &p.out_of_scope, 1);
+                f.skipped = Some(reason);
+            } else if folder.total != Some(0) {
+                let url = session.messages_url(&folder);
+                for m in session.pages(&url)? {
+                    ctx.count(|p| &p.entries, 1);
+                    let id = m["id"].as_str().unwrap_or_default();
+                    let received = m[TIME_BASIS].as_str().unwrap_or_default();
+                    let path = item_path(&folder.path, received, id);
+                    let size = m["singleValueExtendedProperties"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|p| p["value"].as_str())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    match session.rules.decide(&Candidate {
+                        path: &path,
+                        account: Some(&session.account),
+                        time_ns: dfcore::host::parse_rfc3339(received).ok(),
+                    }) {
+                        Decision::InScope => {
+                            f.in_scope += 1;
+                            f.bytes += size;
+                            ctx.count(|p| &p.files, 1);
+                            ctx.count(|p| &p.bytes, size);
+                        }
+                        Decision::OutOfScope(reason) => {
+                            *pv.out_of_scope.entry(reason).or_default() += 1;
+                            ctx.count(|p| &p.out_of_scope, 1);
+                        }
+                    }
+                }
+            }
+            pv.messages += f.messages.unwrap_or(0);
+            pv.in_scope += f.in_scope;
+            pv.bytes += f.bytes;
+            pv.folders.push(f);
+        }
+        Ok(())
+    })();
+    let Session {
+        api: Api { auth, .. },
+        account,
+        ..
+    } = session;
+    pv.account = account;
+    // The sign-in goes back to the caller even when the listing failed: in
+    // the result, or left in the context (`RunCtx::credential`) with an error
+    let credential = auth.into_credential(record);
+    match result {
+        Ok(()) => {}
+        Err(_) if ctx.stop.is_set() => pv.stopped = ctx.stop.reason().map(|(r, _)| r),
+        Err(e) => {
+            ctx.keep_credential(credential);
+            return Err(e);
+        }
+    }
+    ctx.set_phase(Phase::Done);
+    Ok((pv, credential))
+}
+
+pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
+    let (scope, rules) = prepare(args)?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let flow = flow(&args.conn, ctx)?;
+    let with = oauth::reuse_or(ctx, || flow(&args.conn, ctx))?;
     let graph = args.conn.graph_endpoint.trim_end_matches('/').to_string();
     let accounts = scope.accounts.clone();
 
@@ -579,14 +810,24 @@ pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
     };
     let mut http = Client::new(Duration::from_secs(args.conn.timeout)).for_run(ctx);
     ctx.set_stage("signing in");
-    let (auth, record) = match Auth::sign_in(
-        &mut http,
-        flow,
-        &args.conn.login_endpoint,
-        &graph,
-        &["Mail.Read"],
-        ctx,
-    ) {
+    let signed_in = match with {
+        SignInWith::Preview(auth, record) => {
+            collection.footprint(FootprintEntry::new(
+                "info",
+                json!({ "what": "the preview's sign-in was used; there was no new sign-in" }),
+            ))?;
+            Ok((*auth, record))
+        }
+        SignInWith::Flow(flow) => Auth::sign_in(
+            &mut http,
+            flow,
+            &args.conn.login_endpoint,
+            &graph,
+            &["Mail.Read"],
+            ctx,
+        ),
+    };
+    let (auth, record) = match signed_in {
         Ok(a) => a,
         Err(e) => {
             let (reason, code) = common::not_started(&e, ctx.stop);
@@ -608,8 +849,8 @@ pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
         api: Api { http, auth, graph },
         account: args.mailbox.clone(),
         rules,
-        collection,
-        container,
+        collection: Some(collection),
+        container: Some(container),
         ctx,
         folders_listed: 0,
         bodies: 0,
@@ -634,7 +875,7 @@ pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
             );
         }
         let tls = tls_records(&output, &session.api.http)?;
-        session.collection.set_source_identity(json!({
+        session.rec()?.set_source_identity(json!({
             "user": user,
             "auth": record,
             "tls": tls,
@@ -652,13 +893,16 @@ pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
         Ok(())
     })();
     let Session {
-        mut collection,
+        collection,
         container,
         api: Api { http, auth, .. },
         folders_listed,
         bodies,
         ..
     } = session;
+    let (Some(mut collection), Some(container)) = (collection, container) else {
+        unreachable!("a run has its collection and container")
+    };
     collection.footprint(FootprintEntry {
         bytes_sent: Some(http.sent),
         bytes_received: Some(http.received),

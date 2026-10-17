@@ -194,10 +194,22 @@ fn main() -> ExitCode {
                 o.code
             })
         }
+        args::Command::Imap(a) if a.dry_run => {
+            mail::preview(a, &RunCtx::cli(&STOP, None)).map(|(pv, _)| {
+                print(a.json, &pv.summary());
+                pv.stopped.as_ref().map_or(0, |_| 8)
+            })
+        }
         args::Command::Imap(a) => mail::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
+        args::Command::Graph(a) if a.dry_run => {
+            graph::preview(a, &RunCtx::cli(&STOP, None)).map(|(pv, _)| {
+                print(a.json, &pv.summary());
+                pv.stopped.as_ref().map_or(0, |_| 8)
+            })
+        }
         args::Command::Graph(a) => graph::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
@@ -230,6 +242,12 @@ fn main() -> ExitCode {
             print(a.json, &o.summary);
             o.code
         }),
+        args::Command::Gmail(a) if a.dry_run => {
+            gmail::preview(a, &RunCtx::cli(&STOP, None)).map(|(pv, _)| {
+                print(a.json, &pv.summary());
+                pv.stopped.as_ref().map_or(0, |_| 8)
+            })
+        }
         args::Command::Gmail(a) => gmail::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code

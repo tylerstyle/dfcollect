@@ -113,6 +113,23 @@ pkgs.testers.runNixOSTest {
         assert not any("/mailFolders/junk/messages" in r["path"] for r in reqs), "Junk was listed"
         assert not any("/mailFolders/search/" in r["path"] for r in reqs), "a search folder was read"
 
+    with subtest("a dry run signs in and counts what the run takes; no body is fetched"):
+        before = len(requests())
+        code, stdout = run("/target/dry", "--dry-run")
+        assert code == 0, (code, stdout)
+        pv = json.loads(stdout)
+        assert pv["dry_run"] and pv["in_scope"] == 5, pv
+        assert pv["account"] == "alice@contoso.test", pv
+        assert pv["auth_method"] == "device code (delegated)", pv
+        assert pv["out_of_scope"] == {
+            "receivedDateTime before the time window": 1,
+            "folder excluded by Junk Email/**": 1,
+        }, pv
+        new = requests()[before:]
+        assert new and not any("/$value" in r["path"] for r in new), new
+        assert {r["method"] for r in new if r["path"].startswith("/v1.0/")} == {"GET"}, new
+        client.fail("test -e /target/dry")
+
     with subtest("a nextLink to another host never gets the token"):
         before = len(requests())
         code, stdout = run("/target/evil", "--auth app --mailbox mallory@contoso.test",
