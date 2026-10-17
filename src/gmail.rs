@@ -24,12 +24,13 @@
 
 use crate::{
     args::GmailArgs,
-    common,
+    common::{self, Phase, RunCtx},
+    console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     graph::{tls_records, Api},
     http::{encode, Client},
-    mail::{first_line, prompt_secret},
+    mail::first_line,
     meta::Stamps,
     oauth::{b64decode, pem_der, Auth, Flow},
     scope, Usage, TOOL, VERSION,
@@ -41,12 +42,8 @@ use dfcore::manifest::{
 };
 use ring::signature::RsaKeyPair;
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::Path, time::Duration};
+use zeroize::Zeroizing;
 
 const AUDIT_ACTION: &str = "mail_acquisition";
 const TIME_BASIS: &str = "internalDate";
@@ -281,7 +278,7 @@ struct Session<'a> {
     labels: LabelMap,
     collection: Collection,
     container: Container,
-    stop: &'a AtomicBool,
+    ctx: &'a RunCtx<'a>,
     messages_listed: u64,
     bodies: u64,
 }
@@ -316,9 +313,7 @@ impl Session<'_> {
             .map(|q| format!("&q={}", encode(q)))
             .unwrap_or_default();
         loop {
-            if self.stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(self.ctx.stop)?;
             let url = match &page_token {
                 None => format!(
                     "{}/messages?includeSpamTrash=true&maxResults={PAGE}{q_param}",
@@ -361,6 +356,7 @@ impl Session<'_> {
     }
 
     fn message(&mut self, id: &str) -> Result<()> {
+        self.ctx.set_current(id);
         let min_url = format!("{}/messages/{}?format=minimal", self.base, encode(id));
         let min_resp = self.api.get(&min_url, "application/json")?;
         if min_resp.status != 200 {
@@ -373,7 +369,7 @@ impl Session<'_> {
                 min_resp.error_text()
             ));
             item.metadata = json!({ "id": id });
-            self.collection.add(item)?;
+            common::record(&mut self.collection, item, self.ctx)?;
             return Ok(());
         }
         let m = match min_resp.json() {
@@ -384,7 +380,7 @@ impl Session<'_> {
                 item.account = Some(self.account.clone());
                 item.reason = Some(format!("GET format=minimal: {e:#}"));
                 item.metadata = json!({ "id": id });
-                self.collection.add(item)?;
+                common::record(&mut self.collection, item, self.ctx)?;
                 return Ok(());
             }
         };
@@ -431,9 +427,10 @@ impl Session<'_> {
                     item.account = Some(self.account.clone());
                     item.times = times;
                     item.metadata = metadata;
-                    self.collection.add(item)?;
+                    common::record(&mut self.collection, item, self.ctx)?;
                 } else {
                     self.collection.count_out_of_scope(&reason);
+                    self.ctx.count(|p| &p.out_of_scope, 1);
                 }
                 return Ok(());
             }
@@ -452,7 +449,7 @@ impl Session<'_> {
             ));
             item.times = times;
             item.metadata = metadata;
-            self.collection.add(item)?;
+            common::record(&mut self.collection, item, self.ctx)?;
             return Ok(());
         }
         let raw_json = resp.json()?;
@@ -463,7 +460,7 @@ impl Session<'_> {
             item.reason = Some("GET format=raw response has no 'raw' field".into());
             item.times = times;
             item.metadata = metadata;
-            self.collection.add(item)?;
+            common::record(&mut self.collection, item, self.ctx)?;
             return Ok(());
         };
         let Some(body) = b64decode(raw_b64) else {
@@ -473,7 +470,7 @@ impl Session<'_> {
             item.reason = Some("GET format=raw 'raw' field is not valid base64url".into());
             item.times = times;
             item.metadata = metadata;
-            self.collection.add(item)?;
+            common::record(&mut self.collection, item, self.ctx)?;
             return Ok(());
         };
 
@@ -501,7 +498,7 @@ impl Session<'_> {
                     "another message already has the container name {name}"
                 ));
                 item.metadata = metadata;
-                self.collection.add(item)?;
+                common::record(&mut self.collection, item, self.ctx)?;
                 return Ok(());
             }
         }
@@ -515,12 +512,12 @@ impl Session<'_> {
         item.hashes = hasher.finish();
         item.times = times;
         item.metadata = metadata;
-        self.collection.add(item)?;
+        common::record(&mut self.collection, item, self.ctx)?;
         Ok(())
     }
 }
 
-fn header(args: &GmailArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
+fn header(args: &GmailArgs, scope: dfcore::manifest::Scope, ctx: &RunCtx) -> Result<Header> {
     let gmail = args.gmail_endpoint.trim_end_matches('/');
     let who = if args.mailbox.eq_ignore_ascii_case("me") {
         "me".to_string()
@@ -540,7 +537,7 @@ fn header(args: &GmailArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: vec![
                 format!("Gmail API: GET requests only with scope {GMAIL_SCOPE}; nothing is created, changed or deleted in the mailbox"),
                 "GET /gmail/v1/users/me/messages/{id}?format=raw returns exact RFC 2822 bytes without changing UNREAD or any other label".into(),
@@ -561,13 +558,13 @@ fn header(args: &GmailArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
         },
         scope,
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
 }
 
-fn flow(args: &GmailArgs) -> Result<Flow> {
+fn flow(args: &GmailArgs, ctx: &RunCtx) -> Result<Flow> {
     Ok(match args.auth {
         GmailAuth::Token => {
             let path = args
@@ -626,8 +623,14 @@ fn flow(args: &GmailArgs) -> Result<Flow> {
                 )
             })?;
             let client_secret = match &args.client_secret_file {
-                Some(p) => first_line(p)?,
-                None => prompt_secret("Client secret: ")?,
+                Some(p) => Zeroizing::new(first_line(p)?),
+                None => need_secret(
+                    ctx.console.as_ref(),
+                    SecretAsk {
+                        prompt: "Client secret: ".into(),
+                        file_flag: "--client-secret-file",
+                    },
+                )?,
             };
             Flow::Installed {
                 auth_url: args.auth_endpoint.clone(),
@@ -638,7 +641,7 @@ fn flow(args: &GmailArgs) -> Result<Flow> {
     })
 }
 
-pub fn run(args: &GmailArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &GmailArgs, ctx: &RunCtx) -> Result<Outcome> {
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
         if args.scope.scope.is_none() {
@@ -664,11 +667,14 @@ pub fn run(args: &GmailArgs, stop: &AtomicBool) -> Result<Outcome> {
         crate::http::parse_url(url).map_err(|e| Usage(format!("{name}: {e:#}")))?;
     }
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let flow = flow(args)?;
+    let flow = flow(args, ctx)?;
     let gmail = args.gmail_endpoint.trim_end_matches('/').to_string();
     let accounts = scope.accounts.clone();
 
-    let mut collection = Collection::create(&output, header(args, scope)?)?;
+    let mut collection = Collection::create(&output, header(args, scope, ctx)?)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -678,15 +684,17 @@ pub fn run(args: &GmailArgs, stop: &AtomicBool) -> Result<Outcome> {
             return Err(e);
         }
     };
-    let mut http = Client::new(Duration::from_secs(args.timeout));
+    let mut http = Client::new(Duration::from_secs(args.timeout)).for_run(ctx);
+    ctx.set_stage("signing in");
     let (auth, record) =
-        match Auth::sign_in_google(&mut http, flow, &args.token_endpoint, GMAIL_SCOPE) {
+        match Auth::sign_in_google(&mut http, flow, &args.token_endpoint, GMAIL_SCOPE, ctx) {
             Ok(a) => a,
             Err(e) => {
-                let reason = format!("{e:#}");
+                let (reason, code) = common::not_started(&e, ctx.stop);
                 collection.footprint(FootprintEntry::new("auth", json!({ "error": reason })))?;
                 container.finish()?;
-                let (code, finished, _) = common::conclude(collection, &output, Some((reason, 4)))?;
+                let (code, finished, _) =
+                    common::conclude(collection, &output, Some((reason, code)), ctx)?;
                 return Ok(Outcome {
                     code,
                     summary: summary(&output, &finished, 0, 0),
@@ -709,7 +717,7 @@ pub fn run(args: &GmailArgs, stop: &AtomicBool) -> Result<Outcome> {
         labels: LabelMap::default(),
         collection,
         container,
-        stop,
+        ctx,
         messages_listed: 0,
         bodies: 0,
     };
@@ -736,11 +744,15 @@ pub fn run(args: &GmailArgs, stop: &AtomicBool) -> Result<Outcome> {
             "auth": record,
             "tls": tls,
         }))?;
+        ctx.set_phase(Phase::Listing);
+        ctx.set_stage("listing the messages");
         let ids = session.list_message_ids()?;
+        ctx.set_phase(Phase::Copying);
+        ctx.set_total(ids.len() as u64);
+        ctx.set_stage("fetching the messages (format=raw)");
         for id in &ids {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(ctx.stop)?;
+            ctx.count(|p| &p.entries, 1);
             session.message(id)?;
         }
         Ok(())
@@ -767,15 +779,12 @@ pub fn run(args: &GmailArgs, stop: &AtomicBool) -> Result<Outcome> {
             }),
         )
     })?;
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     Ok(Outcome {
         code,
         summary: summary(&output, &finished, messages_listed, bodies),

@@ -4,6 +4,7 @@
 mod args;
 mod cloud;
 mod common;
+mod console;
 mod container;
 mod db;
 mod files;
@@ -111,6 +112,8 @@ fn progress_line(p: &Progress, columns: usize) -> String {
             human_bytes(p.check_bytes.load(Ordering::Relaxed))
         ),
         Phase::Finishing | Phase::Done => "closing the records".into(),
+        Phase::SigningIn => "waiting for the sign-in".into(),
+        Phase::Waiting => p.stage(),
     };
     let mut line = counts;
     if p.phase() == Phase::Copying {
@@ -191,31 +194,31 @@ fn main() -> ExitCode {
                 o.code
             })
         }
-        args::Command::Imap(a) => mail::run(a, &STOP.signal).map(|o| {
+        args::Command::Imap(a) => mail::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Graph(a) => graph::run(a, &STOP.signal).map(|o| {
+        args::Command::Graph(a) => graph::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Cloud(a) => cloud::run(a, &STOP.signal).map(|o| {
+        args::Command::Cloud(a) => cloud::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Db(a) => db::run(a, &STOP.signal).map(|o| {
+        args::Command::Db(a) => db::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::M365Logs(a) => m365logs::run(a, &STOP.signal).map(|o| {
+        args::Command::M365Logs(a) => m365logs::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Gmail(a) => gmail::run(a, &STOP.signal).map(|o| {
+        args::Command::Gmail(a) => gmail::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),
-        args::Command::Ingest(a) => ingest::run(a, &STOP.signal).map(|o| {
+        args::Command::Ingest(a) => ingest::run_with(a, &RunCtx::cli(&STOP, None)).map(|o| {
             print(a.json, &o.summary);
             o.code
         }),

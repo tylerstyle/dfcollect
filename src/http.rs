@@ -260,6 +260,12 @@ pub struct Client {
     pub waits: u64,
     pub sent: u64,
     pub received: u64,
+    /// The run's console and stop: server-requested waits are reported there
+    /// and end early on a stop. None: the terminal, uninterrupted
+    run: Option<(
+        std::sync::Arc<dyn crate::console::Console>,
+        &'static crate::common::Stop,
+    )>,
 }
 
 impl Client {
@@ -272,7 +278,14 @@ impl Client {
             waits: 0,
             sent: 0,
             received: 0,
+            run: None,
         }
+    }
+
+    /// Report waits to the run's console and end them on a stop
+    pub fn for_run(mut self, ctx: &crate::common::RunCtx) -> Self {
+        self.run = Some((ctx.console.clone(), ctx.stop));
+        self
     }
 
     fn connect(&mut self, url: &Url) -> Result<BufReader<Tls>> {
@@ -357,13 +370,22 @@ impl Client {
                 tries += 1;
                 self.waits += 1;
                 let secs = retry_after(resp.header("Retry-After"));
-                eprintln!(
-                    "[*] {} {}: HTTP {}, waiting {secs} s as the server asks",
+                let text = format!(
+                    "{} {}: HTTP {}, waiting {secs} s as the server asks",
                     method,
                     strip_query(&parsed.target),
                     resp.status
                 );
-                std::thread::sleep(Duration::from_secs(secs));
+                match &self.run {
+                    Some((console, stop)) => {
+                        console.notice(crate::console::Level::Info, &text);
+                        crate::common::sleep_unless_stopped(stop, Duration::from_secs(secs))?;
+                    }
+                    None => {
+                        eprintln!("[*] {text}");
+                        std::thread::sleep(Duration::from_secs(secs));
+                    }
+                }
                 continue;
             }
             if (300..400).contains(&resp.status) {

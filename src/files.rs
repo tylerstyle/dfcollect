@@ -770,8 +770,7 @@ pub fn run_with(args: &FilesArgs, ctx: &RunCtx) -> Result<Outcome> {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
 
-    let (code, finished, mismatches) =
-        common::conclude_with(collection, &output, stopped, ctx.progress, Some(ctx.stop))?;
+    let (code, finished, mismatches) = common::conclude(collection, &output, stopped, ctx)?;
     if let Some(p) = ctx.progress {
         p.set_phase(Phase::Done);
     }
@@ -1088,21 +1087,22 @@ mod tests {
             "--reference-how",
             "radio clock",
         ]);
-        let stop = Stop::new();
+        let stop: &'static Stop = Box::leak(Box::new(Stop::new()));
         let progress = Progress::default();
-        let pv = preview(&args, &RunCtx::cli(&stop, Some(&progress))).unwrap();
+        let pv = preview(&args, &RunCtx::cli(stop, Some(&progress))).unwrap();
         assert_eq!((pv.files, pv.bytes), (2, 5 + (3 << 20)));
         assert_eq!(progress.phase(), Phase::Done);
         let argv: Vec<String> = ["dfcollect", "files", "(equivalent)"]
             .map(String::from)
             .to_vec();
         let ctx = RunCtx {
-            stop: &stop,
+            stop,
             progress: Some(&progress),
             argv: Some(argv.clone()),
             interactive: true,
             preview_at_ns: Some(pv.at_ns),
             reference_entered_ns: Some(1_800_000_000_000_000_000),
+            console: std::sync::Arc::new(crate::console::QuietConsole::default()),
         };
         let progress_before = progress.bytes.load(Ordering::Relaxed);
         let out = run_with(&args, &ctx).unwrap();
@@ -1128,9 +1128,9 @@ mod tests {
     fn a_stop_by_the_examiner_is_recorded_as_such() {
         let t = Tree::new("stop");
         let args = t.args(&[]);
-        let stop = Stop::new();
+        let stop: &'static Stop = Box::leak(Box::new(Stop::new()));
         stop.examiner.store(true, Ordering::Relaxed);
-        let out = run_with(&args, &RunCtx::cli(&stop, None)).unwrap();
+        let out = run_with(&args, &RunCtx::cli(stop, None)).unwrap();
         assert_eq!(out.code, 8, "{}", out.summary);
         let m = manifest(&t.0.join("out"));
         assert_eq!(m["status"], "aborted", "{m}");
@@ -1142,12 +1142,12 @@ mod tests {
     #[test]
     fn a_stop_ends_a_large_file_and_leaves_it_out() {
         // A reader that sets the stop after its first block
-        let stop = Stop::new();
+        let stop: &'static Stop = Box::leak(Box::new(Stop::new()));
         let data = vec![0u8; 3 << 20];
         let mut counting = Counting {
             inner: &data[..],
             counter: None,
-            stop: Some(&stop),
+            stop: Some(stop),
         };
         let mut buf = vec![0u8; 1 << 20];
         use std::io::Read;

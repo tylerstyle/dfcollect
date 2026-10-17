@@ -14,7 +14,7 @@
 
 use crate::{
     args::IngestArgs,
-    common,
+    common::{self, Counting, Phase, RunCtx, Stopped},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     meta::Stamps,
@@ -31,7 +31,6 @@ use std::{
     io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 const AUDIT_ACTION: &str = "provider_delivery";
@@ -215,7 +214,7 @@ fn stamps_of(md: &std::fs::Metadata) -> Stamps {
     }
 }
 
-fn header(args: &IngestArgs, received: &str) -> Result<Header> {
+fn header(args: &IngestArgs, received: &str, ctx: &RunCtx) -> Result<Header> {
     Ok(Header {
         action: AUDIT_ACTION.into(),
         case: common::case(&args.case),
@@ -239,7 +238,7 @@ fn header(args: &IngestArgs, received: &str) -> Result<Header> {
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: vec!["the package is only read".into()],
             description: Some(format!(
                 "Every file of the delivered package stored as package/<path> in {CONTAINER} and hashed; the \
@@ -253,13 +252,13 @@ fn header(args: &IngestArgs, received: &str) -> Result<Header> {
             ..Scope::default()
         },
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
 }
 
-pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &IngestArgs, ctx: &RunCtx) -> Result<Outcome> {
     let received = dfcore::host::parse_rfc3339(&args.received_at)
         .map(dfcore::host::rfc3339_utc_ns)
         .map_err(|e| Usage(format!("--received-at: {e:#}")))?;
@@ -297,7 +296,7 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
         return Err(Usage(format!("{}: a directory or a file", package.display())).into());
     };
 
-    let mut collection = Collection::create(&output, header(args, &received)?)?;
+    let mut collection = Collection::create(&output, header(args, &received, ctx)?)?;
     let mut container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -307,6 +306,11 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
             return Err(e);
         }
     };
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
+    ctx.set_phase(Phase::Copying);
+    ctx.set_total(files.len() as u64);
     collection.footprint(FootprintEntry::new(
         "receipt",
         json!({
@@ -352,9 +356,9 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
             collection.add(item)?;
         }
         for (rel, full, kind) in &files {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(ctx.stop)?;
+            ctx.set_current(rel);
+            ctx.count(|p| &p.entries, 1);
             let key = normalize(rel);
             seen.insert(key.clone());
             if *kind != "file" {
@@ -372,6 +376,7 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
                 } else {
                     item.reason = Some("a special file in the package".into());
                     *tally.get_mut("errors").unwrap() += 1;
+                    ctx.count(|p| &p.errors, 1);
                 }
                 // A hash list that names it expected a file
                 if let Some(l) = listed.get(&key) {
@@ -393,14 +398,18 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
             let mut extra = Extra::for_listed(&want);
             let mut hasher = Hasher::new(args.md5, args.sha1);
             let member = format!("package/{rel}");
-            let mut f = std::fs::File::open(full)
+            let f = std::fs::File::open(full)
                 .with_context(|| format!("Cannot open {}", full.display()))?;
             let added = container.add_file(
                 &member,
                 0o444,
                 &stamps_of(&md),
                 &mut Tee {
-                    inner: &mut f,
+                    inner: Counting {
+                        inner: f,
+                        counter: ctx.progress.map(|p| &p.bytes),
+                        stop: Some(ctx.stop),
+                    },
                     extra: &mut extra,
                 },
                 &mut hasher,
@@ -408,7 +417,10 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
             let size = match added {
                 Ok(n) => n,
                 Err(CopyError::Container(e)) => return Err(e),
+                // A stop inside a large file: the member was aborted, the file is not recorded
+                Err(CopyError::Source(_)) if ctx.stop.is_set() => return Err(Stopped.into()),
                 Err(CopyError::Source(e)) => {
+                    ctx.count(|p| &p.errors, 1);
                     let mut item = Item::new(ItemStatus::Error, rel.clone());
                     item.kind = Some("file".into());
                     item.reason = Some(format!("reading failed: {e}"));
@@ -447,6 +459,7 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
                 item.status = ItemStatus::Error;
                 item.reason = Some(bad.join("; "));
                 *tally.get_mut("mismatched").unwrap() += 1;
+                ctx.count(|p| &p.errors, 1);
             } else if want.is_empty() && !lists.is_empty() {
                 *tally.get_mut("unlisted").unwrap() += 1;
                 if !args.allow_unlisted {
@@ -456,6 +469,7 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
             } else if !want.is_empty() {
                 *tally.get_mut("verified").unwrap() += 1;
             }
+            ctx.count(|p| &p.files, 1);
             collection.add(item)?;
         }
         for (path, l) in &listed {
@@ -475,15 +489,12 @@ pub fn run(args: &IngestArgs, stop: &AtomicBool) -> Result<Outcome> {
         }
         Ok(())
     })();
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     let m = &finished.manifest;
     Ok(Outcome {
         code,
@@ -524,6 +535,102 @@ mod tests {
         assert!(l.contains_key("dir/file name.txt"), "{l:?}");
         assert!(parse_list("nothex  file\n", "x").is_err());
         assert!(parse_list("abc  file\n", "x").is_err());
+    }
+
+    fn package(tag: &str) -> PathBuf {
+        let root = PathBuf::from("/dev/shm")
+            .join(format!("dfcollect_ingest_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pkg/sub")).unwrap();
+        std::fs::write(root.join("pkg/a.txt"), b"alpha").unwrap();
+        std::fs::write(root.join("pkg/sub/b.bin"), vec![7u8; 2 << 20]).unwrap();
+        std::fs::write(
+            root.join("SHA256SUMS"),
+            format!("{}  a.txt\n", crate::mail::client::sha256_hex(b"alpha")),
+        )
+        .unwrap();
+        crate::common::test_audit_log();
+        root
+    }
+
+    fn args(root: &Path, extra: &[&str]) -> IngestArgs {
+        let mut argv: Vec<String> = [
+            "dfcollect",
+            "ingest",
+            "--provider",
+            "Example Mail Inc.",
+            "--received-at",
+            "2026-10-17T10:00:00Z",
+            "--channel",
+            "SFTP",
+            "--allow-unlisted",
+            "--allow-tmpfs",
+            "-C",
+            "C",
+            "-E",
+            "E",
+            "-e",
+            "x",
+        ]
+        .map(String::from)
+        .to_vec();
+        argv.push("--hashes".into());
+        argv.push(root.join("SHA256SUMS").display().to_string());
+        argv.push("-o".into());
+        argv.push(root.join("out").display().to_string());
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        argv.push(root.join("pkg").display().to_string());
+        use clap::Parser;
+        match crate::args::Cli::try_parse_from(argv).unwrap().command {
+            Some(crate::args::Command::Ingest(a)) => *a,
+            _ => unreachable!(),
+        }
+    }
+
+    fn manifest(dir: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_tui_run_records_its_command_counts_and_can_be_stopped() {
+        use crate::common::{Progress, Stop};
+        use std::sync::atomic::Ordering;
+        let root = package("tui");
+        let a = args(&root, &[]);
+        let stop: &'static Stop = Box::leak(Box::new(Stop::new()));
+        let progress = Progress::default();
+        let argv: Vec<String> = ["dfcollect", "ingest", "(equivalent)"]
+            .map(String::from)
+            .to_vec();
+        let console = std::sync::Arc::new(crate::console::QuietConsole::default());
+        let ctx = RunCtx {
+            stop,
+            progress: Some(&progress),
+            console: console.clone(),
+            argv: Some(argv.clone()),
+            interactive: true,
+            preview_at_ns: None,
+            reference_entered_ns: None,
+        };
+        let out = run_with(&a, &ctx).unwrap();
+        assert_eq!(out.code, 0, "{}", out.summary);
+        let m = manifest(&root.join("out"));
+        assert_eq!(m["method"]["argv"], json!(argv));
+        assert_eq!(progress.files.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.bytes.load(Ordering::Relaxed), 5 + (2 << 20));
+        assert_eq!(progress.items_total.load(Ordering::Relaxed), 2);
+        assert_eq!(progress.phase(), Phase::Done);
+        assert_eq!(out.summary["verified"], 1);
+
+        // Stopped by the examiner: aborted, exit 8, the reason recorded
+        let _ = std::fs::remove_dir_all(root.join("out"));
+        stop.examiner.store(true, Ordering::Relaxed);
+        let out = run_with(&a, &ctx).unwrap();
+        assert_eq!(out.code, 8, "{}", out.summary);
+        let m = manifest(&root.join("out"));
+        assert_eq!(m["status"], "aborted");
+        assert!(m.to_string().contains("stopped by the examiner"), "{m}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

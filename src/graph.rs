@@ -17,11 +17,12 @@
 
 use crate::{
     args::{GraphArgs, GraphConnArgs},
-    common,
+    common::{self, Phase, RunCtx, Stop},
+    console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     http::{encode, strip_query, Client, Response},
-    mail::{client::sha256_hex, first_line, folder_scope, prompt_secret},
+    mail::{client::sha256_hex, first_line, folder_scope},
     meta::Stamps,
     oauth::{Auth, Flow},
     scope, Usage, TOOL, VERSION,
@@ -32,11 +33,8 @@ use dfcore::manifest::{
     ScopeRules, Source, Times,
 };
 use serde_json::{json, Value};
-use std::{
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::{path::Path, time::Duration};
+use zeroize::Zeroizing;
 
 const AUDIT_ACTION: &str = "mail_acquisition";
 const TIME_BASIS: &str = "receivedDateTime";
@@ -165,7 +163,7 @@ impl Api {
     }
 
     /// All pages of a collection
-    pub fn pages(&mut self, first: &str, stop: &AtomicBool) -> Result<Vec<Value>> {
+    pub fn pages(&mut self, first: &str, stop: &Stop) -> Result<Vec<Value>> {
         let mut out = Vec::new();
         self.each_page(first, stop, |page| {
             out.extend(page.iter().cloned());
@@ -178,15 +176,13 @@ impl Api {
     pub fn each_page(
         &mut self,
         first: &str,
-        stop: &AtomicBool,
+        stop: &Stop,
         mut f: impl FnMut(&[Value]) -> Result<()>,
     ) -> Result<u64> {
         let mut next = Some(first.to_string());
         let mut pages = 0;
         while let Some(url) = next {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(stop)?;
             let v = self.get_json(&url)?;
             if let Some(items) = v["value"].as_array() {
                 f(items)?;
@@ -206,14 +202,14 @@ struct Session<'a> {
     rules: ScopeRules,
     collection: Collection,
     container: Container,
-    stop: &'a AtomicBool,
+    ctx: &'a RunCtx<'a>,
     folders_listed: u64,
     bodies: u64,
 }
 
 impl Session<'_> {
     fn pages(&mut self, first: &str) -> Result<Vec<Value>> {
-        self.api.pages(first, self.stop)
+        self.api.pages(first, self.ctx.stop)
     }
 
     fn walk(&mut self, url: &str, parent: &str, out: &mut Vec<Folder>) -> Result<()> {
@@ -308,10 +304,9 @@ impl Session<'_> {
             "request",
             json!({ "request": "GET messages (metadata)", "folder": folder.path, "messages": messages.len() }),
         ))?;
+        self.ctx.count(|p| &p.entries, messages.len() as u64);
         for m in &messages {
-            if self.stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(self.ctx.stop)?;
             self.message(folder, m)?;
         }
         Ok(())
@@ -346,6 +341,7 @@ impl Session<'_> {
         }) {
             Decision::InScope => {}
             Decision::OutOfScope(reason) => {
+                self.ctx.count(|p| &p.out_of_scope, 1);
                 if self.args.scope.list_out_of_scope {
                     let mut item = Item::out_of_scope(path, reason);
                     item.kind = Some("message".into());
@@ -360,8 +356,10 @@ impl Session<'_> {
             }
         }
         let url = format!("{}/messages/{}/$value", self.base, encode(id));
+        self.ctx.set_current(&path);
         let resp = self.api.get(&url, "*/*")?;
         if resp.status != 200 {
+            self.ctx.count(|p| &p.errors, 1);
             let mut item = Item::new(ItemStatus::Error, path);
             item.kind = Some("message".into());
             item.account = Some(self.account.clone());
@@ -392,6 +390,7 @@ impl Session<'_> {
             Err(CopyError::Container(e)) => return Err(e),
             Err(CopyError::Source(e)) => return Err(e.into()),
             Err(CopyError::Duplicate(name)) => {
+                self.ctx.count(|p| &p.errors, 1);
                 let mut item = Item::new(ItemStatus::Error, path);
                 item.kind = Some("message".into());
                 item.account = Some(self.account.clone());
@@ -404,6 +403,8 @@ impl Session<'_> {
             }
         }
         self.bodies += 1;
+        self.ctx.count(|p| &p.files, 1);
+        self.ctx.count(|p| &p.bytes, resp.body.len() as u64);
         let mut item = Item::new(ItemStatus::Acquired, path);
         item.kind = Some("message".into());
         item.account = Some(self.account.clone());
@@ -437,7 +438,7 @@ pub(crate) fn tls_records(dir: &Path, http: &Client) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
-fn header(args: &GraphArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
+fn header(args: &GraphArgs, scope: dfcore::manifest::Scope, ctx: &RunCtx) -> Result<Header> {
     let graph = args.conn.graph_endpoint.trim_end_matches('/');
     Ok(Header {
         action: AUDIT_ACTION.into(),
@@ -452,7 +453,7 @@ fn header(args: &GraphArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: vec![
                 "Microsoft Graph: GET requests only; nothing is created, changed or deleted in the mailbox".into(),
                 "GET /messages/{id}/$value does not change isRead".into(),
@@ -468,14 +469,14 @@ fn header(args: &GraphArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
         },
         scope,
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
 }
 
 /// The sign-in the connection options ask for
-pub(crate) fn flow(conn: &GraphConnArgs) -> Result<Flow> {
+pub(crate) fn flow(conn: &GraphConnArgs, ctx: &RunCtx) -> Result<Flow> {
     let client_id = || {
         conn.client_id.clone().ok_or_else(|| {
             Usage(
@@ -506,8 +507,14 @@ pub(crate) fn flow(conn: &GraphConnArgs) -> Result<Flow> {
                 .into());
             }
             let secret = match &conn.client_secret_file {
-                Some(p) => first_line(p)?,
-                None => prompt_secret("Client secret: ")?,
+                Some(p) => Zeroizing::new(first_line(p)?),
+                None => need_secret(
+                    ctx.console.as_ref(),
+                    SecretAsk {
+                        prompt: "Client secret: ".into(),
+                        file_flag: "--client-secret-file",
+                    },
+                )?,
             };
             Flow::App {
                 tenant: conn.tenant.clone(),
@@ -529,7 +536,7 @@ pub(crate) fn check_endpoints(conn: &GraphConnArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &GraphArgs, ctx: &RunCtx) -> Result<Outcome> {
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
         if args.scope.scope.is_none() {
@@ -553,11 +560,14 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
         );
     }
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let flow = flow(&args.conn)?;
+    let flow = flow(&args.conn, ctx)?;
     let graph = args.conn.graph_endpoint.trim_end_matches('/').to_string();
     let accounts = scope.accounts.clone();
 
-    let mut collection = Collection::create(&output, header(args, scope)?)?;
+    let mut collection = Collection::create(&output, header(args, scope, ctx)?)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -567,20 +577,23 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
             return Err(e);
         }
     };
-    let mut http = Client::new(Duration::from_secs(args.conn.timeout));
+    let mut http = Client::new(Duration::from_secs(args.conn.timeout)).for_run(ctx);
+    ctx.set_stage("signing in");
     let (auth, record) = match Auth::sign_in(
         &mut http,
         flow,
         &args.conn.login_endpoint,
         &graph,
         &["Mail.Read"],
+        ctx,
     ) {
         Ok(a) => a,
         Err(e) => {
-            let reason = format!("{e:#}");
+            let (reason, code) = common::not_started(&e, ctx.stop);
             collection.footprint(FootprintEntry::new("auth", json!({ "error": reason })))?;
             container.finish()?;
-            let (code, finished, _) = common::conclude(collection, &output, Some((reason, 4)))?;
+            let (code, finished, _) =
+                common::conclude(collection, &output, Some((reason, code)), ctx)?;
             return Ok(Outcome {
                 code,
                 summary: summary(&output, &finished, 0, 0),
@@ -597,7 +610,7 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
         rules,
         collection,
         container,
-        stop,
+        ctx,
         folders_listed: 0,
         bodies: 0,
     };
@@ -626,11 +639,15 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
             "auth": record,
             "tls": tls,
         }))?;
-        for folder in session.folders()? {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
-            session.folder(&folder)?;
+        ctx.set_phase(Phase::Listing);
+        ctx.set_stage("listing the mail folders");
+        let folders = session.folders()?;
+        ctx.set_phase(Phase::Copying);
+        let n = folders.len();
+        for (i, folder) in folders.iter().enumerate() {
+            common::check_stop(ctx.stop)?;
+            ctx.set_stage(&format!("folder {} ({}/{n})", folder.path, i + 1));
+            session.folder(folder)?;
         }
         Ok(())
     })();
@@ -656,15 +673,12 @@ pub fn run(args: &GraphArgs, stop: &AtomicBool) -> Result<Outcome> {
             }),
         )
     })?;
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     Ok(Outcome {
         code,
         summary: summary(&output, &finished, folders_listed, bodies),

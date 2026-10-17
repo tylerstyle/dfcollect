@@ -17,10 +17,11 @@
 
 use crate::{
     args::DbArgs,
-    common,
+    common::{self, Counting, Phase, RunCtx, Stopped},
+    console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
-    mail::{first_line, prompt_secret},
+    mail::first_line,
     meta::Stamps,
     TOOL, VERSION,
 };
@@ -34,7 +35,6 @@ use std::{
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 const AUDIT_ACTION: &str = "database_acquisition";
@@ -135,6 +135,7 @@ pub fn member_name(db: &str) -> String {
 
 struct Session<'a> {
     args: &'a DbArgs,
+    ctx: &'a RunCtx<'a>,
     collection: Collection,
     container: Container,
     env: Vec<(String, String)>,
@@ -184,11 +185,15 @@ impl Session<'_> {
                 ],
             ),
         };
-        let out = self
-            .command(program)
-            .args(&args)
-            .output()
-            .with_context(|| format!("Cannot run {program}"))?;
+        let mut cmd = self.command(program);
+        cmd.args(&args);
+        let out = common::output_unless_stopped(cmd, self.ctx.stop).map_err(|e| {
+            if e.downcast_ref::<Stopped>().is_some() {
+                e
+            } else {
+                e.context(format!("Cannot run {program}"))
+            }
+        })?;
         self.collection.footprint(FootprintEntry::new(
             "query",
             json!({ "client": program, "sql": sql, "exit": out.status.code() }),
@@ -271,7 +276,8 @@ impl Session<'_> {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("Cannot run {program}"))?;
-        let mut stdout = child.stdout.take().context("stdout")?;
+        let stdout = child.stdout.take().context("stdout")?;
+        self.ctx.set_current(path);
         let mut stderr = child.stderr.take().context("stderr")?;
         let err_thread = std::thread::spawn(move || {
             let mut s = String::new();
@@ -286,9 +292,22 @@ impl Session<'_> {
             birth: None,
         };
         let mut hasher = Hasher::new(self.args.md5, self.args.sha1);
+        let mut counted = Counting {
+            inner: stdout,
+            counter: self.ctx.progress.map(|p| &p.bytes),
+            stop: Some(self.ctx.stop),
+        };
         let added = self
             .container
-            .add_file(member, 0o644, &stamps, &mut stdout, &mut hasher);
+            .add_file(member, 0o644, &stamps, &mut counted, &mut hasher);
+        if matches!(added, Err(CopyError::Source(_))) && self.ctx.stop.is_set() {
+            // Stopped inside the dump: the member was aborted and the tool is
+            // ended (it would block on the full pipe); the dump is not recorded
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = err_thread.join();
+            return Err(Stopped.into());
+        }
         let status = child.wait()?;
         let err = err_thread.join().unwrap_or_default();
         let command = format!("{program} {}", args.join(" "));
@@ -320,8 +339,10 @@ impl Session<'_> {
         item.metadata = md;
         if status.success() {
             self.dumps += 1;
+            self.ctx.count(|p| &p.files, 1);
         } else {
             self.failed += 1;
+            self.ctx.count(|p| &p.errors, 1);
             item.reason = Some(format!(
                 "{program} exited with {:?}: {}; the member holds what it wrote",
                 status.code(),
@@ -333,7 +354,7 @@ impl Session<'_> {
     }
 }
 
-fn header(args: &DbArgs) -> Result<Header> {
+fn header(args: &DbArgs, ctx: &RunCtx) -> Result<Header> {
     let engine = match args.engine {
         Engine::Postgres => "postgresql",
         Engine::Mariadb => "mariadb",
@@ -351,7 +372,7 @@ fn header(args: &DbArgs) -> Result<Header> {
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: match args.engine {
                 Engine::Postgres => vec![
                     "pg_dump: one read-only snapshot per database (ACCESS SHARE locks: DDL waits while it runs)".into(),
@@ -374,7 +395,7 @@ fn header(args: &DbArgs) -> Result<Header> {
             ..Scope::default()
         },
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
@@ -387,12 +408,18 @@ fn port(args: &DbArgs) -> u16 {
     })
 }
 
-pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &DbArgs, ctx: &RunCtx) -> Result<Outcome> {
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
     let password = match &args.password_file {
-        Some(p) => Some(first_line(p)?),
+        Some(p) => Some(zeroize::Zeroizing::new(first_line(p)?)),
         None if args.no_password => None,
-        None => Some(prompt_secret("Database password: ")?),
+        None => Some(need_secret(
+            ctx.console.as_ref(),
+            SecretAsk {
+                prompt: "Database password: ".into(),
+                file_flag: "--password-file",
+            },
+        )?),
     };
     let port = port(args);
     let secrets = Secrets::new()?;
@@ -418,16 +445,20 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
                 env.push(("PGSSLROOTCERT".into(), "system".into()));
             }
             let pass = match &password {
-                Some(pw) => {
-                    secrets.write("pgpass", &pgpass_line(&args.host, port, &args.user, pw))?
-                }
+                Some(pw) => secrets.write(
+                    "pgpass",
+                    &zeroize::Zeroizing::new(pgpass_line(&args.host, port, &args.user, pw)),
+                )?,
                 None => secrets.write("pgpass", "")?,
             };
             env.push(("PGPASSFILE".into(), pass.display().to_string()));
             base_args.push("--no-password".into());
         }
         Engine::Mariadb => {
-            let cnf = secrets.write("my.cnf", &mycnf(password.as_deref().unwrap_or("")))?;
+            let cnf = secrets.write(
+                "my.cnf",
+                &zeroize::Zeroizing::new(mycnf(password.as_deref().map_or("", String::as_str))),
+            )?;
             // --defaults-extra-file must come first
             base_args.push(format!("--defaults-extra-file={}", cnf.display()));
             base_args.extend([
@@ -451,7 +482,10 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
         }
     }
 
-    let collection = Collection::create(&output, header(args)?)?;
+    let mut collection = Collection::create(&output, header(args, ctx)?)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -463,6 +497,7 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
     };
     let mut session = Session {
         args,
+        ctx,
         collection,
         container,
         env,
@@ -471,6 +506,8 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
         failed: 0,
     };
     let result = (|| -> Result<()> {
+        ctx.set_phase(Phase::Listing);
+        ctx.set_stage("reading the server's clock, settings and databases");
         let (server, all) = session.server()?;
         session.collection.set_source_identity(server)?;
         let wanted: Vec<String> = if args.databases.is_empty() {
@@ -486,7 +523,10 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
             }
             args.databases.clone()
         };
+        ctx.set_phase(Phase::Copying);
+        ctx.set_total(wanted.len() as u64 + u64::from(args.engine == Engine::Postgres));
         for d in all.iter().filter(|d| !wanted.contains(d)) {
+            ctx.count(|p| &p.out_of_scope, 1);
             session
                 .collection
                 .count_out_of_scope(&format!("database {d} not named with --database"));
@@ -502,9 +542,8 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
                     json!({ "what": "roles and tablespaces, without role password hashes" }),
                 )?;
                 for db in &wanted {
-                    if stop.load(Ordering::Relaxed) {
-                        bail!("stopped by a signal");
-                    }
+                    common::check_stop(ctx.stop)?;
+                    ctx.set_stage(&format!("dumping {db}"));
                     let mut a = vec!["--format=custom".to_string()];
                     if args.serializable {
                         a.push("--serializable-deferrable".into());
@@ -521,9 +560,8 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
             }
             Engine::Mariadb => {
                 for db in &wanted {
-                    if stop.load(Ordering::Relaxed) {
-                        bail!("stopped by a signal");
-                    }
+                    common::check_stop(ctx.stop)?;
+                    ctx.set_stage(&format!("dumping {db}"));
                     let mut a: Vec<String> = [
                         "--single-transaction",
                         "--routines",
@@ -559,15 +597,12 @@ pub fn run(args: &DbArgs, stop: &AtomicBool) -> Result<Outcome> {
         ..
     } = session;
     drop(secrets);
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     let m = &finished.manifest;
     Ok(Outcome {
         code,

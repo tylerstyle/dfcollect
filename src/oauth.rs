@@ -13,7 +13,11 @@
 //! tenant/subject, granted scopes and the claims in the token that name the
 //! account and the app (read, not verified: the API verifies them).
 
-use crate::http::{form, Client};
+use crate::{
+    common::{self, Phase, RunCtx},
+    console::{Console, SignIn},
+    http::{form, Client},
+};
 use anyhow::{bail, ensure, Context, Result};
 use ring::{
     rand::{SecureRandom, SystemRandom},
@@ -23,10 +27,29 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use std::{
     io::{BufRead, BufReader, Write},
-    net::TcpListener,
-    sync::mpsc,
+    net::{TcpListener, TcpStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    },
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
+
+/// Tells the console the sign-in is over when it goes out of scope, however
+/// the sign-in ended
+struct SignInOver<'a>(&'a dyn Console);
+
+impl Drop for SignInOver<'_> {
+    fn drop(&mut self) {
+        self.0.sign_in_done();
+    }
+}
+
+fn expires_at(secs: u64) -> i128 {
+    dfcore::host::unix_now_ns() + i128::from(secs) * 1_000_000_000
+}
 
 pub enum Flow {
     Device {
@@ -36,7 +59,7 @@ pub enum Flow {
     App {
         tenant: String,
         client_id: String,
-        secret: String,
+        secret: Zeroizing<String>,
     },
     ServiceAccount {
         client_email: String,
@@ -48,7 +71,7 @@ pub enum Flow {
     Installed {
         auth_url: String,
         client_id: String,
-        client_secret: String,
+        client_secret: Zeroizing<String>,
     },
     Token(String),
 }
@@ -292,6 +315,7 @@ impl Auth {
         login: &str,
         graph: &str,
         delegated: &[&str],
+        ctx: &RunCtx,
     ) -> Result<(Self, Value)> {
         let login = login.trim_end_matches('/');
         let graph = graph.trim_end_matches('/');
@@ -336,7 +360,7 @@ impl Auth {
             }
             Flow::Device { client_id, .. } => {
                 let client_id = client_id.clone();
-                let granted = auth.device(http, login, &tenant, &client_id)?;
+                let granted = auth.device(http, login, &tenant, &client_id, ctx)?;
                 json!({
                     "method": "device code (delegated)",
                     "client_id": client_id,
@@ -359,6 +383,7 @@ impl Auth {
         flow: Flow,
         token_url: &str,
         scope: &str,
+        ctx: &RunCtx,
     ) -> Result<(Self, Value)> {
         let mut auth = Auth {
             flow,
@@ -405,7 +430,7 @@ impl Auth {
                 let auth_url = auth_url.clone();
                 let client_id = client_id.clone();
                 let client_secret = client_secret.clone();
-                let granted = auth.installed(http, &auth_url, &client_id, &client_secret)?;
+                let granted = auth.installed(http, &auth_url, &client_id, &client_secret, ctx)?;
                 json!({
                     "method": "installed application (OAuth 2.0 authorization code with PKCE)",
                     "client_id": client_id,
@@ -442,6 +467,7 @@ impl Auth {
         auth_url: &str,
         client_id: &str,
         client_secret: &str,
+        ctx: &RunCtx,
     ) -> Result<Option<String>> {
         let rng = SystemRandom::new();
         let mut vbytes = [0u8; 32];
@@ -470,14 +496,22 @@ impl Auth {
             ("prompt", "consent"),
         ]);
         let full_url = format!("{}?{query}", auth_url.trim_end_matches('?'));
-        eprintln!("[!] Signing in can notify the account holder (new sign-in / third-party access alerts).");
-        eprintln!("[?] Open this URL in a browser (or on another device and paste the redirect URL here):");
-        eprintln!("{full_url}");
+        const WAIT: u64 = 900;
+        ctx.set_phase(Phase::SigningIn);
+        ctx.console.sign_in(&SignIn::Browser {
+            url: full_url,
+            expires_at_ns: expires_at(WAIT),
+        });
+        let _over = SignInOver(ctx.console.as_ref());
 
-        let (tx, rx) = mpsc::channel::<Result<String>>();
-        let tx_tcp = tx.clone();
+        let (tx, rx) = mpsc::channel::<String>();
+        let done = Arc::new(AtomicBool::new(false));
+        let listener_done = Arc::clone(&done);
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
+                if listener_done.load(Ordering::Relaxed) {
+                    break;
+                }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
                 let mut req_line = String::new();
@@ -503,32 +537,35 @@ impl Auth {
                 let _ = stream.write_all(body);
                 let _ = stream.flush();
                 if is_redirect {
-                    let _ = tx_tcp.send(Ok(target));
+                    let _ = tx.send(target);
                     break;
                 }
             }
         });
-        std::thread::spawn(move || {
-            let stdin = std::io::stdin();
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match stdin.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            let _ = tx.send(Ok(trimmed.to_string()));
-                            break;
-                        }
-                    }
-                }
+        // The redirect reaches the listener, or the examiner pastes it
+        // (from another device); a stop or the deadline ends the wait
+        let deadline = Instant::now() + Duration::from_secs(WAIT);
+        let waited = loop {
+            if let Err(e) = common::check_stop(ctx.stop) {
+                break Err(e);
             }
-        });
-
-        let received = rx
-            .recv_timeout(Duration::from_secs(900))
-            .context("timed out waiting for the OAuth redirect or pasted URL")??;
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(target) => break Ok(target),
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            }
+            if let Some(line) = ctx.console.pasted() {
+                break Ok(line);
+            }
+            if Instant::now() > deadline {
+                break Err(anyhow::anyhow!(
+                    "timed out waiting for the OAuth redirect or pasted URL"
+                ));
+            }
+        };
+        // End the listener: it checks `done` after the next connection
+        done.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", port));
+        let received = waited?;
         let code = parse_auth_redirect(&received, &state)?;
 
         let url = self.token_url.clone();
@@ -556,6 +593,7 @@ impl Auth {
         login: &str,
         tenant: &str,
         client_id: &str,
+        ctx: &RunCtx,
     ) -> Result<Option<String>> {
         let url = format!(
             "{login}/{}/oauth2/v2.0/devicecode",
@@ -583,13 +621,19 @@ impl Auth {
                     v["user_code"].as_str().unwrap_or("?")
                 )
             });
-        eprintln!("[!] Signing in can notify the account holder (new sign-in alerts).");
-        eprintln!("[?] {message}");
         let mut interval = v["interval"].as_u64().unwrap_or(5).max(1);
-        let deadline =
-            Instant::now() + Duration::from_secs(v["expires_in"].as_u64().unwrap_or(900));
+        let expires_in = v["expires_in"].as_u64().unwrap_or(900);
+        let deadline = Instant::now() + Duration::from_secs(expires_in);
+        ctx.set_phase(Phase::SigningIn);
+        ctx.console.sign_in(&SignIn::DeviceCode {
+            message,
+            uri: v["verification_uri"].as_str().unwrap_or("").to_string(),
+            code: v["user_code"].as_str().unwrap_or("").to_string(),
+            expires_at_ns: expires_at(expires_in),
+        });
+        let _over = SignInOver(ctx.console.as_ref());
         loop {
-            std::thread::sleep(Duration::from_secs(interval));
+            common::sleep_unless_stopped(ctx.stop, Duration::from_secs(interval))?;
             if Instant::now() > deadline {
                 bail!("the device code expired before the sign-in was completed");
             }

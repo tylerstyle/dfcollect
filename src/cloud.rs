@@ -18,7 +18,7 @@
 
 use crate::{
     args::CloudArgs,
-    common,
+    common::{self, Counting, Phase, RunCtx, Stopped},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     meta::Stamps,
@@ -35,7 +35,6 @@ use std::{
     collections::BTreeMap,
     io::Read,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 const AUDIT_ACTION: &str = "cloud_acquisition";
@@ -180,6 +179,7 @@ impl<R: Read> Read for Tee<R> {
 
 struct Session<'a> {
     args: &'a CloudArgs,
+    ctx: &'a RunCtx<'a>,
     remote: String,
     base: String,
     rules: ScopeRules,
@@ -200,11 +200,15 @@ impl Session<'_> {
     }
 
     fn run_rclone(&mut self, args: &[&str]) -> Result<Vec<u8>> {
-        let out = self
-            .rclone()
-            .args(args)
-            .output()
-            .context("Cannot run rclone")?;
+        let mut cmd = self.rclone();
+        cmd.args(args);
+        let out = common::output_unless_stopped(cmd, self.ctx.stop).map_err(|e| {
+            if e.downcast_ref::<Stopped>().is_some() {
+                e
+            } else {
+                e.context("Cannot run rclone")
+            }
+        })?;
         self.collection.footprint(FootprintEntry::new(
             "command",
             json!({
@@ -284,6 +288,7 @@ impl Session<'_> {
         }) {
             Decision::InScope => {}
             Decision::OutOfScope(reason) => {
+                self.ctx.count(|p| &p.out_of_scope, 1);
                 if self.args.scope.list_out_of_scope {
                     let mut item = Item::out_of_scope(rel, reason);
                     item.kind = Some("file".into());
@@ -308,6 +313,7 @@ impl Session<'_> {
             }
         }
         let src = remote_path(&self.remote, &self.base, &rel);
+        self.ctx.set_current(&rel);
         let mut child = self
             .rclone()
             .arg("cat")
@@ -333,18 +339,31 @@ impl Session<'_> {
         };
         let mut hasher = Hasher::new(self.args.md5, self.args.sha1);
         let mut tee = Tee {
-            inner: stdout,
+            inner: Counting {
+                inner: stdout,
+                counter: self.ctx.progress.map(|p| &p.bytes),
+                stop: Some(self.ctx.stop),
+            },
             providers,
         };
         let added = self
             .container
             .add_file(&member, 0o644, &stamps, &mut tee, &mut hasher);
+        if matches!(added, Err(CopyError::Source(_))) && self.ctx.stop.is_set() {
+            // Stopped inside the file: the member was aborted; rclone would
+            // block on the full pipe, so it is ended before it is waited for
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = err_thread.join();
+            return Err(Stopped.into());
+        }
         let status = child.wait()?;
         let rclone_err = err_thread.join().unwrap_or_default();
         let size = match added {
             Ok(n) => n,
             Err(CopyError::Container(e)) => return Err(e),
             Err(CopyError::Source(err)) => {
+                self.ctx.count(|p| &p.errors, 1);
                 let mut item = Item::new(ItemStatus::Error, rel);
                 item.kind = Some("file".into());
                 item.reason = Some(format!(
@@ -357,6 +376,7 @@ impl Session<'_> {
                 return Ok(());
             }
             Err(CopyError::Duplicate(n)) => {
+                self.ctx.count(|p| &p.errors, 1);
                 let mut item = Item::new(ItemStatus::Error, rel);
                 item.kind = Some("file".into());
                 item.reason = Some(format!("another file already has the container name {n}"));
@@ -410,8 +430,10 @@ impl Session<'_> {
         item.metadata = md;
         if problems.is_empty() {
             self.acquired += 1;
+            self.ctx.count(|p| &p.files, 1);
         } else {
             self.mismatched += 1;
+            self.ctx.count(|p| &p.errors, 1);
             item.reason = Some(problems.join("; "));
         }
         self.collection.add(item)?;
@@ -419,7 +441,7 @@ impl Session<'_> {
     }
 }
 
-fn header(args: &CloudArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
+fn header(args: &CloudArgs, scope: dfcore::manifest::Scope, ctx: &RunCtx) -> Result<Header> {
     Ok(Header {
         action: AUDIT_ACTION.into(),
         case: common::case(&args.case),
@@ -433,7 +455,7 @@ fn header(args: &CloudArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: vec![
                 "rclone lsjson and rclone cat only: both read the remote and never write".into(),
             ],
@@ -447,13 +469,13 @@ fn header(args: &CloudArgs, scope: dfcore::manifest::Scope) -> Result<Header> {
         },
         scope,
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
 }
 
-pub fn run(args: &CloudArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &CloudArgs, ctx: &RunCtx) -> Result<Outcome> {
     let (remote, base) = split_source(&args.source)?;
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
@@ -473,7 +495,10 @@ pub fn run(args: &CloudArgs, stop: &AtomicBool) -> Result<Outcome> {
     let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
 
-    let collection = Collection::create(&output, header(args, scope)?)?;
+    let mut collection = Collection::create(&output, header(args, scope, ctx)?)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -485,6 +510,7 @@ pub fn run(args: &CloudArgs, stop: &AtomicBool) -> Result<Outcome> {
     };
     let mut session = Session {
         args,
+        ctx,
         remote,
         base,
         rules,
@@ -503,13 +529,19 @@ pub fn run(args: &CloudArgs, stop: &AtomicBool) -> Result<Outcome> {
             "path": session.base,
             "config": redact_config(&String::from_utf8_lossy(&config)),
         }))?;
+        ctx.set_phase(Phase::Listing);
+        ctx.set_stage("listing the remote (rclone lsjson)");
         let before = session.listing("rclone/listing-before.json")?;
+        ctx.set_phase(Phase::Copying);
+        ctx.set_total(before.len() as u64);
+        ctx.set_stage("copying (rclone cat)");
         for entry in &before {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(ctx.stop)?;
+            ctx.count(|p| &p.entries, 1);
             session.file(entry)?;
         }
+        ctx.set_phase(Phase::Listing);
+        ctx.set_stage("listing the remote again (changes during the acquisition)");
         let after = session.listing("rclone/listing-after.json")?;
         changes = listing_changes(&before, &after);
         let n = ["added", "removed", "changed"]
@@ -534,15 +566,12 @@ pub fn run(args: &CloudArgs, stop: &AtomicBool) -> Result<Outcome> {
         mismatched,
         ..
     } = session;
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     let m = &finished.manifest;
     Ok(Outcome {
         code,

@@ -3,6 +3,7 @@
 
 use crate::{
     args::{CaseArgs, ClockArgs},
+    console::{Console, Level, TermConsole},
     container,
     files::CONTAINER,
     Usage,
@@ -17,8 +18,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 /// Who asked a run to stop. A signal (the CLI's Ctrl-C, SIGTERM, a closed
@@ -71,6 +73,10 @@ pub enum Phase {
     /// The records are closed
     Finishing = 3,
     Done = 4,
+    /// Waiting for the examiner to sign in
+    SigningIn = 5,
+    /// Waiting for the remote side (a query that runs there)
+    Waiting = 6,
 }
 
 /// Counters a run updates as it goes, read by the TUI and the CLI's progress
@@ -88,7 +94,11 @@ pub struct Progress {
     pub errors: AtomicU64,
     /// Bytes read back while checking the container
     pub check_bytes: AtomicU64,
+    /// Items the run will handle, once known (0: not known)
+    pub items_total: AtomicU64,
     current: Mutex<String>,
+    /// What the run is doing, in words ("folder INBOX 3/12")
+    stage: Mutex<String>,
 }
 
 impl Progress {
@@ -98,6 +108,8 @@ impl Progress {
             1 => Phase::Copying,
             2 => Phase::CheckingContainer,
             3 => Phase::Finishing,
+            5 => Phase::SigningIn,
+            6 => Phase::Waiting,
             _ => Phase::Done,
         }
     }
@@ -108,6 +120,17 @@ impl Progress {
 
     pub fn current(&self) -> String {
         self.current.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    pub fn stage(&self) -> String {
+        self.stage.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    pub fn set_stage(&self, text: &str) {
+        if let Ok(mut c) = self.stage.lock() {
+            c.clear();
+            c.push_str(text);
+        }
     }
 
     pub fn set_current(&self, path: &str) {
@@ -124,8 +147,10 @@ impl Progress {
 
 /// How a run is started: by the CLI or by the TUI.
 pub struct RunCtx<'a> {
-    pub stop: &'a Stop,
+    pub stop: &'static Stop,
     pub progress: Option<&'a Progress>,
+    /// Secrets, sign-in and notices: the terminal (CLI) or the TUI
+    pub console: Arc<dyn Console>,
     /// The command line recorded as `method.argv`. None: this process's own
     /// arguments (the CLI).
     pub argv: Option<Vec<String>>,
@@ -139,10 +164,11 @@ pub struct RunCtx<'a> {
 }
 
 impl<'a> RunCtx<'a> {
-    pub fn cli(stop: &'a Stop, progress: Option<&'a Progress>) -> Self {
+    pub fn cli(stop: &'static Stop, progress: Option<&'a Progress>) -> Self {
         Self {
             stop,
             progress,
+            console: Arc::new(TermConsole::default()),
             argv: None,
             interactive: false,
             preview_at_ns: None,
@@ -178,6 +204,154 @@ impl<'a> RunCtx<'a> {
         }
         out
     }
+}
+
+impl RunCtx<'_> {
+    pub fn set_phase(&self, phase: Phase) {
+        if let Some(p) = self.progress {
+            p.set_phase(phase);
+        }
+    }
+
+    pub fn set_stage(&self, text: &str) {
+        if let Some(p) = self.progress {
+            p.set_stage(text);
+        }
+    }
+
+    pub fn set_current(&self, text: &str) {
+        if let Some(p) = self.progress {
+            p.set_current(text);
+        }
+    }
+
+    /// Add `n` to one of the progress counters
+    pub fn count(&self, counter: impl Fn(&Progress) -> &AtomicU64, n: u64) {
+        if let Some(p) = self.progress {
+            Progress::add(counter(p), n);
+        }
+    }
+
+    pub fn set_total(&self, n: u64) {
+        if let Some(p) = self.progress {
+            p.items_total.store(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `Err(Stopped)` once a stop was asked for
+pub fn check_stop(stop: &Stop) -> Result<()> {
+    if stop.is_set() {
+        Err(Stopped.into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Sleep for `d` unless a stop is asked for in the meantime (checked every
+/// 200 ms; then `Err(Stopped)`)
+pub fn sleep_unless_stopped(stop: &Stop, d: Duration) -> Result<()> {
+    let end = Instant::now() + d;
+    loop {
+        check_stop(stop)?;
+        let now = Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        std::thread::sleep((end - now).min(Duration::from_millis(200)));
+    }
+}
+
+/// How a run's acquisition part ended: `None` when it went through,
+/// `(reason, 8)` when it was stopped (a stop wins over the error it caused,
+/// such as a killed tool's broken pipe), else `(error, 6)`
+pub fn ended(result: Result<()>, stop: &Stop) -> Option<(String, u8)> {
+    match result {
+        Ok(()) => None,
+        Err(_) if stop.is_set() => Some(stop.reason().unwrap_or_else(|| ("stopped".into(), 8))),
+        Err(e) => Some((format!("{e:#}"), 6)),
+    }
+}
+
+/// [`std::process::Command::output`], but a stop asked for in the meantime
+/// kills the tool (checked every 100 ms; then `Err(Stopped)`)
+pub fn output_unless_stopped(
+    mut cmd: std::process::Command,
+    stop: &Stop,
+) -> Result<std::process::Output> {
+    use std::{io::Read, process::Stdio};
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let read = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = read(
+        child
+            .stdout
+            .take()
+            .map(|o| Box::new(o) as Box<dyn Read + Send>),
+    );
+    let err = read(
+        child
+            .stderr
+            .take()
+            .map(|e| Box::new(e) as Box<dyn Read + Send>),
+    );
+    let status = loop {
+        if stop.is_set() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Stopped.into());
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
+/// Why a run that could not get going (no connection, no sign-in) closes:
+/// the stop's reason and 8 when it was stopped (also during a sign-in), else
+/// the error and 4
+pub fn not_started(e: &anyhow::Error, stop: &Stop) -> (String, u8) {
+    if stop.is_set() {
+        stop.reason().unwrap_or_else(|| ("stopped".into(), 8))
+    } else {
+        (format!("{e:#}"), 4)
+    }
+}
+
+/// Record `item` and count it in the run's progress: acquired (and its
+/// bytes), error or out of scope
+pub fn record(
+    collection: &mut Collection,
+    item: dfcore::manifest::Item,
+    ctx: &RunCtx,
+) -> Result<u64> {
+    match item.status {
+        ItemStatus::Acquired => {
+            ctx.count(|p| &p.files, 1);
+            ctx.count(|p| &p.bytes, item.size.unwrap_or(0));
+        }
+        ItemStatus::Error => ctx.count(|p| &p.errors, 1),
+        ItemStatus::OutOfScope => ctx.count(|p| &p.out_of_scope, 1),
+        _ => {}
+    }
+    collection.add(item)
 }
 
 /// A read-back ended because [`Stop`] was set.
@@ -279,10 +453,6 @@ pub fn case(args: &CaseArgs) -> Case {
     }
 }
 
-pub fn reference(args: &ClockArgs) -> Result<Option<ReferenceTime>> {
-    reference_at(args, None)
-}
-
 /// The reference time, entered at `entered_ns` (None: now)
 pub fn reference_at(args: &ClockArgs, entered_ns: Option<i128>) -> Result<Option<ReferenceTime>> {
     match (&args.reference_time, &args.reference_how) {
@@ -348,24 +518,16 @@ pub fn container_mismatches(
 }
 
 /// Close a run: check the container unless the run stopped, finish the
-/// collection and pick the exit code (see README).
+/// collection and pick the exit code (see README). The check is counted in
+/// the run's progress; a stop ends it early and the collection is closed as
+/// aborted.
 pub fn conclude(
-    collection: Collection,
-    output: &Path,
-    stopped: Option<(String, u8)>,
-) -> Result<(u8, Finished, Vec<String>)> {
-    conclude_with(collection, output, stopped, None, None)
-}
-
-/// [`conclude`], with the container check counted in `progress`. A set
-/// `stop` ends the check early and the collection is closed as aborted.
-pub fn conclude_with(
     mut collection: Collection,
     output: &Path,
     mut stopped: Option<(String, u8)>,
-    progress: Option<&Progress>,
-    stop: Option<&Stop>,
+    ctx: &RunCtx,
 ) -> Result<(u8, Finished, Vec<String>)> {
+    let (progress, stop) = (ctx.progress, Some(ctx.stop));
     let mismatches = if stopped.is_none() {
         if let Some(p) = progress {
             p.set_phase(Phase::CheckingContainer);
@@ -401,7 +563,7 @@ pub fn conclude_with(
     };
     let finished = collection.finish(completion)?;
     for w in &finished.warnings {
-        eprintln!("[!] WARNING: {w}");
+        ctx.console.notice(Level::Warning, &format!("WARNING: {w}"));
     }
     let code = match (&stopped, finished.manifest.status) {
         (Some((_, code)), _) => *code,
@@ -435,6 +597,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_stop_kills_a_running_tool_and_ends_a_wait() {
+        static STOP: Stop = Stop::new();
+        STOP.clear_examiner();
+        let out = output_unless_stopped(
+            {
+                let mut c = std::process::Command::new("sh");
+                c.args(["-c", "printf ok"]);
+                c
+            },
+            &STOP,
+        )
+        .unwrap();
+        assert_eq!(out.stdout, b"ok");
+        assert!(out.status.success());
+
+        let t = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            STOP.examiner.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30");
+        let e = output_unless_stopped(c, &STOP).unwrap_err();
+        assert!(e.downcast_ref::<Stopped>().is_some(), "{e:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        t.join().unwrap();
+
+        let started = Instant::now();
+        let e = sleep_unless_stopped(&STOP, Duration::from_secs(30)).unwrap_err();
+        assert!(e.downcast_ref::<Stopped>().is_some());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        STOP.clear_examiner();
+        sleep_unless_stopped(&STOP, Duration::from_millis(10)).unwrap();
+    }
+
+    #[test]
+    fn how_a_run_ended() {
+        static STOP: Stop = Stop::new();
+        assert_eq!(ended(Ok(()), &STOP), None);
+        let e = || anyhow::anyhow!("broken pipe");
+        assert_eq!(ended(Err(e()), &STOP), Some(("broken pipe".into(), 6)));
+        assert_eq!(not_started(&e(), &STOP), ("broken pipe".into(), 4));
+        STOP.examiner.store(true, Ordering::Relaxed);
+        // A stop wins over the error it caused
+        assert_eq!(
+            ended(Err(e()), &STOP),
+            Some(("stopped by the examiner".into(), 8))
+        );
+        assert_eq!(
+            not_started(&e(), &STOP),
+            ("stopped by the examiner".into(), 8)
+        );
+    }
+
+    #[test]
     fn human_bytes_units() {
         assert_eq!(human_bytes(0), "0 B");
         assert_eq!(human_bytes(1023), "1023 B");
@@ -445,7 +662,7 @@ mod tests {
 
     #[test]
     fn a_signal_wins_over_the_examiner() {
-        let stop = Stop::new();
+        let stop: &'static Stop = Box::leak(Box::new(Stop::new()));
         assert!(!stop.is_set() && stop.reason().is_none());
         stop.examiner.store(true, Ordering::Relaxed);
         assert_eq!(stop.reason().unwrap().0, "stopped by the examiner");

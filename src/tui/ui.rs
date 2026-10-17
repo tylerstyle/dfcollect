@@ -922,7 +922,9 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
     let style_pending = Style::default().fg(Color::DarkGray);
 
     let (s_copy, s_check, s_fin) = match phase {
-        Phase::Listing | Phase::Copying => (style_active, style_pending, style_pending),
+        Phase::Listing | Phase::Copying | Phase::SigningIn | Phase::Waiting => {
+            (style_active, style_pending, style_pending)
+        }
         Phase::CheckingContainer => (style_done, style_active, style_pending),
         Phase::Finishing | Phase::Done => (style_done, style_done, style_active),
     };
@@ -952,7 +954,7 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
 
     // 2. Progress gauge
     let (ratio, label) = match phase {
-        Phase::Listing | Phase::Copying => {
+        Phase::Listing | Phase::Copying | Phase::SigningIn | Phase::Waiting => {
             let r = if run.expected_bytes == 0 {
                 0.0
             } else {

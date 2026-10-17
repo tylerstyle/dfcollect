@@ -4,6 +4,7 @@
 use crate::{
     args::FilesArgs,
     common::{human_bytes, Progress, RunCtx, Stop},
+    console::QuietConsole,
     files::{self, Preview},
     mail::client::base64,
     scope,
@@ -1470,6 +1471,7 @@ impl App {
                 interactive: true,
                 preview_at_ns: None,
                 reference_entered_ns: None,
+                console: Arc::new(QuietConsole::default()),
             };
             files::preview(&args_worker, &ctx)
         });
@@ -1595,6 +1597,7 @@ impl App {
                 interactive: true,
                 preview_at_ns,
                 reference_entered_ns,
+                console: Arc::new(QuietConsole::default()),
             };
             files::run_with(&args_worker, &ctx)
         });
@@ -1858,6 +1861,7 @@ impl App {
                 interactive: true,
                 preview_at_ns: None,
                 reference_entered_ns: None,
+                console: Arc::new(QuietConsole::default()),
             };
             verify::run_with(&dir_worker, &ctx)
         });

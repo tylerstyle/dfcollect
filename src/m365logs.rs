@@ -15,7 +15,8 @@
 
 use crate::{
     args::M365LogsArgs,
-    common,
+    common::{self, Phase, RunCtx},
+    console::Level,
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     graph::{check_endpoints, flow, Api},
@@ -32,7 +33,6 @@ use serde_json::{json, Value};
 use std::{
     io::{BufWriter, Write},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -121,7 +121,7 @@ struct Session<'a> {
     collection: Collection,
     container: Container,
     output: &'a Path,
-    stop: &'a AtomicBool,
+    ctx: &'a RunCtx<'a>,
     from: String,
     to: String,
     records: u64,
@@ -139,6 +139,9 @@ impl Session<'_> {
         let name = kind.name();
         let tmp = self.output.join(format!(".{name}.jsonl.part"));
         let mut count = 0u64;
+        let ctx = self.ctx;
+        ctx.set_stage(&format!("reading {name}"));
+        ctx.set_current(name);
         let written = (|| -> Result<()> {
             let mut w = BufWriter::new(
                 std::fs::OpenOptions::new()
@@ -152,6 +155,7 @@ impl Session<'_> {
                     serde_json::to_writer(&mut w, r)?;
                     w.write_all(b"\n")?;
                     count += 1;
+                    ctx.count(|p| &p.entries, 1);
                 }
                 Ok(())
             })?;
@@ -165,15 +169,17 @@ impl Session<'_> {
         md["users"] = json!(self.args.users);
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
-            if self.stop.load(Ordering::Relaxed) {
+            if self.ctx.stop.is_set() {
                 return Err(e);
             }
             let mut item = Item::new(ItemStatus::Error, path);
             item.kind = Some("log".into());
             item.reason = Some(format!("{e:#}"));
             item.metadata = md;
-            self.collection.add(item)?;
-            eprintln!("[!] {name}: {e:#}");
+            common::record(&mut self.collection, item, self.ctx)?;
+            self.ctx
+                .console
+                .notice(Level::Warning, &format!("{name}: {e:#}"));
             return Ok(());
         }
         let member = format!("{path}.jsonl");
@@ -209,8 +215,10 @@ impl Session<'_> {
         item.size = Some(size);
         item.hashes = hasher.finish();
         item.metadata = md;
-        self.collection.add(item)?;
-        println!("[✓] {name}: {count} records");
+        common::record(&mut self.collection, item, self.ctx)?;
+        self.ctx
+            .console
+            .notice(Level::Done, &format!("{name}: {count} records"));
         Ok(())
     }
 
@@ -225,7 +233,7 @@ impl Session<'_> {
         };
         let filter = time_filter(field, &self.from, &self.to, user_field, &self.args.users);
         let url = format!("{}/{path}?$filter={}&$top={PAGE}", self.v1, encode(&filter));
-        let stop = self.stop;
+        let stop = self.ctx.stop;
         let mut pages = 0;
         let md = json!({ "endpoint": format!("/v1.0/{path}"), "filter": filter });
         self.store(
@@ -263,7 +271,7 @@ impl Session<'_> {
         }
         let poll = Duration::from_secs(self.args.ual_poll.max(1));
         let deadline = Instant::now() + Duration::from_secs(self.args.ual_wait * 60);
-        let stop = self.stop;
+        let stop = self.ctx.stop;
         let base = self.v1.clone();
         let mut record = json!({ "query": body });
         let created = (|| -> Result<(String, String)> {
@@ -285,8 +293,10 @@ impl Session<'_> {
                 item.kind = Some("log".into());
                 item.reason = Some(format!("creating the audit log query: {e:#}"));
                 item.metadata = record;
-                self.collection.add(item)?;
-                eprintln!("[!] unified-audit-log: {e:#}");
+                common::record(&mut self.collection, item, self.ctx)?;
+                self.ctx
+                    .console
+                    .notice(Level::Warning, &format!("unified-audit-log: {e:#}"));
                 return Ok(());
             }
         };
@@ -296,13 +306,16 @@ impl Session<'_> {
             "audit_log_query",
             json!({ "created": record, "note": "an audit log search now exists in the tenant (Purview Audit)" }),
         ))?;
-        println!("[*] Audit log query {id} created; waiting for it to run");
+        self.ctx.console.notice(
+            Level::Info,
+            &format!("Audit log query {id} created; waiting for it to run"),
+        );
+        self.ctx.set_phase(Phase::Waiting);
+        let started = Instant::now();
         let status_url = format!("{queries}/{}", encode(&id));
         let mut polls = 0u32;
         let status = loop {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(stop)?;
             let q = self.api.get_json(&status_url)?;
             polls += 1;
             let s = q["status"].as_str().unwrap_or("").to_string();
@@ -312,12 +325,15 @@ impl Session<'_> {
             if Instant::now() > deadline {
                 break format!("still {s} after {} min", self.args.ual_wait);
             }
-            // In short steps, so Ctrl-C is noticed at once
-            let until = Instant::now() + poll;
-            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(250).min(poll));
-            }
+            self.ctx.set_stage(&format!(
+                "Unified Audit Log query {s}: {} of at most {} min",
+                started.elapsed().as_secs() / 60,
+                self.args.ual_wait
+            ));
+            // In short steps, so a stop is noticed at once
+            common::sleep_unless_stopped(stop, poll)?;
         };
+        self.ctx.set_phase(Phase::Copying);
         self.collection.footprint(FootprintEntry::new(
             "audit_log_query",
             json!({ "id": id, "status": status, "polls": polls }),
@@ -334,8 +350,11 @@ impl Session<'_> {
             item.reason = Some(format!("the audit log query {id} ended {status}"));
             md["window"] = json!({ "from": self.from, "to": self.to });
             item.metadata = md;
-            self.collection.add(item)?;
-            eprintln!("[!] unified-audit-log: query {status}");
+            common::record(&mut self.collection, item, self.ctx)?;
+            self.ctx.console.notice(
+                Level::Warning,
+                &format!("unified-audit-log: query {status}"),
+            );
             return Ok(());
         }
         let url = format!("{status_url}/records?$top=1000");
@@ -351,7 +370,7 @@ impl Session<'_> {
     }
 }
 
-fn header(args: &M365LogsArgs, from: &str, to: &str) -> Result<Header> {
+fn header(args: &M365LogsArgs, from: &str, to: &str, ctx: &RunCtx) -> Result<Header> {
     let graph = args.conn.graph_endpoint.trim_end_matches('/');
     let logs: Vec<&str> = args.logs.iter().map(|l| l.name()).collect();
     Ok(Header {
@@ -367,7 +386,7 @@ fn header(args: &M365LogsArgs, from: &str, to: &str) -> Result<Header> {
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: vec![
                 "sign-in and directory logs: GET only".into(),
                 "Unified Audit Log: one audit log query created in the tenant (POST /security/auditLog/queries), then GET".into(),
@@ -387,20 +406,20 @@ fn header(args: &M365LogsArgs, from: &str, to: &str) -> Result<Header> {
             ..Scope::default()
         },
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
 }
 
-pub fn run(args: &M365LogsArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &M365LogsArgs, ctx: &RunCtx) -> Result<Outcome> {
     if args.logs.is_empty() {
         return Err(Usage("--logs names no log".into()).into());
     }
     check_endpoints(&args.conn)?;
     let (from, to) = window(&args.not_before, &args.not_after)?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let flow = flow(&args.conn)?;
+    let flow = flow(&args.conn, ctx)?;
     let graph = args.conn.graph_endpoint.trim_end_matches('/').to_string();
     let mut scopes: Vec<&str> = args
         .logs
@@ -410,7 +429,10 @@ pub fn run(args: &M365LogsArgs, stop: &AtomicBool) -> Result<Outcome> {
     scopes.sort_unstable();
     scopes.dedup();
 
-    let mut collection = Collection::create(&output, header(args, &from, &to)?)?;
+    let mut collection = Collection::create(&output, header(args, &from, &to, ctx)?)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -420,21 +442,29 @@ pub fn run(args: &M365LogsArgs, stop: &AtomicBool) -> Result<Outcome> {
             return Err(e);
         }
     };
-    let mut http = Client::new(Duration::from_secs(args.conn.timeout));
-    let (auth, record) =
-        match Auth::sign_in(&mut http, flow, &args.conn.login_endpoint, &graph, &scopes) {
-            Ok(a) => a,
-            Err(e) => {
-                let reason = format!("{e:#}");
-                collection.footprint(FootprintEntry::new("auth", json!({ "error": reason })))?;
-                container.finish()?;
-                let (code, finished, _) = common::conclude(collection, &output, Some((reason, 4)))?;
-                return Ok(Outcome {
-                    code,
-                    summary: summary(&output, &finished, 0),
-                });
-            }
-        };
+    let mut http = Client::new(Duration::from_secs(args.conn.timeout)).for_run(ctx);
+    ctx.set_stage("signing in");
+    let (auth, record) = match Auth::sign_in(
+        &mut http,
+        flow,
+        &args.conn.login_endpoint,
+        &graph,
+        &scopes,
+        ctx,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            let (reason, code) = common::not_started(&e, ctx.stop);
+            collection.footprint(FootprintEntry::new("auth", json!({ "error": reason })))?;
+            container.finish()?;
+            let (code, finished, _) =
+                common::conclude(collection, &output, Some((reason, code)), ctx)?;
+            return Ok(Outcome {
+                code,
+                summary: summary(&output, &finished, 0),
+            });
+        }
+    };
     collection.footprint(FootprintEntry::new("auth", record.clone()))?;
     collection.set_source_identity(json!({ "auth": record, "tenant": args.conn.tenant }))?;
 
@@ -449,16 +479,16 @@ pub fn run(args: &M365LogsArgs, stop: &AtomicBool) -> Result<Outcome> {
         collection,
         container,
         output: &output,
-        stop,
+        ctx,
         from,
         to,
         records: 0,
     };
     let result = (|| -> Result<()> {
+        ctx.set_phase(Phase::Copying);
+        ctx.set_total(args.logs.len() as u64);
         for kind in &args.logs {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(ctx.stop)?;
             match kind {
                 LogKind::Ual => session.ual()?,
                 k => session.entra(*k)?,
@@ -487,15 +517,12 @@ pub fn run(args: &M365LogsArgs, stop: &AtomicBool) -> Result<Outcome> {
             }),
         )
     })?;
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     Ok(Outcome {
         code,
         summary: summary(&output, &finished, records),

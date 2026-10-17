@@ -15,7 +15,8 @@ mod utf7;
 
 use crate::{
     args::ImapArgs,
-    common,
+    common::{self, Phase, RunCtx},
+    console::{need_secret, SecretAsk},
     container::{Container, CopyError, Hasher},
     files::CONTAINER,
     meta::Stamps,
@@ -33,9 +34,9 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use zeroize::Zeroizing;
 
 const AUDIT_ACTION: &str = "mail_acquisition";
 /// Messages per body fetch, and the bytes one fetch may announce
@@ -57,8 +58,8 @@ pub struct Outcome {
 }
 
 enum Secret {
-    Password(String),
-    Token(String),
+    Password(Zeroizing<String>),
+    Token(Zeroizing<String>),
 }
 
 pub(crate) fn first_line(path: &Path) -> Result<String> {
@@ -71,53 +72,22 @@ pub(crate) fn first_line(path: &Path) -> Result<String> {
     Ok(line)
 }
 
-/// Ask on the terminal without echo.
-pub(crate) fn prompt_secret(prompt: &str) -> Result<String> {
-    use std::io::{BufRead, Write};
-    use std::os::fd::AsRawFd;
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| Usage("no terminal to ask for the password; use --password-file".into()))?;
-    let fd = tty.as_raw_fd();
-    // SAFETY: termios is a plain C struct, filled by tcgetattr
-    let mut term: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: valid fd and out-pointer
-    let have_term = unsafe { libc::tcgetattr(fd, &mut term) } == 0;
-    let saved = term;
-    if have_term {
-        term.c_lflag &= !libc::ECHO;
-        // SAFETY: valid fd and termios
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
-    }
-    let mut out = &tty;
-    write!(out, "{prompt}")?;
-    out.flush()?;
-    let mut line = String::new();
-    let read = std::io::BufReader::new(&tty).read_line(&mut line);
-    if have_term {
-        // SAFETY: restores the settings read above
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
-    }
-    writeln!(out)?;
-    read?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
-}
-
-fn secret(args: &ImapArgs) -> Result<Secret> {
+fn secret(args: &ImapArgs, ctx: &RunCtx) -> Result<Secret> {
     if let Some(path) = &args.token_file {
-        return Ok(Secret::Token(first_line(path)?));
+        return Ok(Secret::Token(Zeroizing::new(first_line(path)?)));
     }
     if args.auth == Auth::Xoauth2 {
         return Err(Usage("--auth xoauth2 needs --token-file".into()).into());
     }
     match &args.password_file {
-        Some(path) => Ok(Secret::Password(first_line(path)?)),
-        None => Ok(Secret::Password(prompt_secret(&format!(
-            "IMAP password for {}: ",
-            args.user
-        ))?)),
+        Some(path) => Ok(Secret::Password(Zeroizing::new(first_line(path)?))),
+        None => Ok(Secret::Password(need_secret(
+            ctx.console.as_ref(),
+            SecretAsk {
+                prompt: format!("IMAP password for {}: ", args.user),
+                file_flag: "--password-file",
+            },
+        )?)),
     }
 }
 
@@ -211,7 +181,7 @@ struct Session<'a> {
     conn: Connection,
     collection: Collection,
     container: Container,
-    stop: &'a AtomicBool,
+    ctx: &'a RunCtx<'a>,
     folders_examined: u64,
 }
 
@@ -418,7 +388,12 @@ impl Session<'_> {
         let by_uid: HashMap<u64, &&MessageMeta> = batch.iter().map(|m| (m.uid, m)).collect();
         let mut stored = BTreeSet::new();
         let mut bytes = 0u64;
-        let (args, container, collection) = (&self.args, &mut self.container, &mut self.collection);
+        let (args, container, collection, ctx) = (
+            &self.args,
+            &mut self.container,
+            &mut self.collection,
+            self.ctx,
+        );
         self.conn.command(
             &command,
             &format!("UID FETCH <{} UIDs> (UID BODY.PEEK[])", set.len()),
@@ -468,10 +443,13 @@ impl Session<'_> {
                         item.metadata =
                             json!({ "folder": folder.name, "uidvalidity": uidvalidity, "uid": uid });
                         collection.add(item)?;
+                        ctx.count(|p| &p.errors, 1);
                         return Ok(());
                     }
                 }
                 bytes += body.len() as u64;
+                ctx.count(|p| &p.files, 1);
+                ctx.count(|p| &p.bytes, body.len() as u64);
                 let mut item = Item::new(ItemStatus::Acquired, format!("{}/{uid}", folder.name));
                 item.kind = Some("message".into());
                 item.account = Some(args.user.clone());
@@ -523,8 +501,10 @@ impl Session<'_> {
     fn folder(&mut self, folder: &Folder) -> Result<()> {
         if let Some(reason) = self.folder_scope(&folder.name) {
             self.collection.count_out_of_scope(&reason);
+            self.ctx.count(|p| &p.out_of_scope, 1);
             return Ok(());
         }
+        self.ctx.set_current(&folder.name);
         if std::str::from_utf8(&folder.raw)
             .ok()
             .and_then(client::quote)
@@ -566,15 +546,15 @@ impl Session<'_> {
                     } else {
                         self.collection.count_out_of_scope(&reason);
                     }
+                    self.ctx.count(|p| &p.out_of_scope, 1);
                 }
             }
         }
         let mut batch = Vec::new();
         let mut batch_bytes = 0u64;
+        self.ctx.count(|p| &p.entries, wanted.len() as u64);
         for m in wanted {
-            if self.stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+            common::check_stop(self.ctx.stop)?;
             if !batch.is_empty()
                 && (batch.len() >= BATCH_MESSAGES || batch_bytes + m.size > BATCH_BYTES)
             {
@@ -597,6 +577,7 @@ fn header(
     host: &str,
     port: u16,
     scope: dfcore::manifest::Scope,
+    ctx: &RunCtx,
 ) -> Result<Header> {
     let scheme = match args.security {
         Security::Tls => "imaps",
@@ -616,7 +597,7 @@ fn header(
             tool: TOOL.into(),
             tool_version: VERSION.into(),
             system_revision: dfcore::release::system_revision(),
-            argv: std::env::args().collect(),
+            argv: ctx.argv(),
             read_only_primitives: vec![
                 "IMAP EXAMINE (read-only), [READ-ONLY] required".into(),
                 "UID FETCH BODY.PEEK[] (does not set \\Seen)".into(),
@@ -629,13 +610,13 @@ fn header(
         },
         scope,
         clocks: dfcore::manifest::Clocks {
-            reference: common::reference(&args.clock)?,
+            reference: common::reference_at(&args.clock, ctx.reference_entered_ns)?,
             ..Default::default()
         },
     })
 }
 
-pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
+pub fn run_with(args: &ImapArgs, ctx: &RunCtx) -> Result<Outcome> {
     let mut scope = scope::build(&args.scope)?;
     if scope.not_before.is_some() || scope.not_after.is_some() {
         if args.scope.scope.is_none() {
@@ -658,9 +639,14 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
     let rules = scope.rules().map_err(|e| Usage(format!("{e:#}")))?;
     let (host, port) = host_port(&args.server, args.security)?;
     let (output, _) = common::check_output(&args.output, args.allow_tmpfs)?;
-    let secret = secret(args)?;
+    let secret = secret(args, ctx)?;
 
-    let mut collection = Collection::create(&output, header(args, &host, port, scope)?)?;
+    let mut collection = Collection::create(&output, header(args, &host, port, scope, ctx)?)?;
+    for entry in ctx.footprint() {
+        collection.footprint(entry)?;
+    }
+    ctx.set_phase(Phase::Listing);
+    ctx.set_stage(&format!("connecting to {host}:{port}"));
     let container = match Container::create(&output.join(CONTAINER), args.compress) {
         Ok(c) => c,
         Err(e) => {
@@ -684,13 +670,14 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
     let (conn, tls, greeting) = match connected {
         Ok(c) => c,
         Err(e) => {
-            let reason = format!("{e:#}");
+            let (reason, code) = common::not_started(&e, ctx.stop);
             collection.footprint(FootprintEntry::new(
                 "connect",
                 json!({ "server": format!("{host}:{port}"), "error": reason }),
             ))?;
             container.finish()?;
-            let (code, finished, _) = common::conclude(collection, &output, Some((reason, 4)))?;
+            let (code, finished, _) =
+                common::conclude(collection, &output, Some((reason, code)), ctx)?;
             return Ok(Outcome {
                 code,
                 summary: summary(&output, &finished, 0),
@@ -717,7 +704,7 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
         conn,
         collection,
         container,
-        stop,
+        ctx,
         folders_examined: 0,
     };
     let result = (|| -> Result<()> {
@@ -744,11 +731,15 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
         }
         match (method, &secret) {
             ("XOAUTH2", Secret::Token(token)) => {
-                let resp = format!("user={}\x01auth=Bearer {token}\x01\x01", args.user);
+                let resp = Zeroizing::new(format!(
+                    "user={}\x01auth=Bearer {}\x01\x01",
+                    args.user,
+                    token.as_str()
+                ));
                 session.conn.authenticate("XOAUTH2", resp.as_bytes())?;
             }
             ("PLAIN", Secret::Password(pw)) => {
-                let resp = format!("\0{}\0{pw}", args.user);
+                let resp = Zeroizing::new(format!("\0{}\0{}", args.user, pw.as_str()));
                 session.conn.authenticate("PLAIN", resp.as_bytes())?;
             }
             ("LOGIN", Secret::Password(pw)) => {
@@ -771,16 +762,18 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
             "capabilities": caps_after,
             "tls": tls_json,
         }))?;
-        for folder in session.list()? {
-            if stop.load(Ordering::Relaxed) {
-                bail!("stopped by a signal");
-            }
+        let folders = session.list()?;
+        ctx.set_phase(Phase::Copying);
+        let n = folders.len();
+        for (i, folder) in folders.iter().enumerate() {
+            common::check_stop(ctx.stop)?;
+            ctx.set_stage(&format!("folder {} ({}/{n})", folder.name, i + 1));
             if folder.attributes.iter().any(|a| {
                 a.eq_ignore_ascii_case("\\Noselect") || a.eq_ignore_ascii_case("\\NonExistent")
             }) {
                 continue;
             }
-            session.folder(&folder)?;
+            session.folder(folder)?;
         }
         Ok(())
     })();
@@ -800,15 +793,12 @@ pub fn run(args: &ImapArgs, stop: &AtomicBool) -> Result<Outcome> {
             json!({ "folders_examined": folders_examined }),
         )
     })?;
-    let mut stopped = match result {
-        Ok(()) => None,
-        Err(e) if stop.load(Ordering::Relaxed) => Some((format!("{e:#}"), 8)),
-        Err(e) => Some((format!("{e:#}"), 6)),
-    };
+    let mut stopped = common::ended(result, ctx.stop);
     if let Err(e) = container.finish() {
         stopped.get_or_insert((format!("{e:#}"), 6));
     }
-    let (code, finished, _) = common::conclude(collection, &output, stopped)?;
+    let (code, finished, _) = common::conclude(collection, &output, stopped, ctx)?;
+    ctx.set_phase(Phase::Done);
     Ok(Outcome {
         code,
         summary: summary(&output, &finished, folders_examined),
