@@ -823,7 +823,7 @@ fn collect_failed_items(collection: &Path, problems: &mut Vec<String>) {
 fn finish_run_outcome(code: u8, mut summary: serde_json::Value, output: &Path) -> verify::Outcome {
     let errors = summary.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
     let status = summary.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    if errors > 0 || status == "completed_with_errors" {
+    if errors > 0 || status == "complete_with_errors" {
         let mut probs: Vec<String> = summary
             .get("problems")
             .and_then(|v| v.as_array())
@@ -938,7 +938,7 @@ impl ResultData {
             .get("items_errors_scanned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        if !already_scanned && (errors > 0 || status == "completed_with_errors") {
+        if !already_scanned && (errors > 0 || status == "complete_with_errors") {
             collect_failed_items(&collection, &mut problems);
         }
         Self {
@@ -7048,12 +7048,12 @@ mod tests {
             rd_clean.problems
         );
 
-        // Error outcome (errors: 1, status: "completed_with_errors"): worker scans items.jsonl via finish_run_outcome
+        // Error outcome (errors: 1, status: "complete_with_errors"): worker scans items.jsonl via finish_run_outcome
         let outcome = finish_run_outcome(
             7,
             serde_json::json!({
                 "collection": dir,
-                "status": "completed_with_errors",
+                "status": "complete_with_errors",
                 "messages": 3,
                 "bytes": 1024,
                 "errors": 1,
