@@ -194,7 +194,8 @@ without mouse capture, so paths and hashes stay selectable.
    - `gmail`: mailbox account, authentication method, in-scope vs listed message
      counts and bytes, target free space, per-label breakdown with message counts
      and bytes, time basis (`Gmail internalDate`), and out-of-scope counts
-     (account `historyId` is recorded in the run's footprint).
+     (the account profile with its `historyId` is recorded in `manifest.json`
+     as the source identity).
 
    Press `c` to copy the equivalent CLI command via OSC 52. Starting an
    acquisition (`Enter` or `F2`/`p` on m365-logs → `y`) is only possible when
