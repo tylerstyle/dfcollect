@@ -23,7 +23,7 @@ pkgs.testers.runNixOSTest {
   };
 
   nodes.client = {
-    environment.systemPackages = [ dfcollect pkgs.rclone pkgs.python3 ];
+    environment.systemPackages = [ dfcollect pkgs.rclone pkgs.python3 pkgs.tmux ];
     environment.etc."rclone.conf".text = ''
       [evidence]
       type = s3
@@ -36,6 +36,7 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    ${builtins.readFile ./tui.py}
     import json
 
     rc = "rclone --config /etc/rclone.conf"
@@ -92,6 +93,44 @@ pkgs.testers.runNixOSTest {
         assert "minio-secret-key" not in client.succeed("cat /target/c1/*.jsonl /target/c1/manifest.json")
         assert summary["remote_changes"]["added"] == [], summary
         client.succeed("dfcollect verify /target/c1")
+
+    with subtest("TUI interactive run: cloud preview and run against S3 via rclone"):
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("c")
+        tui.wait_for_text("Cloud / remote storage via rclone")
+
+        tui.fill_field("Case number", "CASE-CLOUD")
+        tui.fill_field("Evidence number", "tui-cloud01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("rclone config", "/etc/rclone.conf")
+        tui.fill_field("Remote source", "evidence:case")
+        tui.fill_field("Output dir", "/target/tui-cloud")
+
+        # Start preview
+        tui.send_keys("F2")
+        tui.wait_for_text("Enter start", timeout=45)
+
+        # Confirm start
+        tui.send_keys("Enter")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Result
+        tui.wait_for_text("Acquisition Result", timeout=45)
+        tui.wait_for_text("Status      : COMPLETE")
+        tui.wait_for_text("q quit")
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-cloud/manifest.json"))
+        assert manifest["status"] == "complete", manifest
+        client.succeed("dfcollect verify /target/tui-cloud")
+        items = {i["path"]: i for i in (json.loads(l) for l in client.succeed("cat /target/tui-cloud/items.jsonl").splitlines())}
+        assert "docs/a.txt" in items, items
+        assert manifest["source"]["kind"] == "rclone", manifest["source"]
+        assert "minio-secret-key" not in client.succeed("cat /target/tui-cloud/*.jsonl /target/tui-cloud/manifest.json")
 
     with subtest("a stop ends rclone inside a file; the collection closes as aborted"):
         client.succeed(

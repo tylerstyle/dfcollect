@@ -79,10 +79,11 @@ pkgs.testers.runNixOSTest {
   nodes.client = {
     networking.firewall.enable = false;
     security.pki.certificateFiles = [ "${certs}/ca.pem" ];
-    environment.systemPackages = [ dfcollect pkgs.python3 ];
+    environment.systemPackages = [ dfcollect pkgs.python3 pkgs.tmux ];
   };
 
   testScript = ''
+    ${builtins.readFile ./tui.py}
     import json
 
     def flags():
@@ -163,6 +164,56 @@ pkgs.testers.runNixOSTest {
         }, pv
         assert pv["auth_method"] in ("PLAIN", "LOGIN"), pv
         client.fail("test -e /target/dry")
+
+    with subtest("TUI interactive run: secret modal masks password and preview + run acquire cleanly"):
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("m")
+        tui.wait_for_text("Mailboxes over IMAP")
+
+        tui.fill_field("Case number", "CASE-IMAP")
+        tui.fill_field("Evidence number", "tui-imap01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("IMAP server", "server:993")
+        tui.fill_field("Account (user)", "alice")
+        tui.fill_field("Output dir", "/target/tui-imap")
+
+        # Start preview with F2
+        tui.send_keys("F2")
+        tui.wait_for_text("Credential Required")
+
+        # Type password while modal is displayed
+        tui.type_string("foobar")
+        scr = tui.capture()
+        assert "foobar" not in scr, "password leaked to screen"
+        assert "••••••" in scr, "password bullets missing"
+        hist = tui.capture(full_history=True)
+        assert "foobar" not in hist, "password leaked to tmux history"
+
+        # Submit password and wait for preview to finish and be ready
+        tui.send_keys("Enter")
+        tui.wait_for_text("Enter start")
+
+        # Request acquisition start
+        tui.send_keys("Enter")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Wait for acquisition result
+        tui.wait_for_text("Acquisition Result")
+        tui.wait_for_text("Status      : COMPLETE")
+        tui.wait_for_text("q quit")
+        assert "foobar" not in tui.capture(full_history=True), "password leaked during run"
+
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-imap/manifest.json"))
+        assert manifest["status"] == "complete", manifest
+        client.succeed("dfcollect verify /target/tui-imap")
+        tui_items = [json.loads(l) for l in client.succeed("cat /target/tui-imap/items.jsonl").splitlines()]
+        assert len(tui_items) > 0, "No items acquired in TUI run"
 
     with subtest("no flag changed on the server"):
         assert flags() == before, (before, flags())

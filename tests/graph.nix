@@ -41,10 +41,11 @@ pkgs.testers.runNixOSTest {
   nodes.client = {
     networking.firewall.enable = false;
     security.pki.certificateFiles = [ "${certs}/ca.pem" ];
-    environment.systemPackages = [ dfcollect pkgs.python3 ];
+    environment.systemPackages = [ dfcollect pkgs.python3 pkgs.tmux ];
   };
 
   testScript = ''
+    ${builtins.readFile ./tui.py}
     import base64, hashlib, json
 
     def run(out, *extra):
@@ -130,6 +131,55 @@ pkgs.testers.runNixOSTest {
         assert {r["method"] for r in new if r["path"].startswith("/v1.0/")} == {"GET"}, new
         client.fail("test -e /target/dry")
 
+    with subtest("TUI interactive run: single device-code sign-in shared between preview and run"):
+        before = len(requests())
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("g")
+        tui.wait_for_text("Microsoft 365 / Exchange Online via Graph")
+
+        tui.fill_field("Case number", "CASE-GRAPH")
+        tui.fill_field("Evidence number", "tui-graph01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("Tenant", "tenant1")
+        tui.fill_field("App client ID", "test-client")
+        tui.cycle_field("Cloud preset", "custom")
+        tui.fill_field("Graph endpoint", "https://server:8443")
+        tui.fill_field("Login endpoint", "https://server:8443")
+        tui.fill_field("Output dir", "/target/tui-graph")
+
+        # Start preview
+        tui.send_keys("F2")
+        tui.wait_for_text("Sign-In Required")
+        # Polling against graph-mock auto-approves on 2nd poll
+        tui.wait_for_text("Enter start", timeout=45)
+
+        # Confirm acquisition start
+        tui.send_keys("Enter")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Wait for acquisition result
+        tui.wait_for_text("Acquisition Result", timeout=45)
+        tui.wait_for_text("Status      : COMPLETE")
+        tui.wait_for_text("q quit")
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-graph/manifest.json"))
+        assert manifest["status"] == "complete", manifest
+        client.succeed("dfcollect verify /target/tui-graph")
+
+        new_reqs = requests()[before:]
+        device_code_reqs = [r for r in new_reqs if r["path"] == "/tenant1/oauth2/v2.0/devicecode"]
+        assert len(device_code_reqs) == 1, f"Expected 1 device-code request, got {len(device_code_reqs)}: {device_code_reqs}"
+        graph_reqs = [r for r in new_reqs if r["path"].startswith("/v1.0/")]
+        assert len(graph_reqs) > 0, "No graph requests during TUI run"
+        tokens = {r["token"] for r in graph_reqs if "token" in r and r["token"]}
+        # at1 is used across preview and run until m6 triggers token renewal to at2
+        assert len(tokens) <= 2 and all(tokens), f"Unexpected auth tokens: {tokens}"
+
     with subtest("a nextLink to another host never gets the token"):
         before = len(requests())
         code, stdout = run("/target/evil", "--auth app --mailbox mallory@contoso.test",
@@ -193,5 +243,50 @@ pkgs.testers.runNixOSTest {
         assert items["logs/directory-audits"]["status"] == "acquired", items
         manifest = json.loads(client.succeed("cat /target/logs2/manifest.json"))
         assert manifest["status"] == "complete_with_errors", manifest
+
+    with subtest("TUI interactive run: m365-logs (direct run, single device-code sign-in, verify)"):
+        before = len(requests())
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("l")
+        tui.wait_for_text("[M365 Logs]")
+
+        tui.fill_field("Case number", "CASE-GRAPH")
+        tui.fill_field("Evidence number", "tui-logs01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("Tenant", "tenant1")
+        tui.fill_field("App client ID", "test-client")
+        tui.cycle_field("Cloud preset", "custom")
+        tui.fill_field("Graph endpoint", "https://server:8443")
+        tui.fill_field("Login endpoint", "https://server:8443")
+        tui.fill_field("Not before", "2026-03-01T00:00:00Z")
+        tui.fill_field("Not after", "2026-04-01T00:00:00Z")
+        tui.fill_field("Output dir", "/target/tui-logs")
+
+        # Start acquisition directly (m365-logs has no preview step)
+        tui.send_keys("F2")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Wait for acquisition result
+        tui.wait_for_text("Acquisition Result", timeout=45)
+        tui.wait_for_text("Status      : COMPLETE")
+        tui.wait_for_text("q quit")
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-logs/manifest.json"))
+        assert manifest["status"] == "complete", manifest
+        items = {i["path"]: i for i in (json.loads(l) for l in client.succeed("cat /target/tui-logs/items.jsonl").splitlines())}
+        assert sorted(items) == ["logs/directory-audits", "logs/signins", "logs/unified-audit-log"], items
+        assert all(i["status"] == "acquired" for i in items.values()), items
+        client.succeed("dfcollect verify /target/tui-logs")
+
+        new_reqs = requests()[before:]
+        device_code_reqs = [r for r in new_reqs if r["path"] == "/tenant1/oauth2/v2.0/devicecode"]
+        assert len(device_code_reqs) == 1, f"Expected 1 device-code request, got {len(device_code_reqs)}: {device_code_reqs}"
+        graph_reqs = [r for r in new_reqs if r["path"].startswith("/v1.0/")]
+        assert len(graph_reqs) > 0, "No graph requests during TUI m365-logs run"
   '';
 }

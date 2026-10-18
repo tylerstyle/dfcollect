@@ -15,13 +15,28 @@ and serves:
   nopremium@contoso.test), directory audits, and an audit log query that
   runs on the second status check and returns records over two pages.
 """
-import base64, json, ssl, sys, threading
+import argparse, base64, json, os, ssl, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
-PORT = int(sys.argv[1])
-CERT, KEY, REQUEST_LOG, BODIES = sys.argv[2:6]
-BASE = f"https://server:{PORT}"
+parser = argparse.ArgumentParser(description="Microsoft Graph & Identity mock")
+parser.add_argument("port", type=int, help="Port to listen on (0 for dynamic)")
+parser.add_argument("cert", help="Path to TLS certificate")
+parser.add_argument("key", help="Path to TLS private key")
+parser.add_argument("request_log", help="Path to request log")
+parser.add_argument("bodies", help="Path to bodies json file")
+parser.add_argument("--bind", default="0.0.0.0", help="Host/IP to bind to")
+parser.add_argument("--host", default="server", help="Host name used in URLs/BASE")
+parser.add_argument("--port-file", help="File to write bound port to")
+parser.add_argument("--approve", action="store_true", help="Gated device-code approval via <request-log>.approve")
+
+args = parser.parse_args()
+PORT = args.port
+CERT, KEY, REQUEST_LOG, BODIES = args.cert, args.key, args.request_log, args.bodies
+BIND_HOST = args.bind
+HOST = args.host
+APPROVE_GATE = args.approve
+BASE = f"https://{HOST}:{PORT}"
 
 def b64url(b):
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
@@ -146,7 +161,11 @@ class H(BaseHTTPRequestHandler):
             if g == "urn:ietf:params:oauth:grant-type:device_code":
                 with lock:
                     state["polls"] += 1
-                    if state["polls"] == 1:
+                    if APPROVE_GATE:
+                        pending = not os.path.exists(REQUEST_LOG + ".approve")
+                    else:
+                        pending = (state["polls"] == 1)
+                    if pending:
                         return self.send(400, {"error": "authorization_pending", "error_description": "AADSTS70016: pending"})
                 return self.send(200, {"access_token": TOKENS["at1"], "refresh_token": "rt1", "expires_in": 3600,
                                        "token_type": "Bearer", "scope": form.get("scope", f"{BASE}/Mail.Read")})
@@ -233,6 +252,11 @@ class H(BaseHTTPRequestHandler):
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(CERT, KEY)
-srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+srv = ThreadingHTTPServer((BIND_HOST, PORT), H)
+actual_port = srv.server_port
+BASE = f"https://{HOST}:{actual_port}"
+if args.port_file:
+    with open(args.port_file, "w") as pf:
+        pf.write(f"{actual_port}\n")
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()

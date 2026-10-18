@@ -29,10 +29,11 @@ pkgs.testers.runNixOSTest {
   };
 
   nodes.client = {
-    environment.systemPackages = [ dfcollect pkgs.postgresql pkgs.mariadb.client pkgs.python3 ];
+    environment.systemPackages = [ dfcollect pkgs.postgresql pkgs.mariadb.client pkgs.python3 pkgs.tmux ];
   };
 
   testScript = ''
+    ${builtins.readFile ./tui.py}
     import json
 
     start_all()
@@ -148,5 +149,59 @@ pkgs.testers.runNixOSTest {
         assert "MariaDB" in ident["version"], ident
         client.fail("grep -r my-pass-123 /target/my")
         client.succeed("dfcollect verify /target/my")
+
+    with subtest("TUI interactive run: password prompted once on preview, masked, and reused for run"):
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("d")
+        tui.wait_for_text("Database dump")
+
+        tui.fill_field("Case number", "CASE-DB")
+        tui.fill_field("Evidence number", "tui-db01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("Host", "server")
+        tui.fill_field("User", "examiner")
+        tui.cycle_field("TLS mode", "off")
+        tui.fill_field("Output dir", "/target/tui-pg")
+
+        # Start preview
+        tui.send_keys("F2")
+        tui.wait_for_text("Credential Required")
+
+        # Type password while modal is displayed
+        tui.type_string("pg-pass-123")
+        scr = tui.capture()
+        assert "pg-pass-123" not in scr, "password leaked to screen"
+        assert "•••••••••••" in scr, "password bullets missing"
+        hist = tui.capture(full_history=True)
+        assert "pg-pass-123" not in hist, "password leaked to tmux history"
+
+        # Submit password
+        tui.send_keys("Enter")
+        tui.wait_for_text("Enter start", timeout=45)
+
+        # Confirm start
+        tui.send_keys("Enter")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Result: verify password prompt is NOT displayed again and run completes
+        tui.wait_for_text("Acquisition Result", timeout=45)
+        tui.wait_for_text("Status      : COMPLETE")
+        tui.wait_for_text("q quit")
+        assert "pg-pass-123" not in tui.capture(full_history=True), "password leaked during run"
+
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-pg/manifest.json"))
+        assert manifest["status"] == "complete", manifest
+        client.succeed("dfcollect verify /target/tui-pg")
+        client.fail("grep -r pg-pass-123 /target/tui-pg")
+        items = {i["path"]: i for i in (json.loads(l) for l in client.succeed("cat /target/tui-pg/items.jsonl").splitlines())}
+        assert {"globals", "postgres", "shop"} <= set(items), items
+        dump = member("/target/tui-pg", "postgres/shop.dump")
+        assert "alpha" in client.succeed(f"pg_restore -f - {dump}")
   '';
 }

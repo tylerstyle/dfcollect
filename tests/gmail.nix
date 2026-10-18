@@ -70,10 +70,11 @@ pkgs.testers.runNixOSTest {
   nodes.client = {
     networking.firewall.enable = false;
     security.pki.certificateFiles = [ "${certs}/ca.pem" ];
-    environment.systemPackages = [ dfcollect pkgs.python3 pkgs.curl ];
+    environment.systemPackages = [ dfcollect pkgs.python3 pkgs.curl pkgs.tmux ];
   };
 
   testScript = ''
+    ${builtins.readFile ./tui.py}
     import base64, hashlib, json
 
     COMMON_ARGS = (
@@ -236,6 +237,69 @@ pkgs.testers.runNixOSTest {
             bodies,
             "installed application (OAuth 2.0 authorization code with PKCE)",
         )
+
+    with subtest("TUI interactive run: installed app loopback sign-in and acquisition"):
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("w")
+        tui.wait_for_text("Google Workspace / Gmail via REST API")
+
+        tui.fill_field("Case number", "CASE-GMAIL")
+        tui.fill_field("Evidence number", "tui-gmail01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("Mailbox", "alice@workspace.test")
+        tui.fill_field("OAuth client ID", "desktop-client")
+        tui.fill_field("Secret file", "/target/client-secret")
+        tui.fill_field("Gmail endpoint", "https://server:8443")
+        tui.fill_field("Token endpoint", "https://server:8443/token")
+        tui.fill_field("Auth endpoint", "https://server:8443/o/oauth2/v2/auth")
+        tui.fill_field("Not before", "2026-02-01T00:00:00Z")
+        tui.fill_field("Not after", "2026-06-01T00:00:00Z")
+        tui.fill_field("Output dir", "/target/tui-gmail")
+
+        # Start preview
+        tui.send_keys("F2")
+        tui.wait_for_text("Sign-In Required — Browser OAuth + PKCE")
+
+        # Extract auth URL from screen and complete loopback auth via curl
+        lines = tui.capture().splitlines()
+        url_lines = []
+        capturing = False
+        for l in lines:
+            if "Open this URL in a browser" in l:
+                capturing = True
+                continue
+            if capturing:
+                if "Time remaining:" in l or "Or paste the redirect" in l:
+                    break
+                url_lines.append(l.strip())
+        auth_url = "".join(url_lines)
+        assert auth_url.startswith("https://server:8443/o/oauth2/v2/auth?"), f"Unexpected auth URL: {auth_url}"
+        client.succeed(f"curl -sS -L '{auth_url}'")
+
+        # Sign-in completes, preview finishes and becomes ready
+        tui.wait_for_text("Enter start", timeout=45)
+
+        # Confirm start
+        tui.send_keys("Enter")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Acquisition result
+        tui.wait_for_text("Acquisition Result", timeout=45)
+        tui.wait_for_text("Status      : COMPLETE_WITH_ERRORS")
+        tui.wait_for_text("q quit")
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-gmail/manifest.json"))
+        assert manifest["status"] == "complete_with_errors", manifest
+        client.succeed("dfcollect verify /target/tui-gmail")
+        items = [json.loads(l) for l in client.succeed("cat /target/tui-gmail/items.jsonl").splitlines()]
+        assert len(items) >= 5, f"Unexpected items count: {len(items)}"
+        assert manifest["source"]["identity"]["auth"]["method"].startswith("installed application")
+        assert manifest["source"]["identity"]["profile"]["emailAddress"] == "alice@workspace.test"
 
     with subtest("token endpoint error aborts cleanly with exit code 4"):
         code, stdout = client.execute(

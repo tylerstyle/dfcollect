@@ -35,10 +35,11 @@ pkgs.testers.runNixOSTest {
     networking.firewall.enable = false;
     virtualisation.emptyDiskImages = [ 64 256 ];
     boot.supportedFilesystems = [ "cifs" "nfs" ];
-    environment.systemPackages = [ dfcollect pkgs.cifs-utils pkgs.nfs-utils pkgs.e2fsprogs ];
+    environment.systemPackages = [ dfcollect pkgs.cifs-utils pkgs.nfs-utils pkgs.e2fsprogs pkgs.python3 pkgs.tmux ];
   };
 
   testScript = ''
+    ${builtins.readFile ./tui.py}
     import json
 
     def tree(machine, root):
@@ -82,6 +83,7 @@ pkgs.testers.runNixOSTest {
     # vdb: evidence disk, vdc: target disk
     client.succeed("mkfs.ext4 -q /dev/vdb && mkdir -p /mnt/ev && mount /dev/vdb /mnt/ev")
     fill(client, "/mnt/ev")
+    client.succeed("mkdir -p /mnt/ev/delivery && printf 'payload\n' > /mnt/ev/delivery/data.txt")
     client.succeed("umount /mnt/ev && mount -o ro,noload /dev/vdb /mnt/ev")
     local_before = tree(client, "/mnt/ev")
     client.succeed("mkfs.ext4 -q /dev/vdc && mkdir -p /target && mount /dev/vdc /target")
@@ -106,6 +108,45 @@ pkgs.testers.runNixOSTest {
             text = client.succeed(f"cat {out}/items.jsonl {out}/manifest.json")
             assert "diary" not in text and "notes" not in text, (name, "out-of-scope name recorded")
             client.succeed(f"dfcollect verify {out}")
+
+    with subtest("TUI interactive run: ingest package acquisition from read-only mount"):
+        tui = TuiDriver(client)
+        tui.start()
+        tui.wait_for_text("dfcollect")
+        tui.send_keys("i")
+        tui.wait_for_text("Provider delivery package")
+
+        tui.fill_field("Case number", "CASE-VM")
+        tui.fill_field("Evidence number", "tui-ingest01")
+        tui.fill_field("Examiner", "tester")
+        tui.fill_field("Package path", "/mnt/ev/delivery")
+        tui.fill_field("Provider", "Example Mail GmbH")
+        tui.fill_field("Received at", "2026-03-01T12:00:00Z")
+        tui.fill_field("Channel", "SFTP")
+        tui.fill_field("Output dir", "/target/tui-ingest")
+
+        # Start preview
+        tui.send_keys("F2")
+        tui.wait_for_text("Enter start", timeout=45)
+
+        # Confirm start
+        tui.send_keys("Enter")
+        tui.wait_for_text("Confirm Acquisition Start")
+        tui.send_keys("y")
+
+        # Result
+        tui.wait_for_text("Acquisition Result", timeout=45)
+        tui.wait_for_text("Status      : COMPLETE")
+        tui.wait_for_text("q quit")
+        tui.send_keys("q")
+        tui.wait_for_exit()
+
+        manifest = json.loads(client.succeed("cat /target/tui-ingest/manifest.json"))
+        assert manifest["status"] == "complete", manifest
+        client.succeed("dfcollect verify /target/tui-ingest")
+        items_list = [json.loads(l) for l in client.succeed("cat /target/tui-ingest/items.jsonl").splitlines()]
+        assert any(i["path"] == "data.txt" and i["status"] == "acquired" for i in items_list), items_list
+        assert manifest["source"]["kind"] == "provider-delivery", manifest["source"]
 
     with subtest("the sources are unchanged"):
         client.succeed("umount /mnt/smb /mnt/nfs")

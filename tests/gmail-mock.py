@@ -12,13 +12,27 @@
 - one 429 with Retry-After on m2's raw fetch; m5's raw fetch revokes the first
   token (401) so the client must renew it.
 """
-import base64, hashlib, json, ssl, subprocess, sys, tempfile, threading
+import argparse, base64, hashlib, json, ssl, subprocess, sys, tempfile, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
-PORT = int(sys.argv[1])
-CERT, KEY, SA_PUB, REQUEST_LOG, BODIES = sys.argv[2:7]
-BASE = f"https://server:{PORT}"
+parser = argparse.ArgumentParser(description="Google OAuth 2.0 & Gmail API mock")
+parser.add_argument("port", type=int, help="Port to listen on (0 for dynamic)")
+parser.add_argument("cert", help="Path to TLS certificate")
+parser.add_argument("key", help="Path to TLS private key")
+parser.add_argument("sa_pub", help="Path to SA public key")
+parser.add_argument("request_log", help="Path to request log")
+parser.add_argument("bodies", help="Path to bodies json file")
+parser.add_argument("--bind", default="0.0.0.0", help="Host/IP to bind to")
+parser.add_argument("--host", default="server", help="Host name used in URLs/BASE")
+parser.add_argument("--port-file", help="File to write bound port to")
+
+args = parser.parse_args()
+PORT = args.port
+CERT, KEY, SA_PUB, REQUEST_LOG, BODIES = args.cert, args.key, args.sa_pub, args.request_log, args.bodies
+BIND_HOST = args.bind
+HOST = args.host
+BASE = f"https://{HOST}:{PORT}"
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 
 
@@ -318,6 +332,11 @@ class H(BaseHTTPRequestHandler):
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(CERT, KEY)
-srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
+srv = ThreadingHTTPServer((BIND_HOST, PORT), H)
+actual_port = srv.server_port
+BASE = f"https://{HOST}:{actual_port}"
+if args.port_file:
+    with open(args.port_file, "w") as pf:
+        pf.write(f"{actual_port}\n")
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
 srv.serve_forever()

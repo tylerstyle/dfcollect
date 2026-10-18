@@ -6014,4 +6014,632 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_form_layout_all_modes_at_80x24_and_120x40() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        let modes = [
+            (Mode::Files, Screen::FilesForm, "[Files]"),
+            (Mode::Ingest, Screen::IngestForm, "[Ingest]"),
+            (Mode::Cloud, Screen::CloudForm, "[Cloud]"),
+            (Mode::Db, Screen::DbForm, "[Database]"),
+            (Mode::Imap, Screen::ImapForm, "[IMAP]"),
+            (Mode::Graph, Screen::GraphForm, "[Graph]"),
+            (Mode::Gmail, Screen::GmailForm, "[Gmail]"),
+            (Mode::M365Logs, Screen::M365LogsForm, "[M365 Logs]"),
+        ];
+
+        for (w, h) in [(80u16, 24u16), (120u16, 40u16)] {
+            for (mode, screen, title) in modes {
+                app.active_mode = mode;
+                app.screen = screen;
+                let out = render_to_string(&app, w, h);
+                assert!(
+                    out.contains(title),
+                    "Screen {screen:?} must contain title {title} at {w}x{h}:\n{out}"
+                );
+                let last_line = out.lines().next_back().unwrap_or("");
+                assert!(
+                    !last_line.ends_with('…'),
+                    "Footer of {screen:?} must not clip at {w}x{h}: '{last_line}'"
+                );
+            }
+            // Also test Verify screen
+            app.screen = Screen::Verify;
+            let ver_out = render_to_string(&app, w, h);
+            assert!(ver_out.contains("[Verify]"));
+            let last_line = ver_out.lines().next_back().unwrap_or("");
+            assert!(!last_line.ends_with('…'));
+        }
+    }
+
+    #[test]
+    fn test_confirm_start_modal_keys_and_alignment_all_modes() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        // Previews for each mode
+        let files_argv = files_argv(&app.files_form);
+        let files_args = parse_files_argv(&files_argv).unwrap();
+        let files_pv = PreviewData::from_files(
+            Preview {
+                source: PathBuf::from("/media/evidence/sdb1"),
+                output: PathBuf::from("/media/target/sdc1/case/ev"),
+                files: 10,
+                bytes: 1024,
+                directories: 1,
+                symlinks: 0,
+                special: 0,
+                out_of_scope: BTreeMap::new(),
+                excluded_trees: 0,
+                trees_outside_includes: 0,
+                other_filesystems: Vec::new(),
+                errors: Vec::new(),
+                sample: Vec::new(),
+                target_free: Some(500 << 30),
+                stopped: None,
+                at_ns: 1_776_000_000_000_000_000,
+            },
+            files_argv,
+            files_args,
+        );
+
+        let case_nr = "VG 12345/26";
+        let evid_nr = "ev01";
+        let examiner = "KHK Muster";
+
+        app.ingest_form.case.case = case_nr.into();
+        app.ingest_form.case.evidence = evid_nr.into();
+        app.ingest_form.case.examiner = examiner.into();
+
+        app.cloud_form.case.case = case_nr.into();
+        app.cloud_form.case.evidence = evid_nr.into();
+        app.cloud_form.case.examiner = examiner.into();
+
+        app.db_form.case.case = case_nr.into();
+        app.db_form.case.evidence = evid_nr.into();
+        app.db_form.case.examiner = examiner.into();
+
+        app.imap_form.case.case = case_nr.into();
+        app.imap_form.case.evidence = evid_nr.into();
+        app.imap_form.case.examiner = examiner.into();
+
+        app.graph_form.case.case = case_nr.into();
+        app.graph_form.case.evidence = evid_nr.into();
+        app.graph_form.case.examiner = examiner.into();
+
+        app.gmail_form.case.case = case_nr.into();
+        app.gmail_form.case.evidence = evid_nr.into();
+        app.gmail_form.case.examiner = examiner.into();
+
+        app.m365_logs_form.case.case = case_nr.into();
+        app.m365_logs_form.case.evidence = evid_nr.into();
+        app.m365_logs_form.case.examiner = examiner.into();
+
+        app.ingest_form.package = "/media/evidence/sdb1/pkg".into();
+        app.ingest_form.provider = "Example Mail Inc.".into();
+        app.ingest_form.received_at = "2026-10-17T10:00:00Z".into();
+        app.ingest_form.channel = "e-CODEX".into();
+        app.ingest_form.output.output_path = "/media/target/sdc1/case/ingest01".into();
+        let ingest_argv = ingest_argv(&app.ingest_form);
+        let ingest_args = parse_ingest_argv(&ingest_argv).unwrap();
+        let ingest_pv = PreviewData {
+            mode_preview: ModePreview::Ingest {
+                preview: IngestPreview {
+                    files: 5,
+                    bytes: 2048,
+                    symlinks: 0,
+                    special: 0,
+                    listed_present: 5,
+                    unlisted: Vec::new(),
+                    unlisted_count: 0,
+                    missing: Vec::new(),
+                    missing_count: 0,
+                    lists: vec![("hashlist.txt".into(), 5)],
+                    target_free: Some(500 << 30),
+                    stopped: None,
+                    at_ns: 1_776_000_000_000_000_000,
+                },
+                args: Box::new(ingest_args),
+            },
+            argv: ingest_argv,
+            scroll: 0,
+            copied_osc52: false,
+        };
+
+        app.cloud_form.source = "case_s3:bucket/data".into();
+        app.cloud_form.output.output_path = "/media/target/sdc1/case/cloud01".into();
+        let cloud_argv = cloud_argv(&app.cloud_form);
+        let cloud_args = parse_cloud_argv(&cloud_argv).unwrap();
+        let cloud_pv = PreviewData {
+            mode_preview: ModePreview::Cloud {
+                preview: CloudPreview {
+                    listed: 12,
+                    files: 10,
+                    bytes: 4096,
+                    out_of_scope: BTreeMap::new(),
+                    hash_types: vec!["MD5".into()],
+                    sample: Vec::new(),
+                    target_free: Some(500 << 30),
+                    stopped: None,
+                    at_ns: 1_776_000_000_000_000_000,
+                },
+                args: Box::new(cloud_args),
+            },
+            argv: cloud_argv,
+            scroll: 0,
+            copied_osc52: false,
+        };
+
+        app.db_form.host = "db.example.org".into();
+        app.db_form.user = "auditor".into();
+        app.db_form.databases = vec!["sales".into()];
+        app.db_form.output.output_path = "/media/target/sdc1/case/db01".into();
+        let db_argv = db_argv(&app.db_form);
+        let db_args = parse_db_argv(&db_argv).unwrap();
+        let db_pv = PreviewData {
+            mode_preview: ModePreview::Db {
+                preview: DbPreview {
+                    server: "PostgreSQL 16.0".into(),
+                    server_time: "2026-04-01 12:00:00+00".into(),
+                    databases: vec![("sales".into(), Some(1024 * 1024), true)],
+                    missing: Vec::new(),
+                    tools: vec![("pg_dump".into(), "16.0".into())],
+                    target_free: Some(500 << 30),
+                    at_ns: 1_776_000_000_000_000_000,
+                },
+                args: Box::new(db_args),
+            },
+            argv: db_argv,
+            scroll: 0,
+            copied_osc52: false,
+        };
+
+        app.imap_form.server = "mail.example.org:993".into();
+        app.imap_form.user = "alice@example.org".into();
+        app.imap_form.output.output_path = "/media/target/sdc1/case/imap01".into();
+        let imap_argv = imap_argv(&app.imap_form);
+        let imap_args = parse_imap_argv(&imap_argv).unwrap();
+        let imap_pv = PreviewData {
+            mode_preview: ModePreview::Imap {
+                preview: ImapPreview {
+                    server: "mail.example.org".into(),
+                    auth_method: "PLAIN".into(),
+                    folders: vec![crate::mail::FolderPreview {
+                        name: "INBOX".into(),
+                        messages: 8,
+                        in_scope: 8,
+                        bytes: 1024,
+                        skipped: None,
+                    }],
+                    messages: 8,
+                    in_scope: 8,
+                    bytes: 1024,
+                    out_of_scope: BTreeMap::new(),
+                    target_free: Some(500 << 30),
+                    stopped: None,
+                    at_ns: 1_776_000_000_000_000_000,
+                },
+                args: Box::new(imap_args),
+            },
+            argv: imap_argv,
+            scroll: 0,
+            copied_osc52: false,
+        };
+
+        app.graph_form.client_id = "00000000-1111-2222-3333-444444444444".into();
+        app.graph_form.mailbox = "alice@contoso.test".into();
+        app.graph_form.output.output_path = "/media/target/sdc1/case/graph01".into();
+        let graph_argv = graph_argv(&app.graph_form);
+        let graph_args = parse_graph_argv(&graph_argv).unwrap();
+        let graph_pv = PreviewData {
+            mode_preview: ModePreview::Graph {
+                preview: GraphPreview {
+                    account: "alice@contoso.test".into(),
+                    auth_method: "device_code".into(),
+                    folders: vec![crate::graph::GraphFolderPreview {
+                        path: "Inbox".into(),
+                        messages: Some(10),
+                        in_scope: 10,
+                        bytes: 2048,
+                        skipped: None,
+                    }],
+                    messages: 10,
+                    in_scope: 10,
+                    bytes: 2048,
+                    out_of_scope: BTreeMap::new(),
+                    target_free: Some(500 << 30),
+                    stopped: None,
+                    at_ns: 1_776_000_000_000_000_000,
+                },
+                args: Box::new(graph_args),
+            },
+            argv: graph_argv,
+            scroll: 0,
+            copied_osc52: false,
+        };
+
+        app.gmail_form.mailbox = "alice@workspace.test".into();
+        app.gmail_form.client_id = "desktop-client".into();
+        app.gmail_form.output.output_path = "/media/target/sdc1/case/gmail01".into();
+        let gmail_argv = gmail_argv(&app.gmail_form);
+        let gmail_args = parse_gmail_argv(&gmail_argv).unwrap();
+        let gmail_pv = PreviewData {
+            mode_preview: ModePreview::Gmail {
+                preview: GmailPreview {
+                    account: "alice@workspace.test".into(),
+                    auth_method: "installed_app".into(),
+                    messages: 15,
+                    in_scope: 15,
+                    bytes: 4096,
+                    by_label: BTreeMap::new(),
+                    out_of_scope: BTreeMap::new(),
+                    errors: 0,
+                    target_free: Some(500 << 30),
+                    stopped: None,
+                    at_ns: 1_776_000_000_000_000_000,
+                },
+                args: Box::new(gmail_args),
+            },
+            argv: gmail_argv,
+            scroll: 0,
+            copied_osc52: false,
+        };
+
+        let mode_previews = [
+            (Mode::Files, files_pv),
+            (Mode::Ingest, ingest_pv),
+            (Mode::Cloud, cloud_pv),
+            (Mode::Db, db_pv),
+            (Mode::Imap, imap_pv),
+            (Mode::Graph, graph_pv),
+            (Mode::Gmail, gmail_pv),
+        ];
+
+        // 1. Assert keys <= 12 chars across all modes with previews
+        for (mode, pv) in &mode_previews {
+            app.active_mode = *mode;
+            let lines = confirm_start_lines(&app, pv);
+            assert!(
+                !lines.is_empty(),
+                "ConfirmStart lines must not be empty for {mode:?}"
+            );
+            for (k, _) in lines {
+                assert!(
+                    k.len() <= 12,
+                    "ConfirmStart key '{k}' in {mode:?} exceeds 12 chars ({})",
+                    k.len()
+                );
+            }
+        }
+
+        // M365Logs keys <= 12 chars
+        app.active_mode = Mode::M365Logs;
+        let m365_lines = confirm_start_m365_logs_lines(&app);
+        assert!(!m365_lines.is_empty());
+        for (k, _) in m365_lines {
+            assert!(
+                k.len() <= 12,
+                "ConfirmStart key '{k}' in M365Logs exceeds 12 chars ({})",
+                k.len()
+            );
+        }
+
+        // 2. Alignment check at 80x24 for M365Logs
+        app.active_mode = Mode::M365Logs;
+        app.screen = Screen::M365LogsForm;
+        app.modal = Some(Modal::ConfirmStart);
+        let cs_m365 = render_to_string(&app, 80, 24);
+        assert!(cs_m365.contains("Confirm Acquisition Start"));
+        let mut m365_matched = 0;
+        for line in cs_m365.lines() {
+            if line.contains("│ │ ") && line.contains(':') && !line.contains("http") {
+                let colon_idx = line.chars().position(|c| c == ':').unwrap();
+                assert_eq!(
+                    colon_idx, 16,
+                    "ConfirmStart key in line '{line}' not aligned to column 16 (inner col 14)"
+                );
+                m365_matched += 1;
+            }
+        }
+        assert!(
+            m365_matched >= 3,
+            "Expected at least 3 aligned key lines in M365Logs ConfirmStart, got {m365_matched}:\n{cs_m365}"
+        );
+        app.modal = None;
+
+        // 3. Alignment check at 80x24 for a preview mode (e.g. Files)
+        let (_, test_pv) = mode_previews
+            .into_iter()
+            .find(|(m, _)| *m == Mode::Files)
+            .unwrap();
+        app.active_mode = Mode::Files;
+        app.screen = Screen::FilesForm;
+        app.preview_state = Some(PreviewState::Ready(Box::new(test_pv)));
+        app.modal = Some(Modal::ConfirmStart);
+        let cs_files = render_to_string(&app, 80, 24);
+        assert!(cs_files.contains("Confirm Acquisition Start"));
+        let mut files_matched = 0;
+        for line in cs_files.lines() {
+            if line.contains("│ │ ") && line.contains(':') && !line.contains("http") {
+                let colon_idx = line.chars().position(|c| c == ':').unwrap();
+                assert_eq!(
+                    colon_idx, 16,
+                    "ConfirmStart key in line '{line}' not aligned to column 16 (inner col 14)"
+                );
+                files_matched += 1;
+            }
+        }
+        assert!(
+            files_matched >= 4,
+            "Expected at least 4 aligned key lines in Files ConfirmStart, got {files_matched}:\n{cs_files}"
+        );
+        app.modal = None;
+        app.preview_state = None;
+    }
+
+    #[test]
+    fn test_mode_switching_clears_preview_and_credentials() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        let argv = files_argv(&app.files_form);
+        let args = parse_files_argv(&argv).unwrap();
+        let dummy_preview = PreviewData::from_files(
+            Preview {
+                source: PathBuf::from("/media/evidence/sdb1"),
+                output: PathBuf::from("/media/target/sdc1/case/ev"),
+                files: 10,
+                bytes: 1024,
+                directories: 1,
+                symlinks: 0,
+                special: 0,
+                out_of_scope: BTreeMap::new(),
+                excluded_trees: 0,
+                trees_outside_includes: 0,
+                other_filesystems: Vec::new(),
+                errors: Vec::new(),
+                sample: Vec::new(),
+                target_free: Some(500 << 30),
+                stopped: None,
+                at_ns: 1_776_000_000_000_000_000,
+            },
+            argv,
+            args,
+        );
+
+        app.preview_state = Some(PreviewState::Ready(Box::new(dummy_preview)));
+        app.db_credential = Some((
+            app.db_form.conn_key(),
+            crate::common::Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "db-secret".into(),
+            ))),
+        ));
+        app.imap_credential = Some((
+            app.imap_form.conn_key(),
+            crate::common::Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "imap-secret".into(),
+            ))),
+        ));
+        app.graph_credential = Some((
+            app.graph_form.conn_key(),
+            crate::common::Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "graph-secret".into(),
+            ))),
+        ));
+        app.gmail_credential = Some((
+            app.gmail_form.conn_key(),
+            crate::common::Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "gmail-secret".into(),
+            ))),
+        ));
+
+        app.open_cloud_form();
+        assert_eq!(app.active_mode, Mode::Cloud);
+        assert!(app.preview_state.is_none());
+        assert!(app.db_credential.is_none());
+        assert!(app.imap_credential.is_none());
+        assert!(app.graph_credential.is_none());
+        assert!(app.gmail_credential.is_none());
+    }
+
+    #[test]
+    fn test_sign_in_screen_renders_device_code_and_url() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        let console = Arc::new(TuiConsole::new(&STOP, app.secret_tx.clone()));
+        console.sign_in(&SignIn::DeviceCode {
+            message: "To sign in, open https://microsoft.com/devicelogin and enter TEST-CODE-1234."
+                .into(),
+            uri: "https://microsoft.com/devicelogin".into(),
+            code: "TEST-CODE-1234".into(),
+            expires_at_ns: 2_000_000_000_000_000_000,
+        });
+        app.preview_state = Some(PreviewState::Running {
+            mode: Mode::Graph,
+            argv: graph_argv(&app.graph_form),
+            progress: Arc::new(Progress::default()),
+            console: console.clone(),
+            started: Instant::now(),
+            handle: None,
+        });
+        app.screen = Screen::Preview;
+
+        for (w, h) in [(80u16, 24u16), (120u16, 40u16)] {
+            let dc_out = render_to_string(&app, w, h);
+            assert!(dc_out.contains("[Sign-In]"));
+            assert!(dc_out.contains("https://microsoft.com/devicelogin"));
+            assert!(dc_out.contains("TEST-CODE-1234"));
+            assert!(dc_out.contains("('y' copies code via OSC 52)"));
+        }
+
+        // ConfirmStopSignIn auto-closes on tick() when sign-in is inactive
+        console.sign_in_done();
+        app.modal = Some(Modal::ConfirmStopSignIn);
+        assert!(app.active_sign_in().is_none());
+        app.tick();
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn test_m365_logs_progress_gauge_rendering() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        let progress = Arc::new(Progress::default());
+        progress.set_phase(Phase::Waiting);
+        progress.set_stage("fetching logs…");
+        progress.files.store(2, Ordering::Relaxed);
+        progress.bytes.store(128 * 1024, Ordering::Relaxed);
+
+        let run_console = Arc::new(TuiConsole::new(&STOP, app.secret_tx.clone()));
+        app.run_state = Some(RunState {
+            mode: Mode::M365Logs,
+            source_display: "tenant contoso.example".into(),
+            output: PathBuf::from("/media/target/sdc1/case/m365-logs"),
+            argv: m365_logs_argv(&app.m365_logs_form),
+            expected_files: 4,
+            expected_bytes: 0,
+            progress,
+            console: run_console,
+            notices_expanded: false,
+            notices_scroll: 0,
+            started: Instant::now(),
+            rate_samples: VecDeque::new(),
+            stop_requested: false,
+            handle: None,
+        });
+        app.screen = Screen::Running;
+
+        for (w, h) in [(80u16, 24u16), (120u16, 40u16)] {
+            let out = render_to_string(&app, w, h);
+            assert!(out.contains("fetching logs…"));
+            assert!(out.contains("Phase: 1. Waiting"));
+            assert!(out.contains("Logs           : 2 of 4"));
+        }
+    }
+
+    #[test]
+    fn test_problems_pane_minimum_height_and_formatting() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        app.result_data = Some(ResultData {
+            mode: Mode::M365Logs,
+            code: 0,
+            status: "complete_with_errors".into(),
+            collection: PathBuf::from("/media/target/sdc1/case/m365-logs"),
+            argv: vec![
+                "dfcollect".into(),
+                "m365-logs".into(),
+                "--tenant".into(),
+                "contoso.example".into(),
+                "--client-id".into(),
+                "00000000-0000-0000-0000-000000000001".into(),
+                "--graph-endpoint".into(),
+                "https://graph.microsoft.com/v1.0".into(),
+                "--login-endpoint".into(),
+                "https://login.microsoftonline.com".into(),
+                "--users".into(),
+                "alice@contoso.example,bob@contoso.example,charlie@contoso.example".into(),
+                "--record-types".into(),
+                "ExchangeItem,AzureActiveDirectory,SharePoint".into(),
+                "--operations".into(),
+                "MailItemsAccessed,FileDownloaded,UserLoggedIn".into(),
+                "--not-before".into(),
+                "2026-03-01T00:00:00Z".into(),
+                "--not-after".into(),
+                "2026-04-01T00:00:00Z".into(),
+                "-o".into(),
+                "/media/target/sdc1/case/m365-logs".into(),
+                "-C".into(),
+                "CASE 12345/26".into(),
+                "-E".into(),
+                "logs01".into(),
+                "-e".into(),
+                "KHK Muster".into(),
+            ],
+            acquired: 4,
+            records: Some(120),
+            bytes: 1024 * 1024,
+            out_of_scope_listed: 0,
+            out_of_scope_counted: 0,
+            excluded_trees: 0,
+            trees_outside_includes: 0,
+            errors: 8,
+            skipped: 0,
+            summary_kv: vec![
+                ("tenant".into(), "contoso.example".into()),
+                ("logs".into(), "4".into()),
+            ],
+            audit_anchor: None,
+            container_mismatches: Vec::new(),
+            warnings: Vec::new(),
+            problems: (1..=8)
+                .map(|i| format!("directory/000{i:02}.jsonl: permission denied (EACCES)"))
+                .collect(),
+            fatal_error: None,
+            left_unfinished: false,
+            scroll: 0,
+        });
+        app.screen = Screen::Result;
+
+        for (w, h) in [(80u16, 24u16), (120u16, 40u16)] {
+            let res_out = render_to_string(&app, w, h);
+            assert!(res_out.contains("Problems, Warnings & Container Mismatches"));
+            assert!(res_out.contains("directory/00001.jsonl"));
+            assert!(res_out.contains("directory/00005.jsonl"));
+            if w == 80 && h == 24 {
+                assert!(
+                    res_out.contains("… (press 'c' to copy full command)"),
+                    "Command should show long copy hint when avail_cmd_rows >= 2 at 80x24:\n{res_out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_result_screen_summary_labels_for_mail_modes() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        app.result_data = Some(ResultData {
+            mode: Mode::Imap,
+            code: 0,
+            status: "completed".into(),
+            collection: PathBuf::from("/media/target/sdc1/case/imap01"),
+            argv: vec!["dfcollect".into(), "imap".into()],
+            acquired: 8,
+            records: None,
+            bytes: 512 * 1024,
+            out_of_scope_listed: 2,
+            out_of_scope_counted: 2,
+            excluded_trees: 0,
+            trees_outside_includes: 0,
+            errors: 0,
+            skipped: 0,
+            summary_kv: vec![
+                ("server".into(), "imaps://mail.example.org:993".into()),
+                ("mailbox".into(), "alice@example.org".into()),
+                ("folders_examined".into(), "2".into()),
+                ("messages_listed".into(), "8".into()),
+            ],
+            audit_anchor: None,
+            container_mismatches: Vec::new(),
+            warnings: Vec::new(),
+            problems: Vec::new(),
+            fatal_error: None,
+            left_unfinished: false,
+            scroll: 0,
+        });
+        app.screen = Screen::Result;
+        let imap_res_out = render_to_string(&app, 80, 24);
+        assert!(imap_res_out.contains("Folders"));
+        assert!(imap_res_out.contains("2 examined"));
+        assert!(imap_res_out.contains("Listed"));
+        assert!(imap_res_out.contains("8 message(s)"));
+    }
 }
