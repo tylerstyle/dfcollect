@@ -1,6 +1,7 @@
 //! Pure rendering functions for the `dfcollect` TUI (`Home`, `FilesForm`,
-//! `IngestForm`, `CloudForm`, `DbForm`, `Preview`, `Running`, `Result`,
-//! `Verify` and modal overlays).
+//! `IngestForm`, `CloudForm`, `DbForm`, `ImapForm`, `GraphForm`, `GmailForm`,
+//! `M365LogsForm`, `SignIn`, `Preview`, `Running`, `Result`, `Verify` and
+//! modal overlays).
 //!
 //! Uses only the standard 16 ANSI colours (`Color::Cyan`, `Green`, `Yellow`,
 //! `Red`, `Magenta`, `White`, `DarkGray`, `Black`) so the interface renders
@@ -9,17 +10,26 @@
 
 use crate::{
     common::{human_bytes, Phase},
-    console::Level,
+    console::{Level, SignIn},
     files::PREVIEW_SAMPLE,
+    gmail::GmailAuth,
+    graph::GraphAuth,
+    mail::Auth as ImapAuth,
     meta::Kind,
     tui::{
         app::{
-            confirm_start_lines, exit_code_meaning, format_duration, App, ListTarget, Modal, Mode,
-            ModePreview, NoticeLevel, PreviewData, PreviewState, Screen, VerifyFocus,
-            VerifyReportData, HOME_ITEMS,
+            confirm_start_lines, confirm_start_m365_logs_lines, exit_code_meaning, format_duration,
+            App, ListTarget, Modal, Mode, ModePreview, NoticeLevel, PreviewData, PreviewState,
+            Screen, VerifyFocus, VerifyReportData, HOME_ITEMS,
         },
-        command::{cloud_argv, db_argv, files_argv, ingest_argv, shell_quote},
-        form::{CloudField, DbField, FilesField, IngestField},
+        command::{
+            cloud_argv, db_argv, files_argv, gmail_argv, graph_argv, imap_argv, ingest_argv,
+            m365_logs_argv, shell_quote,
+        },
+        form::{
+            CloudField, DbField, FilesField, GmailField, GraphCloud, GraphField, ImapField,
+            IngestField, M365LogsField,
+        },
         input::{str_width, truncate_to_width, visible_window, wrap_text},
     },
     VERSION,
@@ -84,16 +94,24 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     render_title_bar(frame, chunks[0], app);
 
-    match app.screen {
-        Screen::Home => render_home(frame, chunks[1], app),
-        Screen::FilesForm => render_files_form(frame, chunks[1], app),
-        Screen::IngestForm => render_ingest_form(frame, chunks[1], app),
-        Screen::CloudForm => render_cloud_form(frame, chunks[1], app),
-        Screen::DbForm => render_db_form(frame, chunks[1], app),
-        Screen::Preview => render_preview(frame, chunks[1], app),
-        Screen::Running => render_running(frame, chunks[1], app),
-        Screen::Result => render_result(frame, chunks[1], app),
-        Screen::Verify => render_verify(frame, chunks[1], app),
+    if let Some(sign_in) = app.active_sign_in() {
+        render_sign_in(frame, chunks[1], app, &sign_in);
+    } else {
+        match app.screen {
+            Screen::Home => render_home(frame, chunks[1], app),
+            Screen::FilesForm => render_files_form(frame, chunks[1], app),
+            Screen::IngestForm => render_ingest_form(frame, chunks[1], app),
+            Screen::CloudForm => render_cloud_form(frame, chunks[1], app),
+            Screen::DbForm => render_db_form(frame, chunks[1], app),
+            Screen::ImapForm => render_imap_form(frame, chunks[1], app),
+            Screen::GraphForm => render_graph_form(frame, chunks[1], app),
+            Screen::GmailForm => render_gmail_form(frame, chunks[1], app),
+            Screen::M365LogsForm => render_m365_logs_form(frame, chunks[1], app),
+            Screen::Preview => render_preview(frame, chunks[1], app),
+            Screen::Running => render_running(frame, chunks[1], app),
+            Screen::Result => render_result(frame, chunks[1], app),
+            Screen::Verify => render_verify(frame, chunks[1], app),
+        }
     }
 
     render_footer(frame, chunks[2], app);
@@ -198,16 +216,24 @@ fn push_form_error(lines: &mut Vec<Line<'static>>, indent: &str, err: &str, tota
 }
 
 fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let screen_name = match app.screen {
-        Screen::Home => "Home",
-        Screen::FilesForm => "Files",
-        Screen::IngestForm => "Ingest",
-        Screen::CloudForm => "Cloud",
-        Screen::DbForm => "Database",
-        Screen::Preview => "Preview",
-        Screen::Running => "Running",
-        Screen::Result => "Result",
-        Screen::Verify => "Verify",
+    let screen_name = if app.active_sign_in().is_some() {
+        "Sign-In"
+    } else {
+        match app.screen {
+            Screen::Home => "Home",
+            Screen::FilesForm => "Files",
+            Screen::IngestForm => "Ingest",
+            Screen::CloudForm => "Cloud",
+            Screen::DbForm => "Database",
+            Screen::ImapForm => "IMAP",
+            Screen::GraphForm => "Graph",
+            Screen::GmailForm => "Gmail",
+            Screen::M365LogsForm => "M365 Logs",
+            Screen::Preview => "Preview",
+            Screen::Running => "Running",
+            Screen::Result => "Result",
+            Screen::Verify => "Verify",
+        }
     };
     let left = format!(" dfcollect {VERSION} — logical forensic acquisition ");
     let right = format!(" [{screen_name}] ");
@@ -235,9 +261,31 @@ fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
+fn format_cmd_footer_line(
+    flag: &str,
+    required: bool,
+    argv: &[String],
+    width: u16,
+) -> Line<'static> {
+    let tag = if flag.is_empty() {
+        String::new()
+    } else if required {
+        format!("[{flag} *] ")
+    } else {
+        format!("[{flag}] ")
+    };
+    let cmd = shell_quote(argv);
+    let shown = truncate_to_width(
+        &format!("{tag}cmd: {cmd}"),
+        width.saturating_sub(1) as usize,
+    );
+    Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)))
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut footer_lines: Vec<Line> = Vec::new();
     let max_notice_rows = area.height.saturating_sub(1).max(1) as usize;
+    let active_signin = app.active_sign_in();
     if let Some(n) = &app.notice {
         let (prefix, color) = match n.level {
             NoticeLevel::Info => ("INFO: ", Color::Cyan),
@@ -254,6 +302,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
         }
+    } else if active_signin.is_some() {
+        footer_lines.push(Line::from(Span::styled(
+            " Authenticate in your browser to continue; press Esc to stop sign-in.",
+            Style::default().fg(Color::Cyan),
+        )));
     } else {
         let notice_line = match app.screen {
             Screen::FilesForm => {
@@ -266,51 +319,61 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             }
             Screen::IngestForm => {
                 let spec = app.ingest_form.field.spec();
-                let tag = if spec.flag.is_empty() {
-                    String::new()
-                } else if spec.required {
-                    format!("[{} *] ", spec.flag)
-                } else {
-                    format!("[{}] ", spec.flag)
-                };
-                let cmd = shell_quote(&ingest_argv(&app.ingest_form));
-                let shown = truncate_to_width(
-                    &format!("{tag}cmd: {cmd}"),
-                    area.width.saturating_sub(1) as usize,
-                );
-                Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)))
+                format_cmd_footer_line(
+                    spec.flag,
+                    spec.required,
+                    &ingest_argv(&app.ingest_form),
+                    area.width,
+                )
             }
             Screen::CloudForm => {
                 let spec = app.cloud_form.field.spec();
-                let tag = if spec.flag.is_empty() {
-                    String::new()
-                } else if spec.required {
-                    format!("[{} *] ", spec.flag)
-                } else {
-                    format!("[{}] ", spec.flag)
-                };
-                let cmd = shell_quote(&cloud_argv(&app.cloud_form));
-                let shown = truncate_to_width(
-                    &format!("{tag}cmd: {cmd}"),
-                    area.width.saturating_sub(1) as usize,
-                );
-                Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)))
+                format_cmd_footer_line(
+                    spec.flag,
+                    spec.required,
+                    &cloud_argv(&app.cloud_form),
+                    area.width,
+                )
             }
             Screen::DbForm => {
                 let spec = app.db_form.field.spec(app.db_form.engine);
-                let tag = if spec.flag.is_empty() {
-                    String::new()
-                } else if spec.required {
-                    format!("[{} *] ", spec.flag)
-                } else {
-                    format!("[{}] ", spec.flag)
-                };
-                let cmd = shell_quote(&db_argv(&app.db_form));
-                let shown = truncate_to_width(
-                    &format!("{tag}cmd: {cmd}"),
-                    area.width.saturating_sub(1) as usize,
-                );
-                Line::from(Span::styled(shown, Style::default().fg(Color::DarkGray)))
+                format_cmd_footer_line(spec.flag, spec.required, &db_argv(&app.db_form), area.width)
+            }
+            Screen::ImapForm => {
+                let spec = app.imap_form.field.spec();
+                format_cmd_footer_line(
+                    spec.flag,
+                    spec.required,
+                    &imap_argv(&app.imap_form),
+                    area.width,
+                )
+            }
+            Screen::GraphForm => {
+                let spec = app.graph_form.field.spec();
+                format_cmd_footer_line(
+                    spec.flag,
+                    spec.required,
+                    &graph_argv(&app.graph_form),
+                    area.width,
+                )
+            }
+            Screen::GmailForm => {
+                let spec = app.gmail_form.field.spec();
+                format_cmd_footer_line(
+                    spec.flag,
+                    spec.required,
+                    &gmail_argv(&app.gmail_form),
+                    area.width,
+                )
+            }
+            Screen::M365LogsForm => {
+                let spec = app.m365_logs_form.field.spec();
+                format_cmd_footer_line(
+                    spec.flag,
+                    spec.required,
+                    &m365_logs_argv(&app.m365_logs_form),
+                    area.width,
+                )
             }
             Screen::Home => {
                 let item = &HOME_ITEMS[app.home_idx.min(HOME_ITEMS.len() - 1)];
@@ -322,24 +385,41 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         footer_lines.push(notice_line);
     }
 
-    let keys = match app.screen {
-        Screen::Home => " ↑/↓ select  Enter open  f/v/i/c/d mode  ? keys  q quit",
-        Screen::FilesForm | Screen::IngestForm | Screen::CloudForm | Screen::DbForm => {
-            " Tab/↑↓ move  Enter edit/toggle  F2/p preview  F4/Tab complete  ? keys  Esc"
+    let keys = match &active_signin {
+        Some(SignIn::DeviceCode { .. }) => " u copy URI  y copy code  Esc stop sign-in  ? keys",
+        Some(SignIn::Browser { .. }) => {
+            " u/F2 copy URL  Enter submit URL  Esc stop sign-in  ? keys"
         }
-        Screen::Preview if app.is_worker_running() => " Esc / s stop preview  ? keys",
-        Screen::Preview if !app.is_preview_stale() => {
-            " Enter start  e/Esc edit  c copy cmd  r/F2 re-run  ↑/↓ scroll  ? keys"
-        }
-        Screen::Preview => " e/Esc edit  c copy cmd  r/F2 re-run  ↑/↓ scroll  ? keys",
-        Screen::Running => {
-            " s/Ctrl+C stop (aborts)  l notices  ↑/↓ scroll  ? keys  (quit disabled)"
-        }
-        Screen::Result => " v verify  n next acquisition  h/Esc home  ↑/↓ scroll  ? keys  q quit",
-        Screen::Verify if app.is_worker_running() => " Esc / s stop verification  ? keys",
-        Screen::Verify => {
-            " Enter/F2 verify  Tab focus  F4/Tab complete  ↑/↓ scroll  ? keys  Esc  q quit"
-        }
+        None => match app.screen {
+            Screen::Home => " ↑/↓ select  Enter open  f/v/i/c/d/m/g/w/l mode  ? keys  q quit",
+            Screen::FilesForm
+            | Screen::IngestForm
+            | Screen::CloudForm
+            | Screen::DbForm
+            | Screen::ImapForm
+            | Screen::GraphForm
+            | Screen::GmailForm => {
+                " Tab/↑↓ move  Enter edit/toggle  F2/p preview  F4/Tab complete  ? keys  Esc"
+            }
+            Screen::M365LogsForm => {
+                " Tab/↑↓ move  Enter edit/toggle  F2/p start  F4/Tab complete  ? keys  Esc"
+            }
+            Screen::Preview if app.is_worker_running() => " Esc / s stop preview  ? keys",
+            Screen::Preview if !app.is_preview_stale() => {
+                " Enter start  e/Esc edit  c copy cmd  r/F2 re-run  ↑/↓ scroll  ? keys"
+            }
+            Screen::Preview => " e/Esc edit  c copy cmd  r/F2 re-run  ↑/↓ scroll  ? keys",
+            Screen::Running => {
+                " s/Ctrl+C stop (aborts)  l notices  ↑/↓ scroll  ? keys  (quit disabled)"
+            }
+            Screen::Result => {
+                " v verify  c copy cmd  n next  h/Esc home  ↑/↓ scroll  ? keys  q quit"
+            }
+            Screen::Verify if app.is_worker_running() => " Esc / s stop verification  ? keys",
+            Screen::Verify => {
+                " Enter/F2 verify  Tab focus  F4/Tab complete  ↑/↓ scroll  ? keys  Esc  q quit"
+            }
+        },
     };
     footer_lines.push(Line::from(Span::styled(
         truncate_to_width(keys, area.width as usize),
@@ -560,7 +640,7 @@ fn render_files_form(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             if is_focused {
-                let x_off = (2 + label_col + cursor_col) as u16;
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
                 cursor_screen_offset = Some((line_idx, x_off));
             }
 
@@ -739,7 +819,7 @@ fn render_ingest_form(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             if is_focused {
-                let x_off = (2 + label_col + cursor_col) as u16;
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
                 cursor_screen_offset = Some((line_idx, x_off));
             }
 
@@ -946,7 +1026,7 @@ fn render_cloud_form(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             if is_focused {
-                let x_off = (2 + label_col + cursor_col) as u16;
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
                 cursor_screen_offset = Some((line_idx, x_off));
             }
 
@@ -1116,7 +1196,7 @@ fn render_db_form(frame: &mut Frame, area: Rect, app: &App) {
             };
 
             if is_focused {
-                let x_off = (2 + label_col + cursor_col) as u16;
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
                 cursor_screen_offset = Some((line_idx, x_off));
             }
 
@@ -1220,6 +1300,1013 @@ fn render_db_form(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_imap_form(frame: &mut Frame, area: Rect, app: &App) {
+    let form = &app.imap_form;
+    let block = Block::default()
+        .title(" Mailboxes over IMAP (dfcollect imap) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 20 || inner.height < 4 {
+        return;
+    }
+
+    let label_col = 18usize;
+    let val_width = (inner.width as usize).saturating_sub(label_col + 4).max(10);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut focused_line_idx: usize = 0;
+    let mut cursor_screen_offset: Option<(usize, u16)> = None;
+
+    for field in ImapField::ALL {
+        if !form.applies(field) {
+            continue;
+        }
+        let spec = field.spec();
+        if let Some(sec) = spec.section {
+            push_section(&mut lines, sec);
+        }
+        if field == ImapField::PreviewButton {
+            lines.push(Line::from(""));
+        }
+
+        let is_focused = form.field == field;
+        let line_idx = lines.len();
+        if is_focused {
+            focused_line_idx = line_idx;
+        }
+
+        let marker = if is_focused { "▸ " } else { "  " };
+        let label = format!("{:<width$}", field.label(), width = label_col);
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        if field == ImapField::PreviewButton {
+            let btn_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(form.value_text(field), btn_style),
+            ]));
+            continue;
+        }
+
+        if spec.kind.is_text() {
+            let raw = form.text(field).map(String::as_str).unwrap_or("");
+            let (shown_span, cursor_col) = if raw.is_empty() && (!is_focused || !form.editing) {
+                (
+                    Span::styled(
+                        truncate_to_width(spec.placeholder, val_width),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    0,
+                )
+            } else {
+                let cur = if is_focused { form.cursor } else { raw.len() };
+                let (win, col) = window_and_col(raw, cur, val_width);
+                let style = if is_focused {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                (Span::styled(win, style), col)
+            };
+
+            if is_focused {
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
+                cursor_screen_offset = Some((line_idx, x_off));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                shown_span,
+            ]));
+        } else {
+            let val = truncate_to_width(&form.value_text(field), val_width);
+            let val_style = if spec.kind.is_safety() && form.output.allow_tmpfs {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if is_focused {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                Span::styled(val, val_style),
+            ]));
+        }
+
+        let indent = " ".repeat(2 + label_col);
+        if field == ImapField::PasswordFile
+            && matches!(
+                form.auth,
+                ImapAuth::Auto | ImapAuth::Plain | ImapAuth::Login
+            )
+            && form.password_file.trim().is_empty()
+        {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("{indent}ℹ Password prompted in masked modal on Preview/Run"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if field == ImapField::OutputPath {
+            if let Some(p) = &form.output.output_probe {
+                if let Some(free) = p.free_bytes {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}Free space on target: {}", human_bytes(free)),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+            }
+        } else if matches!(
+            field,
+            ImapField::NotBefore | ImapField::NotAfter | ImapField::ReferenceTime
+        ) {
+            if let Some(hint) = form.utc_hint(field) {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{hint}"),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            if field == ImapField::ReferenceTime {
+                if let Some(stamp) = form.clock.stamp_hint() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}{stamp}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+        }
+
+        if let Some(err) = form.validate_field(field) {
+            let should_show = is_focused
+                || !form.text(field).is_some_and(|t| t.trim().is_empty())
+                || matches!(
+                    field,
+                    ImapField::Server
+                        | ImapField::User
+                        | ImapField::TokenFile
+                        | ImapField::TlsSha256
+                        | ImapField::OutputPath
+                );
+            if should_show {
+                push_form_error(&mut lines, &indent, &err, inner.width as usize);
+            }
+        }
+        if is_focused {
+            focused_line_idx = lines.len().saturating_sub(1);
+        }
+    }
+
+    finish_form_scroll_and_cursor(
+        frame,
+        inner,
+        lines,
+        focused_line_idx,
+        cursor_screen_offset,
+        app.modal.is_none(),
+    );
+}
+
+fn render_graph_form(frame: &mut Frame, area: Rect, app: &App) {
+    let form = &app.graph_form;
+    let block = Block::default()
+        .title(" Microsoft 365 / Exchange Online via Graph (dfcollect graph) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 20 || inner.height < 4 {
+        return;
+    }
+
+    let label_col = 18usize;
+    let val_width = (inner.width as usize).saturating_sub(label_col + 4).max(10);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut focused_line_idx: usize = 0;
+    let mut cursor_screen_offset: Option<(usize, u16)> = None;
+
+    for field in GraphField::ALL {
+        if !form.applies(field) {
+            continue;
+        }
+        let spec = field.spec();
+        if let Some(sec) = spec.section {
+            push_section(&mut lines, sec);
+        }
+        if field == GraphField::PreviewButton {
+            lines.push(Line::from(""));
+        }
+
+        let is_focused = form.field == field;
+        let line_idx = lines.len();
+        if is_focused {
+            focused_line_idx = line_idx;
+        }
+
+        let marker = if is_focused { "▸ " } else { "  " };
+        let label = format!("{:<width$}", field.label(), width = label_col);
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        if field == GraphField::PreviewButton {
+            let btn_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(form.value_text(field), btn_style),
+            ]));
+            continue;
+        }
+
+        if spec.kind.is_text() {
+            let raw = form.text(field).map(String::as_str).unwrap_or("");
+            let (shown_span, cursor_col) = if raw.is_empty() && (!is_focused || !form.editing) {
+                (
+                    Span::styled(
+                        truncate_to_width(spec.placeholder, val_width),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    0,
+                )
+            } else {
+                let cur = if is_focused { form.cursor } else { raw.len() };
+                let (win, col) = window_and_col(raw, cur, val_width);
+                let style = if is_focused {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                (Span::styled(win, style), col)
+            };
+
+            if is_focused {
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
+                cursor_screen_offset = Some((line_idx, x_off));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                shown_span,
+            ]));
+        } else {
+            let val = truncate_to_width(&form.value_text(field), val_width);
+            let val_style = if spec.kind.is_safety() && form.output.allow_tmpfs {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if is_focused {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                Span::styled(val, val_style),
+            ]));
+        }
+
+        let indent = " ".repeat(2 + label_col);
+        if field == GraphField::ClientSecretFile
+            && form.auth == GraphAuth::App
+            && form.client_secret_file.trim().is_empty()
+        {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("{indent}ℹ Client secret prompted in masked modal on Preview/Run"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if field == GraphField::Auth && form.auth == GraphAuth::Device {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("{indent}ℹ Device-code sign-in screen opens on Preview/Run"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if field == GraphField::OutputPath {
+            if let Some(p) = &form.output.output_probe {
+                if let Some(free) = p.free_bytes {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}Free space on target: {}", human_bytes(free)),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+            }
+        } else if matches!(
+            field,
+            GraphField::NotBefore | GraphField::NotAfter | GraphField::ReferenceTime
+        ) {
+            if let Some(hint) = form.utc_hint(field) {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{hint}"),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            if field == GraphField::ReferenceTime {
+                if let Some(stamp) = form.clock.stamp_hint() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}{stamp}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+        }
+
+        if let Some(err) = form.validate_field(field) {
+            let should_show = is_focused
+                || !form.text(field).is_some_and(|t| t.trim().is_empty())
+                || matches!(
+                    field,
+                    GraphField::Mailbox
+                        | GraphField::Tenant
+                        | GraphField::ClientId
+                        | GraphField::TokenFile
+                        | GraphField::OutputPath
+                );
+            if should_show {
+                push_form_error(&mut lines, &indent, &err, inner.width as usize);
+            }
+        }
+        if is_focused {
+            focused_line_idx = lines.len().saturating_sub(1);
+        }
+    }
+
+    finish_form_scroll_and_cursor(
+        frame,
+        inner,
+        lines,
+        focused_line_idx,
+        cursor_screen_offset,
+        app.modal.is_none(),
+    );
+}
+
+fn render_gmail_form(frame: &mut Frame, area: Rect, app: &App) {
+    let form = &app.gmail_form;
+    let block = Block::default()
+        .title(" Google Workspace / Gmail via REST API (dfcollect gmail) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 20 || inner.height < 4 {
+        return;
+    }
+
+    let label_col = 18usize;
+    let val_width = (inner.width as usize).saturating_sub(label_col + 4).max(10);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut focused_line_idx: usize = 0;
+    let mut cursor_screen_offset: Option<(usize, u16)> = None;
+
+    for field in GmailField::ALL {
+        if !form.applies(field) {
+            continue;
+        }
+        let spec = field.spec();
+        if let Some(sec) = spec.section {
+            push_section(&mut lines, sec);
+        }
+        if field == GmailField::PreviewButton {
+            lines.push(Line::from(""));
+        }
+
+        let is_focused = form.field == field;
+        let line_idx = lines.len();
+        if is_focused {
+            focused_line_idx = line_idx;
+        }
+
+        let marker = if is_focused { "▸ " } else { "  " };
+        let label = format!("{:<width$}", field.label(), width = label_col);
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        if field == GmailField::PreviewButton {
+            let btn_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(form.value_text(field), btn_style),
+            ]));
+            continue;
+        }
+
+        if spec.kind.is_text() {
+            let raw = form.text(field).map(String::as_str).unwrap_or("");
+            let (shown_span, cursor_col) = if raw.is_empty() && (!is_focused || !form.editing) {
+                (
+                    Span::styled(
+                        truncate_to_width(spec.placeholder, val_width),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    0,
+                )
+            } else {
+                let cur = if is_focused { form.cursor } else { raw.len() };
+                let (win, col) = window_and_col(raw, cur, val_width);
+                let style = if is_focused {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                (Span::styled(win, style), col)
+            };
+
+            if is_focused {
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
+                cursor_screen_offset = Some((line_idx, x_off));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                shown_span,
+            ]));
+        } else {
+            let val = truncate_to_width(&form.value_text(field), val_width);
+            let val_style = if spec.kind.is_safety() && form.output.allow_tmpfs {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if is_focused {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                Span::styled(val, val_style),
+            ]));
+        }
+
+        let indent = " ".repeat(2 + label_col);
+        if field == GmailField::ClientSecretFile
+            && form.auth == GmailAuth::Installed
+            && form.client_secret_file.trim().is_empty()
+        {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("{indent}ℹ Client secret modal + browser OAuth on Preview/Run"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if field == GmailField::OutputPath {
+            if let Some(p) = &form.output.output_probe {
+                if let Some(free) = p.free_bytes {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}Free space on target: {}", human_bytes(free)),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+            }
+        } else if matches!(
+            field,
+            GmailField::NotBefore | GmailField::NotAfter | GmailField::ReferenceTime
+        ) {
+            if let Some(hint) = form.utc_hint(field) {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{hint}"),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            if field == GmailField::ReferenceTime {
+                if let Some(stamp) = form.clock.stamp_hint() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}{stamp}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+        }
+
+        if let Some(err) = form.validate_field(field) {
+            let should_show = is_focused
+                || !form.text(field).is_some_and(|t| t.trim().is_empty())
+                || matches!(
+                    field,
+                    GmailField::Mailbox
+                        | GmailField::ClientId
+                        | GmailField::KeyFile
+                        | GmailField::TokenFile
+                        | GmailField::OutputPath
+                );
+            if should_show {
+                push_form_error(&mut lines, &indent, &err, inner.width as usize);
+            }
+        }
+        if is_focused {
+            focused_line_idx = lines.len().saturating_sub(1);
+        }
+    }
+
+    finish_form_scroll_and_cursor(
+        frame,
+        inner,
+        lines,
+        focused_line_idx,
+        cursor_screen_offset,
+        app.modal.is_none(),
+    );
+}
+
+fn render_m365_logs_form(frame: &mut Frame, area: Rect, app: &App) {
+    let form = &app.m365_logs_form;
+    let block = Block::default()
+        .title(" Microsoft 365 / Entra Audit & Sign-In Logs (dfcollect m365-logs) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width < 20 || inner.height < 4 {
+        return;
+    }
+
+    let label_col = 18usize;
+    let val_width = (inner.width as usize).saturating_sub(label_col + 4).max(10);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut focused_line_idx: usize = 0;
+    let mut cursor_screen_offset: Option<(usize, u16)> = None;
+
+    for field in M365LogsField::ALL {
+        if !form.applies(field) {
+            continue;
+        }
+        let spec = field.spec();
+        if let Some(sec) = spec.section {
+            push_section(&mut lines, sec);
+        }
+        if field == M365LogsField::StartButton {
+            push_section(
+                &mut lines,
+                "Acquisition Summary (no dry-run preview — queries tenant on Start)",
+            );
+            for line in form.summary_lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    push_wrapped_kv(
+                        &mut lines,
+                        k.trim(),
+                        v.trim(),
+                        Style::default().fg(Color::White),
+                        inner.width as usize,
+                    );
+                }
+            }
+            lines.push(Line::from(""));
+        }
+
+        let is_focused = form.field == field;
+        let line_idx = lines.len();
+        if is_focused {
+            focused_line_idx = line_idx;
+        }
+
+        let marker = if is_focused { "▸ " } else { "  " };
+        let label = format!("{:<width$}", field.label(), width = label_col);
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        if field == M365LogsField::StartButton {
+            let btn_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(form.value_text(field), btn_style),
+            ]));
+            continue;
+        }
+
+        if spec.kind.is_text() {
+            let raw = form.text(field).map(String::as_str).unwrap_or("");
+            let (shown_span, cursor_col) = if raw.is_empty() && (!is_focused || !form.editing) {
+                (
+                    Span::styled(
+                        truncate_to_width(spec.placeholder, val_width),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    0,
+                )
+            } else {
+                let cur = if is_focused { form.cursor } else { raw.len() };
+                let (win, col) = window_and_col(raw, cur, val_width);
+                let style = if is_focused {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                (Span::styled(win, style), col)
+            };
+
+            if is_focused {
+                let x_off = (2 + str_width(&label) + cursor_col) as u16;
+                cursor_screen_offset = Some((line_idx, x_off));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                shown_span,
+            ]));
+        } else {
+            let val = truncate_to_width(&form.value_text(field), val_width);
+            let val_style = if spec.kind.is_safety() && form.output.allow_tmpfs {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if is_focused {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, label_style),
+                Span::styled(label, label_style),
+                Span::styled(val, val_style),
+            ]));
+        }
+
+        let indent = " ".repeat(2 + label_col);
+        if field == M365LogsField::ClientSecretFile
+            && form.auth == GraphAuth::App
+            && form.client_secret_file.trim().is_empty()
+        {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("{indent}ℹ Client secret prompted in masked modal on Start"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if field == M365LogsField::Auth && form.auth == GraphAuth::Device {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(
+                    &format!("{indent}ℹ Device-code sign-in screen opens on Start"),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Cyan),
+            )));
+        } else if field == M365LogsField::OutputPath {
+            if let Some(p) = &form.output.output_probe {
+                if let Some(free) = p.free_bytes {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}Free space on target: {}", human_bytes(free)),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+            }
+        } else if matches!(
+            field,
+            M365LogsField::NotBefore | M365LogsField::NotAfter | M365LogsField::ReferenceTime
+        ) {
+            if let Some(hint) = form.utc_hint(field) {
+                lines.push(Line::from(Span::styled(
+                    format!("{indent}{hint}"),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            if field == M365LogsField::NotAfter {
+                if let Some((start_utc, end_utc)) = form.rounded_utc_window() {
+                    let msg = format!("Rounded UAL window: {start_utc} .. {end_utc}");
+                    let wrap_w = (inner.width as usize).saturating_sub(indent.len()).max(20);
+                    for w in wrap_text(&msg, wrap_w) {
+                        lines.push(Line::from(Span::styled(
+                            format!("{indent}{w}"),
+                            Style::default().fg(Color::Green),
+                        )));
+                    }
+                }
+            }
+            if field == M365LogsField::ReferenceTime {
+                if let Some(stamp) = form.clock.stamp_hint() {
+                    lines.push(Line::from(Span::styled(
+                        format!("{indent}{stamp}"),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            }
+        }
+
+        if let Some(err) = form.validate_field(field) {
+            let should_show = is_focused
+                || !form.text(field).is_some_and(|t| t.trim().is_empty())
+                || matches!(
+                    field,
+                    M365LogsField::Tenant
+                        | M365LogsField::ClientId
+                        | M365LogsField::TokenFile
+                        | M365LogsField::LogSignins
+                        | M365LogsField::LogDirectory
+                        | M365LogsField::LogUal
+                        | M365LogsField::NotBefore
+                        | M365LogsField::NotAfter
+                        | M365LogsField::OutputPath
+                );
+            if should_show {
+                push_form_error(&mut lines, &indent, &err, inner.width as usize);
+            }
+        }
+        if is_focused {
+            focused_line_idx = lines.len().saturating_sub(1);
+        }
+    }
+
+    finish_form_scroll_and_cursor(
+        frame,
+        inner,
+        lines,
+        focused_line_idx,
+        cursor_screen_offset,
+        app.modal.is_none(),
+    );
+}
+
+// ------------------------------------------------------------------
+// 4.2b Full-size Sign-In screen (Device Code & Browser OAuth + PKCE)
+// ------------------------------------------------------------------
+
+fn render_sign_in(frame: &mut Frame, area: Rect, app: &App, sign_in: &SignIn) {
+    let spin = SPINNER[(app.ticks as usize) % SPINNER.len()];
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+
+    match sign_in {
+        SignIn::DeviceCode {
+            message,
+            uri,
+            code,
+            expires_at_ns,
+        } => {
+            let block = Block::default()
+                .title(" Sign-In Required — Device Code ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            let rem_secs = ((*expires_at_ns - now_ns).max(0) / 1_000_000_000) as u64;
+            let rem_str = format_duration(std::time::Duration::from_secs(rem_secs));
+            let wrap_w = inner.width.saturating_sub(4).max(20) as usize;
+
+            let mut lines: Vec<Line> = Vec::new();
+            push_wrapped_bullet(
+                &mut lines,
+                " ! ",
+                sign_in.warning(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                inner.width as usize,
+            );
+            lines.push(Line::from(""));
+
+            lines.push(Line::from(Span::styled(
+                " 1. Open this verification URI in a browser ('u' copies URI via OSC 52):",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for u in wrap_text(uri, wrap_w) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {u}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            lines.push(Line::from(""));
+
+            lines.push(Line::from(Span::styled(
+                " 2. Enter this user code:",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("  {code}  "),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "   ('y' copies code via OSC 52)",
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+            lines.push(Line::from(""));
+
+            for m in wrap_text(message, wrap_w) {
+                lines.push(Line::from(Span::styled(
+                    format!("   {m}"),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            lines.push(Line::from(""));
+
+            lines.push(Line::from(vec![
+                Span::styled(" Time remaining : ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    rem_str,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("   {spin} Polling token endpoint..."),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Press Esc to stop sign-in (nothing has been acquired).",
+                Style::default().fg(Color::Yellow),
+            )));
+
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        SignIn::Browser { url, expires_at_ns } => {
+            let block = Block::default()
+                .title(" Sign-In Required — Browser OAuth + PKCE ")
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::Cyan));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            let rem_secs = ((*expires_at_ns - now_ns).max(0) / 1_000_000_000) as u64;
+            let rem_str = format_duration(std::time::Duration::from_secs(rem_secs));
+            let wrap_w = inner.width.max(20) as usize;
+
+            let mut lines: Vec<Line> = Vec::new();
+            push_wrapped_bullet(
+                &mut lines,
+                " ! ",
+                sign_in.warning(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+                inner.width as usize,
+            );
+            lines.push(Line::from(Span::styled(
+                " Open this URL in a browser ('u' or F2 copies URL via OSC 52):",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for u in wrap_text(url, wrap_w) {
+                lines.push(Line::from(Span::styled(
+                    u,
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(" Time remaining: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    rem_str,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ({spin} waiting for loopback redirect or pasted URL)"),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " Or paste the redirect URL from another device and press Enter:",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+            let input_row_idx = lines.len() as u16;
+            let input_w = inner.width.saturating_sub(5).max(10) as usize;
+            let (win, col) = if app.sign_in_paste.is_empty() {
+                (
+                    truncate_to_width("http://127.0.0.1:.../?code=...&state=...", input_w),
+                    0,
+                )
+            } else {
+                window_and_col(&app.sign_in_paste, app.sign_in_paste_cursor, input_w)
+            };
+            let input_style = if app.sign_in_paste.is_empty() {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " > ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(win, input_style),
+            ]));
+            lines.push(Line::from(Span::styled(
+                " Press Enter to submit pasted URL, or Esc to stop sign-in.",
+                Style::default().fg(Color::Gray),
+            )));
+
+            frame.render_widget(Paragraph::new(lines), inner);
+
+            if app.modal.is_none() {
+                let x = (inner.x + 3 + col as u16).min(inner.x + inner.width.saturating_sub(1));
+                let y = (inner.y + input_row_idx).min(inner.y + inner.height.saturating_sub(1));
+                frame.set_cursor_position(Position::new(x, y));
+            }
+        }
+    }
+}
+
 fn finish_form_scroll_and_cursor(
     frame: &mut Frame,
     inner: Rect,
@@ -1312,6 +2399,20 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
                         format!(
                             " {spin} Connecting to database and estimating sizes ({elapsed})..."
                         )
+                    }
+                    Mode::Imap => {
+                        format!(
+                            " {spin} Connecting to IMAP server and scanning folders ({elapsed})..."
+                        )
+                    }
+                    Mode::Graph => {
+                        format!(" {spin} Querying Microsoft Graph mailbox folders ({elapsed})...")
+                    }
+                    Mode::Gmail => {
+                        format!(" {spin} Listing Gmail messages via API ({elapsed})...")
+                    }
+                    Mode::M365Logs => {
+                        format!(" {spin} Preparing Microsoft 365 log query ({elapsed})...")
                     }
                 }
             };
@@ -1460,6 +2561,15 @@ fn render_preview_ready(frame: &mut Frame, area: Rect, app: &App, data: &Preview
         }
         ModePreview::Db { preview, .. } => {
             render_db_preview_sample(frame, chunks[1], preview, data.scroll);
+        }
+        ModePreview::Imap { preview, .. } => {
+            render_imap_preview_sample(frame, chunks[1], preview, data.scroll);
+        }
+        ModePreview::Graph { preview, .. } => {
+            render_graph_preview_sample(frame, chunks[1], preview, data.scroll);
+        }
+        ModePreview::Gmail { preview, .. } => {
+            render_gmail_preview_sample(frame, chunks[1], preview, data.scroll);
         }
     }
 
@@ -1834,6 +2944,232 @@ fn build_preview_summary_lines(
                 );
             }
         }
+        ModePreview::Imap { preview: pv, .. } => {
+            push_wrapped_field(
+                &mut sum_lines,
+                " Server    : ",
+                &format!("{} (auth: {})", pv.server, pv.auth_method),
+                Style::default().fg(Color::White),
+                width,
+            );
+
+            let skipped_folders = pv.folders.iter().filter(|f| f.skipped.is_some()).count();
+            let active_folders = pv.folders.len().saturating_sub(skipped_folders);
+            push_wrapped_field(
+                &mut sum_lines,
+                " In scope  : ",
+                &format!(
+                    "{} of {} message(s), ~{} across {} folder(s)",
+                    pv.in_scope,
+                    pv.messages,
+                    human_bytes(pv.bytes),
+                    active_folders
+                ),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                width,
+            );
+
+            sum_lines.push(render_target_space_line(
+                pv.target_free,
+                pv.bytes,
+                pv.short_of_space(),
+            ));
+
+            let oos_total: u64 = pv.out_of_scope.values().sum();
+            let oos_reasons: Vec<String> = pv
+                .out_of_scope
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            let oos_summary = if oos_reasons.is_empty() {
+                format!("0 messages ({skipped_folders} skipped folder(s))")
+            } else {
+                format!(
+                    "{oos_total} ({}) | {skipped_folders} skipped folder(s)",
+                    oos_reasons.join("; ")
+                )
+            };
+            push_wrapped_field(
+                &mut sum_lines,
+                " Excluded  : ",
+                &oos_summary,
+                Style::default().fg(Color::Yellow),
+                width,
+            );
+
+            if let Some(stopped) = &pv.stopped {
+                push_wrapped_field(
+                    &mut sum_lines,
+                    " Stopped   : ",
+                    stopped,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    width,
+                );
+            }
+
+            sum_lines.push(Line::from(vec![
+                Span::styled(" Time basis: ", Style::default().fg(Color::Gray)),
+                Span::styled("IMAP INTERNALDATE", Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        ModePreview::Graph { preview: pv, args } => {
+            let cloud =
+                GraphCloud::from_endpoints(&args.conn.graph_endpoint, &args.conn.login_endpoint);
+            push_wrapped_field(
+                &mut sum_lines,
+                " Mailbox   : ",
+                &format!(
+                    "{} (auth: {}, tenant: {}, cloud: {})",
+                    pv.account,
+                    pv.auth_method,
+                    args.conn.tenant,
+                    cloud.label()
+                ),
+                Style::default().fg(Color::White),
+                width,
+            );
+
+            let skipped_folders = pv.folders.iter().filter(|f| f.skipped.is_some()).count();
+            let active_folders = pv.folders.len().saturating_sub(skipped_folders);
+            push_wrapped_field(
+                &mut sum_lines,
+                " In scope  : ",
+                &format!(
+                    "{} of {} message(s) (~{}) across {} folder(s)",
+                    pv.in_scope,
+                    pv.messages,
+                    human_bytes(pv.bytes),
+                    active_folders
+                ),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                width,
+            );
+
+            sum_lines.push(render_target_space_line(
+                pv.target_free,
+                pv.bytes,
+                pv.short_of_space(),
+            ));
+
+            let oos_total: u64 = pv.out_of_scope.values().sum();
+            let oos_reasons: Vec<String> = pv
+                .out_of_scope
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            let oos_summary = if oos_reasons.is_empty() {
+                format!("0 messages ({skipped_folders} skipped folder(s))")
+            } else {
+                format!(
+                    "{oos_total} ({}) | {skipped_folders} skipped folder(s)",
+                    oos_reasons.join("; ")
+                )
+            };
+            push_wrapped_field(
+                &mut sum_lines,
+                " Excluded  : ",
+                &oos_summary,
+                Style::default().fg(Color::Yellow),
+                width,
+            );
+
+            if let Some(stopped) = &pv.stopped {
+                push_wrapped_field(
+                    &mut sum_lines,
+                    " Stopped   : ",
+                    stopped,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    width,
+                );
+            }
+
+            push_wrapped_field(
+                &mut sum_lines,
+                " Time basis: ",
+                "receivedDateTime (fallback: sentDateTime, createdDateTime)",
+                Style::default().fg(Color::Cyan),
+                width,
+            );
+        }
+        ModePreview::Gmail { preview: pv, .. } => {
+            push_wrapped_field(
+                &mut sum_lines,
+                " Account   : ",
+                &format!("{} (auth: {})", pv.account, pv.auth_method),
+                Style::default().fg(Color::White),
+                width,
+            );
+
+            push_wrapped_field(
+                &mut sum_lines,
+                " In scope  : ",
+                &format!(
+                    "{} of {} message(s), ~{}{}",
+                    pv.in_scope,
+                    pv.messages,
+                    human_bytes(pv.bytes),
+                    if pv.errors > 0 {
+                        format!(" ({} error(s))", pv.errors)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                width,
+            );
+
+            sum_lines.push(render_target_space_line(
+                pv.target_free,
+                pv.bytes,
+                pv.short_of_space(),
+            ));
+
+            let oos_total: u64 = pv.out_of_scope.values().sum();
+            let oos_reasons: Vec<String> = pv
+                .out_of_scope
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect();
+            let oos_summary = if oos_reasons.is_empty() {
+                "0 messages".to_string()
+            } else {
+                format!("{oos_total} ({})", oos_reasons.join("; "))
+            };
+            push_wrapped_field(
+                &mut sum_lines,
+                " Excluded  : ",
+                &oos_summary,
+                Style::default().fg(Color::Yellow),
+                width,
+            );
+
+            if let Some(stopped) = &pv.stopped {
+                push_wrapped_field(
+                    &mut sum_lines,
+                    " Stopped   : ",
+                    stopped,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    width,
+                );
+            }
+
+            sum_lines.push(Line::from(vec![
+                Span::styled(" Time basis: ", Style::default().fg(Color::Gray)),
+                Span::styled("Gmail internalDate", Style::default().fg(Color::Cyan)),
+            ]));
+        }
     }
 
     sum_lines
@@ -2081,6 +3417,209 @@ fn render_db_preview_sample(
     frame.render_widget(Paragraph::new(visible), db_inner);
 }
 
+fn render_imap_preview_sample(
+    frame: &mut Frame,
+    sample_area: Rect,
+    pv: &crate::mail::ImapPreview,
+    scroll: usize,
+) {
+    let block = Block::default()
+        .title(format!(
+            " IMAP folders ({}) (↑/↓/PgUp/PgDn) ",
+            pv.folders.len()
+        ))
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(sample_area);
+    frame.render_widget(block, sample_area);
+
+    let mut lines = Vec::new();
+    for f in &pv.folders {
+        let (tag, col, suffix) = match &f.skipped {
+            Some(reason) => (
+                " [skipped] ",
+                Color::DarkGray,
+                format!(" ({reason}, {} msgs)", f.messages),
+            ),
+            None => (
+                " [folder]  ",
+                Color::Green,
+                format!(
+                    " ({}/{} msgs, ~{})",
+                    f.in_scope,
+                    f.messages,
+                    human_bytes(f.bytes)
+                ),
+            ),
+        };
+        let row_w = str_width(tag) + str_width(&f.name) + str_width(&suffix);
+        if row_w <= inner.width as usize {
+            lines.push(Line::from(vec![
+                Span::styled(tag, Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    f.name.clone(),
+                    Style::default().fg(if f.skipped.is_some() {
+                        Color::DarkGray
+                    } else {
+                        Color::White
+                    }),
+                ),
+                Span::styled(suffix, Style::default().fg(Color::Gray)),
+            ]));
+        } else {
+            push_wrapped_bullet(
+                &mut lines,
+                tag,
+                &format!("{}{suffix}", f.name),
+                Style::default().fg(if f.skipped.is_some() {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                }),
+                inner.width as usize,
+            );
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no folders returned)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(scroll)
+        .take(inner.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn render_graph_preview_sample(
+    frame: &mut Frame,
+    sample_area: Rect,
+    pv: &crate::graph::GraphPreview,
+    scroll: usize,
+) {
+    let block = Block::default()
+        .title(format!(
+            " Mailbox folders ({}) (↑/↓/PgUp/PgDn) ",
+            pv.folders.len()
+        ))
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(sample_area);
+    frame.render_widget(block, sample_area);
+
+    let mut lines = Vec::new();
+    for f in &pv.folders {
+        let is_recov = f.path.starts_with("RecoverableItems");
+        let (tag, col) = if f.skipped.is_some() {
+            (" [skipped]  ", Color::DarkGray)
+        } else if is_recov {
+            (" [recov]    ", Color::Yellow)
+        } else {
+            (" [in scope] ", Color::Green)
+        };
+        let total_str = f
+            .messages
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let suffix = match &f.skipped {
+            Some(reason) => format!(" ({reason}, {total_str} total)"),
+            None => format!(
+                " ({}/{total_str} msgs, ~{})",
+                f.in_scope,
+                human_bytes(f.bytes)
+            ),
+        };
+        let row_w = str_width(tag) + str_width(&f.path) + str_width(&suffix);
+        if row_w <= inner.width as usize {
+            lines.push(Line::from(vec![
+                Span::styled(tag, Style::default().fg(col).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    f.path.clone(),
+                    Style::default().fg(if f.skipped.is_some() {
+                        Color::DarkGray
+                    } else {
+                        Color::White
+                    }),
+                ),
+                Span::styled(suffix, Style::default().fg(Color::Gray)),
+            ]));
+        } else {
+            push_wrapped_bullet(
+                &mut lines,
+                tag,
+                &format!("{}{suffix}", f.path),
+                Style::default().fg(if f.skipped.is_some() {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                }),
+                inner.width as usize,
+            );
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no mailbox folders returned)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(scroll)
+        .take(inner.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
+fn render_gmail_preview_sample(
+    frame: &mut Frame,
+    sample_area: Rect,
+    pv: &crate::gmail::GmailPreview,
+    scroll: usize,
+) {
+    let block = Block::default()
+        .title(format!(
+            " In-scope label breakdown ({} labels) (↑/↓/PgUp/PgDn) ",
+            pv.by_label.len()
+        ))
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(sample_area);
+    frame.render_widget(block, sample_area);
+
+    let mut lines = Vec::new();
+    for (label, (count, bytes)) in &pv.by_label {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " [label] ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(label.clone(), Style::default().fg(Color::White)),
+            Span::styled(
+                format!(" ({count} message(s), ~{})", human_bytes(*bytes)),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (no in-scope messages matched)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(scroll)
+        .take(inner.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), inner);
+}
+
 // ------------------------------------------------------------------
 // 4.4 Running screen
 // ------------------------------------------------------------------
@@ -2120,6 +3659,7 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
         .split(inner);
 
     let phase = run.progress.phase();
+    let entries_done = run.progress.entries.load(Ordering::Relaxed);
     let files_done = run.progress.files.load(Ordering::Relaxed);
     let items_total = run.progress.items_total.load(Ordering::Relaxed);
     let bytes_done = run.progress.bytes.load(Ordering::Relaxed);
@@ -2133,20 +3673,24 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
     let style_active = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
+    let style_waiting = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let style_done = Style::default().fg(Color::Green);
     let style_pending = Style::default().fg(Color::DarkGray);
 
     let (s_copy, s_check, s_fin) = match phase {
-        Phase::Listing | Phase::Copying | Phase::SigningIn | Phase::Waiting => {
+        Phase::Waiting => (style_waiting, style_pending, style_pending),
+        Phase::Listing | Phase::Copying | Phase::SigningIn => {
             (style_active, style_pending, style_pending)
         }
         Phase::CheckingContainer => (style_done, style_active, style_pending),
         Phase::Finishing | Phase::Done => (style_done, style_done, style_active),
     };
-    let copy_label = if !stage.is_empty() {
-        format!("1. Copying ({stage})")
-    } else {
-        "1. Copying".to_string()
+    let copy_label = match phase {
+        Phase::Waiting => "1. Waiting",
+        Phase::SigningIn => "1. Signing in",
+        _ => "1. Copying",
     };
     let phase_line = Line::from(vec![
         Span::raw(" Phase: "),
@@ -2166,7 +3710,21 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::White),
         ),
     ]);
-    frame.render_widget(Paragraph::new(vec![phase_line, target_line]), chunks[0]);
+    let mut header_lines = vec![phase_line, target_line];
+    if !stage.is_empty() {
+        header_lines.push(Line::from(vec![
+            Span::styled(" Stage : ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                truncate_to_width(&stage, inner.width.saturating_sub(10) as usize),
+                if phase == Phase::Waiting {
+                    style_waiting
+                } else {
+                    style_active
+                },
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
 
     // 2. Progress gauge
     let eff_total_items = if items_total > 0 {
@@ -2175,7 +3733,37 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
         run.expected_files
     };
     let (ratio, label) = match phase {
-        Phase::Listing | Phase::Copying | Phase::SigningIn | Phase::Waiting => {
+        Phase::Waiting => {
+            let r = if run.expected_bytes > 0 {
+                (bytes_done as f64 / run.expected_bytes as f64).clamp(0.0, 1.0)
+            } else if eff_total_items > 0 {
+                (files_done as f64 / eff_total_items as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let wait_label = if run.mode == Mode::M365Logs {
+                if eff_total_items > 0 {
+                    format!(
+                        "Waiting for the audit log query ({files_done} of {eff_total_items} logs)"
+                    )
+                } else {
+                    "Waiting for the audit log query".to_string()
+                }
+            } else {
+                let wait_desc = if stage.is_empty() {
+                    "remote query / rate limit backoff".to_string()
+                } else {
+                    stage.clone()
+                };
+                format!(
+                    "Waiting: {} ({files_done} items, {})",
+                    wait_desc,
+                    human_bytes(bytes_done)
+                )
+            };
+            (r, wait_label)
+        }
+        Phase::Listing | Phase::Copying | Phase::SigningIn => {
             if run.expected_bytes > 0 {
                 let r = (bytes_done as f64 / run.expected_bytes as f64).clamp(0.0, 1.0);
                 (
@@ -2221,15 +3809,17 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
         Phase::Finishing | Phase::Done => (1.0, "Closing manifest and audit records...".into()),
     };
 
+    let gauge_title = if run.mode == Mode::M365Logs {
+        " Progress "
+    } else {
+        " Progress (preview size is an estimate) "
+    };
+    let gauge_label = truncate_to_width(&label, inner.width.saturating_sub(4) as usize);
     let gauge = Gauge::default()
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Progress (preview size is an estimate) "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(gauge_title))
         .gauge_style(
             Style::default()
-                .fg(if run.stop_requested {
+                .fg(if run.stop_requested || phase == Phase::Waiting {
                     Color::Yellow
                 } else {
                     Color::Cyan
@@ -2237,7 +3827,7 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
                 .bg(Color::Black),
         )
         .ratio(ratio)
-        .label(label);
+        .label(gauge_label);
     frame.render_widget(gauge, chunks[1]);
 
     // 3. Telemetry lines
@@ -2257,25 +3847,63 @@ fn render_running(frame: &mut Frame, area: Rect, app: &App) {
         truncate_to_width(&current, inner.width.saturating_sub(18) as usize)
     };
 
-    let mut details = vec![
-        Line::from(format!(
-            " Files acquired : {files_done} / {}",
-            eff_total_items
-        )),
-        Line::from(format!(
-            " Bytes copied   : {} (estimate: {})",
-            human_bytes(bytes_done),
-            human_bytes(run.expected_bytes)
-        )),
-        Line::from(format!(" Out of scope   : {oos}    Errors: {errs}")),
-        Line::from(format!(
-            " Rate (5s avg)  : {rate_str}    Elapsed: {elapsed_str}    ETA: {eta_str}"
-        )),
-        Line::from(vec![
-            Span::styled(" Current item   : ", Style::default().fg(Color::Gray)),
-            Span::styled(shown_cur, Style::default().fg(Color::White)),
-        ]),
-    ];
+    let mut details = if run.mode == Mode::M365Logs {
+        vec![
+            Line::from(format!(
+                " Logs           : {files_done} of {eff_total_items}"
+            )),
+            Line::from(format!(" Records        : {entries_done}")),
+            Line::from(format!(
+                " Bytes written  : {} (no dry-run preview)",
+                human_bytes(bytes_done)
+            )),
+            Line::from(format!(" Elapsed        : {elapsed_str}    Errors: {errs}")),
+            Line::from(vec![
+                Span::styled(" Current item   : ", Style::default().fg(Color::Gray)),
+                Span::styled(shown_cur, Style::default().fg(Color::White)),
+            ]),
+        ]
+    } else {
+        let bytes_line = if run.expected_bytes > 0 {
+            format!(
+                " Bytes copied   : {} (estimate: {})",
+                human_bytes(bytes_done),
+                human_bytes(run.expected_bytes)
+            )
+        } else {
+            format!(" Bytes copied   : {}", human_bytes(bytes_done))
+        };
+        vec![
+            Line::from(format!(
+                " Files acquired : {files_done} / {eff_total_items}"
+            )),
+            Line::from(bytes_line),
+            Line::from(format!(" Out of scope   : {oos}    Errors: {errs}")),
+            Line::from(format!(
+                " Rate (5s avg)  : {rate_str}    Elapsed: {elapsed_str}    ETA: {eta_str}"
+            )),
+            Line::from(vec![
+                Span::styled(" Current item   : ", Style::default().fg(Color::Gray)),
+                Span::styled(shown_cur, Style::default().fg(Color::White)),
+            ]),
+        ]
+    };
+    if phase == Phase::Waiting {
+        let wait_msg = if stage.is_empty() {
+            "Waiting: remote query / rate limit backoff".to_string()
+        } else {
+            format!("Waiting: {stage}")
+        };
+        push_wrapped_bullet(
+            &mut details,
+            " ",
+            &wait_msg,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            inner.width as usize,
+        );
+    }
     if run.stop_requested {
         details.push(Line::from(Span::styled(
             " Stopping acquisition — closing collection as aborted...",
@@ -2412,6 +4040,17 @@ fn render_result(frame: &mut Frame, area: Rect, app: &App) {
             res.acquired,
             human_bytes(res.bytes)
         ),
+        Mode::Imap | Mode::Graph | Mode::Gmail => format!(
+            "{} message(s); {} total in container",
+            res.acquired,
+            human_bytes(res.bytes)
+        ),
+        Mode::M365Logs => format!(
+            "{} log(s), {} record(s); {} total in container",
+            res.acquired,
+            res.records.unwrap_or(0),
+            human_bytes(res.bytes)
+        ),
     };
     push_wrapped_field(
         &mut top,
@@ -2438,10 +4077,14 @@ fn render_result(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     for (k, v) in &res.summary_kv {
+        let (display_k, display_v) = match crate::tui::app::format_summary_kv_pair(k, v) {
+            Some((dk, dv)) => (dk, dv),
+            None => continue,
+        };
         push_wrapped_kv(
             &mut top,
-            k,
-            v,
+            &display_k,
+            &display_v,
             Style::default().fg(Color::Cyan),
             inner.width as usize,
         );
@@ -2459,26 +4102,25 @@ fn render_result(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::White),
         inner.width as usize,
     );
-    top.push(Line::from(Span::styled(
-        " Audit anchor:",
-        Style::default().fg(Color::Gray),
-    )));
-    top.push(Line::from(Span::styled(
-        format!(
-            " {}",
-            res.audit_anchor
-                .as_deref()
-                .unwrap_or("none (audit log unavailable)")
-        ),
-        Style::default().fg(Color::Cyan),
-    )));
-    push_wrapped_field(
-        &mut top,
-        " Command     : ",
-        &shell_quote(&res.argv),
-        Style::default().fg(Color::DarkGray),
-        inner.width as usize,
-    );
+    let anchor_str = res
+        .audit_anchor
+        .as_deref()
+        .unwrap_or("none (audit log unavailable)");
+    if 15 + str_width(anchor_str) <= inner.width as usize {
+        top.push(Line::from(vec![
+            Span::styled(" Audit anchor: ", Style::default().fg(Color::Gray)),
+            Span::styled(anchor_str.to_string(), Style::default().fg(Color::Cyan)),
+        ]));
+    } else {
+        top.push(Line::from(Span::styled(
+            " Audit anchor:",
+            Style::default().fg(Color::Gray),
+        )));
+        top.push(Line::from(Span::styled(
+            format!(" {anchor_str}"),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
     if let Some(fatal) = &res.fatal_error {
         push_wrapped_field(
             &mut top,
@@ -2488,11 +4130,42 @@ fn render_result(frame: &mut Frame, area: Rect, app: &App) {
             inner.width as usize,
         );
     }
+    let min_prob_h = 6.min(inner.height.saturating_sub(4));
+    let max_top = inner.height.saturating_sub(min_prob_h) as usize;
+    let avail_cmd_rows = max_top.saturating_sub(top.len()).max(1);
+    let mut cmd_lines = Vec::new();
+    push_wrapped_field(
+        &mut cmd_lines,
+        " Command     : ",
+        &shell_quote(&res.argv),
+        Style::default().fg(Color::DarkGray),
+        inner.width as usize,
+    );
+    if cmd_lines.len() <= avail_cmd_rows {
+        top.extend(cmd_lines);
+    } else if avail_cmd_rows >= 2 {
+        top.extend(cmd_lines.into_iter().take(avail_cmd_rows - 1));
+        top.push(Line::from(Span::styled(
+            "               … (press 'c' to copy full command)",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        let marker = " … ('c' copy)";
+        let room = (inner.width as usize)
+            .saturating_sub(15 + str_width(marker))
+            .max(8);
+        let short_cmd = truncate_to_width(&shell_quote(&res.argv), room);
+        top.push(Line::from(vec![
+            Span::styled(" Command     : ", Style::default().fg(Color::Gray)),
+            Span::styled(short_cmd, Style::default().fg(Color::DarkGray)),
+            Span::styled(marker, Style::default().fg(Color::Yellow)),
+        ]));
+    }
 
-    let top_h = (top.len() as u16).min(inner.height.saturating_sub(3));
+    let top_h = (top.len() as u16).min(max_top as u16);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(top_h), Constraint::Min(3)])
+        .constraints([Constraint::Length(top_h), Constraint::Min(min_prob_h)])
         .split(inner);
 
     frame.render_widget(Paragraph::new(top), chunks[0]);
@@ -3058,6 +4731,42 @@ fn render_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     format!(" {action} Database Name (--database) "),
                     " Database name to dump (leave list empty to dump all non-system databases):",
                 ),
+                ListTarget::ImapInclude => (
+                    format!(" {action} Include Folder Glob (--include) "),
+                    " Folder glob (* and ? within a segment, ** across folders, e.g. INBOX*):",
+                ),
+                ListTarget::ImapExclude => (
+                    format!(" {action} Exclude Folder Glob (--exclude) "),
+                    " Folder glob (* and ? within a segment, ** across folders, e.g. Trash*):",
+                ),
+                ListTarget::GraphInclude => (
+                    format!(" {action} Include Folder Glob (--include) "),
+                    " Folder path glob (e.g. Inbox, Inbox/**, Sent Items):",
+                ),
+                ListTarget::GraphExclude => (
+                    format!(" {action} Exclude Folder Glob (--exclude) "),
+                    " Folder path glob (e.g. Junk Email, Conversation History/**):",
+                ),
+                ListTarget::GmailInclude => (
+                    format!(" {action} Include Label Glob (--include) "),
+                    " Gmail label glob (e.g. INBOX, SENT, Finance/*):",
+                ),
+                ListTarget::GmailExclude => (
+                    format!(" {action} Exclude Label Glob (--exclude) "),
+                    " Gmail label glob (e.g. SPAM, TRASH, CATEGORY_PROMOTIONS):",
+                ),
+                ListTarget::M365Users => (
+                    format!(" {action} User Principal Name Filter (--user) "),
+                    " UPN filter for sign-ins and UAL UserIds (e.g. alice@contoso.example):",
+                ),
+                ListTarget::M365RecordTypes => (
+                    format!(" {action} UAL RecordType Filter (--record-type) "),
+                    " Purview UAL RecordType name or numeric ID (e.g. ExchangeItem, AzureActiveDirectory):",
+                ),
+                ListTarget::M365Operations => (
+                    format!(" {action} UAL Operations Filter (--operation) "),
+                    " Purview UAL Operations name (e.g. MailItemsAccessed, FileDownloaded):",
+                ),
             };
             let block = Block::default()
                 .title(title)
@@ -3107,27 +4816,19 @@ fn render_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
             frame.set_cursor_position(Position::new(x, y));
         }
         Modal::ConfirmStart => {
-            let rect = centered_rect(72, 15, area);
-            frame.render_widget(Clear, rect);
-            let block = Block::default()
-                .title(" Confirm Acquisition Start ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green));
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-
+            let modal_w = 76.min(area.width.saturating_sub(2));
+            let inner_w = modal_w.saturating_sub(2) as usize;
+            let val_style = Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
             let mut lines = Vec::new();
-            if let Some(PreviewState::Ready(data)) = &app.preview_state {
+            if app.screen == Screen::M365LogsForm || app.active_mode == Mode::M365Logs {
+                for (k, v) in confirm_start_m365_logs_lines(app) {
+                    push_wrapped_kv(&mut lines, &k, &v, val_style, inner_w);
+                }
+            } else if let Some(PreviewState::Ready(data)) = &app.preview_state {
                 for (k, v) in confirm_start_lines(app, data) {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" {:<18}: ", k), Style::default().fg(Color::Gray)),
-                        Span::styled(
-                            truncate_to_width(&v, inner.width.saturating_sub(22) as usize),
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
+                    push_wrapped_kv(&mut lines, &k, &v, val_style, inner_w);
                 }
                 if data.mode_preview.short_of_space() {
                     lines.push(Line::from(Span::styled(
@@ -3143,10 +4844,19 @@ fn render_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             )));
+            let modal_h = (lines.len() as u16 + 2).clamp(10, area.height.saturating_sub(2));
+            let rect = centered_rect(modal_w, modal_h, area);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .title(" Confirm Acquisition Start ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
             frame.render_widget(Paragraph::new(lines), inner);
         }
         Modal::ConfirmStop => {
-            let rect = centered_rect(64, 8, area);
+            let rect = centered_rect(70, 9, area);
             frame.render_widget(Clear, rect);
             let block = Block::default()
                 .title(" Stop Acquisition? ")
@@ -3155,17 +4865,59 @@ fn render_modal(frame: &mut Frame, area: Rect, app: &App, modal: &Modal) {
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
 
+            let is_m365_logs = app
+                .run_state
+                .as_ref()
+                .is_some_and(|r| r.mode == Mode::M365Logs);
+            let lines = if is_m365_logs {
+                vec![
+                    Line::from(" The query keeps running in the tenant; stop waiting and"),
+                    Line::from(" close the collection as aborted?"),
+                    Line::from(" Records fetched so far are kept and verifiable (exit 8)."),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " [y] Stop acquisition     [n / Esc] Continue running",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .alignment(Alignment::Left),
+                ]
+            } else {
+                vec![
+                    Line::from(" Stop the acquisition? The collection is closed as aborted."),
+                    Line::from(" Everything acquired so far is recorded and verifiable (exit 8)."),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        " [y] Stop acquisition     [n / Esc] Continue running",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .alignment(Alignment::Left),
+                ]
+            };
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        Modal::ConfirmStopSignIn => {
+            let rect = centered_rect(64, 7, area);
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .title(" Stop Sign-In? ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+
             let lines = vec![
-                Line::from(" Stop the acquisition? The collection is closed as aborted."),
-                Line::from(" Everything acquired so far is recorded and verifiable (exit 8)."),
+                Line::from(" Stop signing in? Nothing has been acquired."),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " [y] Stop acquisition     [n / Esc] Continue running",
+                    " [y] Stop signing in     [n / Esc] Continue waiting",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
-                ))
-                .alignment(Alignment::Left),
+                )),
             ];
             frame.render_widget(Paragraph::new(lines), inner);
         }
@@ -3243,13 +4995,20 @@ mod tests {
     use crate::{
         cloud::CloudPreview,
         common::{Progress, Stop},
-        console::{Console, SecretAsk},
+        console::{Console, SecretAsk, SignIn},
         db::{DbPreview, Engine},
         files::{Preview, SampleEntry},
+        gmail::GmailPreview,
+        graph::{GraphFolderPreview, GraphPreview},
         ingest::IngestPreview,
+        mail::{FolderPreview, ImapPreview},
         tui::{
             app::{ResultData, RunState, SecretModal, TuiConsole},
-            command::{parse_cloud_argv, parse_db_argv, parse_files_argv, parse_ingest_argv},
+            command::{
+                gmail_argv, graph_argv, imap_argv, m365_logs_argv, parse_cloud_argv, parse_db_argv,
+                parse_files_argv, parse_gmail_argv, parse_graph_argv, parse_imap_argv,
+                parse_ingest_argv,
+            },
             form::{OutputProbe, PackageProbe, RcloneRemote, SourceProbe},
             mounts::MountChoice,
         },
@@ -3334,7 +5093,10 @@ mod tests {
             assert!(home_out.contains("Provider delivery package"));
             assert!(home_out.contains("Cloud / remote storage (rclone)"));
             assert!(home_out.contains("Database dump (PostgreSQL / MariaDB)"));
-            assert!(home_out.contains("command line only"));
+            assert!(home_out.contains("IMAP mailbox"));
+            assert!(home_out.contains("Microsoft 365 mailbox (Graph)"));
+            assert!(home_out.contains("Gmail / Google Workspace mailbox"));
+            assert!(home_out.contains("Microsoft 365 tenant audit logs"));
             assert!(!home_out.lines().next_back().unwrap().ends_with('…'));
 
             // 2. FilesForm screen
@@ -3440,6 +5202,7 @@ mod tests {
                 collection: PathBuf::from("/media/target/sdc1/VG_12345_26/share01"),
                 argv,
                 acquired: 48,
+                records: None,
                 bytes: 10 * 1024 * 1024,
                 out_of_scope_listed: 0,
                 out_of_scope_counted: 14,
@@ -3835,6 +5598,7 @@ mod tests {
             collection: PathBuf::from("/tmp/case/out/dfcollect-cloud-sub-01"),
             argv: cl_argv,
             acquired: 2,
+            records: None,
             bytes: 4837,
             out_of_scope_listed: 0,
             out_of_scope_counted: 0,
@@ -3865,5 +5629,389 @@ mod tests {
             res_out.contains("-o /tmp/case/out") && res_out.contains("local-test:sub"),
             "result Command must wrap so -o and remote source are visible at 80x24:\n{res_out}"
         );
+    }
+
+    #[test]
+    fn renders_imap_graph_gmail_m365_logs_and_sign_in_at_80x24_and_120x40() {
+        static STOP: Stop = Stop::new();
+        let mut app = invented_app(&STOP);
+
+        // Configure ImapForm
+        app.imap_form.case.case = "VG 12345/26".into();
+        app.imap_form.case.evidence = "imap01".into();
+        app.imap_form.case.examiner = "KHK Muster".into();
+        app.imap_form.server = "mail.example.org".into();
+        app.imap_form.user = "alice@example.org".into();
+        app.imap_form
+            .output
+            .update_suggestion(&app.imap_form.case.case, &app.imap_form.case.evidence);
+
+        // Configure GraphForm
+        app.graph_form.case.case = "VG 12345/26".into();
+        app.graph_form.case.evidence = "m365-alice".into();
+        app.graph_form.case.examiner = "KHK Muster".into();
+        app.graph_form.tenant = "contoso.example".into();
+        app.graph_form.mailbox = "alice@contoso.example".into();
+        app.graph_form.client_id = "00000000-0000-0000-0000-000000000001".into();
+        app.graph_form
+            .output
+            .update_suggestion(&app.graph_form.case.case, &app.graph_form.case.evidence);
+
+        // Configure GmailForm
+        app.gmail_form.case.case = "VG 12345/26".into();
+        app.gmail_form.case.evidence = "gmail-alice".into();
+        app.gmail_form.case.examiner = "KHK Muster".into();
+        app.gmail_form.mailbox = "alice@example.org".into();
+        app.gmail_form.client_id = "123456.apps.googleusercontent.com".into();
+        app.gmail_form.client_secret_file = "/media/evidence/sdb1/client-secret.txt".into();
+        app.gmail_form
+            .output
+            .update_suggestion(&app.gmail_form.case.case, &app.gmail_form.case.evidence);
+
+        // Configure M365LogsForm
+        app.m365_logs_form.case.case = "VG 12345/26".into();
+        app.m365_logs_form.case.evidence = "m365-logs".into();
+        app.m365_logs_form.case.examiner = "KHK Muster".into();
+        app.m365_logs_form.tenant = "contoso.example".into();
+        app.m365_logs_form.client_id = "00000000-0000-0000-0000-000000000001".into();
+        app.m365_logs_form.not_before = "2026-04-01T09:15:00Z".into();
+        app.m365_logs_form.not_after = "2026-04-07T18:30:00Z".into();
+        app.m365_logs_form.users = vec!["alice@contoso.example".into()];
+        app.m365_logs_form.record_types = vec!["ExchangeItem".into()];
+        app.m365_logs_form.operations = vec!["MailItemsAccessed".into()];
+        app.m365_logs_form.output.update_suggestion(
+            &app.m365_logs_form.case.case,
+            &app.m365_logs_form.case.evidence,
+        );
+
+        for (w, h) in [(80u16, 24u16), (120u16, 40u16)] {
+            // 1. ImapForm
+            app.screen = Screen::ImapForm;
+            app.imap_form.set_focus(ImapField::Server);
+            let imap_form_out = render_to_string(&app, w, h);
+            assert!(imap_form_out.contains("[IMAP]"));
+            assert!(imap_form_out.contains("mail.example.org"));
+            assert!(imap_form_out.contains("alice@example.org"));
+            assert!(!imap_form_out.lines().next_back().unwrap().ends_with('…'));
+
+            // 2. Imap Preview
+            let im_argv = imap_argv(&app.imap_form);
+            let im_args = parse_imap_argv(&im_argv).unwrap();
+            app.preview_state = Some(PreviewState::Ready(Box::new(PreviewData {
+                mode_preview: ModePreview::Imap {
+                    preview: ImapPreview {
+                        server: "imaps://mail.example.org:993".into(),
+                        auth_method: "password".into(),
+                        folders: vec![
+                            FolderPreview {
+                                name: "INBOX".into(),
+                                messages: 15,
+                                in_scope: 12,
+                                bytes: 240_000,
+                                skipped: None,
+                            },
+                            FolderPreview {
+                                name: "Sent".into(),
+                                messages: 5,
+                                in_scope: 5,
+                                bytes: 110_000,
+                                skipped: None,
+                            },
+                            FolderPreview {
+                                name: "Trash".into(),
+                                messages: 9,
+                                in_scope: 0,
+                                bytes: 0,
+                                skipped: Some("excluded".into()),
+                            },
+                        ],
+                        messages: 20,
+                        in_scope: 17,
+                        bytes: 350_000,
+                        out_of_scope: BTreeMap::from([("before --after".into(), 3)]),
+                        target_free: Some(500 << 30),
+                        stopped: None,
+                        at_ns: 1_776_000_000_000_000_000,
+                    },
+                    args: Box::new(im_args),
+                },
+                argv: im_argv,
+                scroll: 0,
+                copied_osc52: false,
+            })));
+            app.screen = Screen::Preview;
+            let imap_prev_out = render_to_string(&app, w, h);
+            assert!(imap_prev_out.contains("imaps://mail.example.org:993"));
+            assert!(imap_prev_out.contains("17 of 20 message(s)"));
+            assert!(imap_prev_out.contains("INBOX"));
+            assert!(imap_prev_out.contains("IMAP INTERNALDATE"));
+
+            // 3. GraphForm
+            app.screen = Screen::GraphForm;
+            app.graph_form.set_focus(GraphField::Tenant);
+            let graph_form_out = render_to_string(&app, w, h);
+            assert!(graph_form_out.contains("[Graph]"));
+            assert!(graph_form_out.contains("contoso.example"));
+            assert!(graph_form_out.contains("alice@contoso.example"));
+            assert!(!graph_form_out.lines().next_back().unwrap().ends_with('…'));
+
+            // 4. Graph Preview
+            let gr_argv = graph_argv(&app.graph_form);
+            let gr_args = parse_graph_argv(&gr_argv).unwrap();
+            app.preview_state = Some(PreviewState::Ready(Box::new(PreviewData {
+                mode_preview: ModePreview::Graph {
+                    preview: GraphPreview {
+                        account: "alice@contoso.example".into(),
+                        auth_method: "device-code".into(),
+                        folders: vec![
+                            GraphFolderPreview {
+                                path: "Inbox".into(),
+                                messages: Some(40),
+                                in_scope: 38,
+                                bytes: 2 * 1024 * 1024,
+                                skipped: None,
+                            },
+                            GraphFolderPreview {
+                                path: "RecoverableItemsDeletions".into(),
+                                messages: Some(4),
+                                in_scope: 4,
+                                bytes: 128 * 1024,
+                                skipped: None,
+                            },
+                        ],
+                        messages: 44,
+                        in_scope: 42,
+                        bytes: 2 * 1024 * 1024 + 128 * 1024,
+                        out_of_scope: BTreeMap::new(),
+                        target_free: Some(500 << 30),
+                        stopped: None,
+                        at_ns: 1_776_000_000_000_000_000,
+                    },
+                    args: Box::new(gr_args),
+                },
+                argv: gr_argv,
+                scroll: 0,
+                copied_osc52: false,
+            })));
+            app.screen = Screen::Preview;
+            let graph_prev_out = render_to_string(&app, w, h);
+            assert!(graph_prev_out.contains("alice@contoso.example (auth: device-code"));
+            assert!(graph_prev_out.contains("RecoverableItemsDeletions"));
+            assert!(graph_prev_out.contains("receivedDateTime"));
+
+            // 5. GmailForm
+            app.screen = Screen::GmailForm;
+            app.gmail_form.set_focus(GmailField::Mailbox);
+            let gmail_form_out = render_to_string(&app, w, h);
+            assert!(gmail_form_out.contains("[Gmail]"));
+            assert!(gmail_form_out.contains("alice@example.org"));
+            assert!(!gmail_form_out.lines().next_back().unwrap().ends_with('…'));
+
+            // 6. Gmail Preview
+            let gm_argv = gmail_argv(&app.gmail_form);
+            let gm_args = parse_gmail_argv(&gm_argv).unwrap();
+            app.preview_state = Some(PreviewState::Ready(Box::new(PreviewData {
+                mode_preview: ModePreview::Gmail {
+                    preview: GmailPreview {
+                        account: "alice@example.org".into(),
+                        auth_method: "oauth-pkce".into(),
+                        messages: 25,
+                        in_scope: 25,
+                        bytes: 512 * 1024,
+                        by_label: BTreeMap::from([
+                            ("INBOX".into(), (20, 400 * 1024)),
+                            ("SENT".into(), (5, 112 * 1024)),
+                        ]),
+                        out_of_scope: BTreeMap::new(),
+                        errors: 0,
+                        target_free: Some(500 << 30),
+                        stopped: None,
+                        at_ns: 1_776_000_000_000_000_000,
+                    },
+                    args: Box::new(gm_args),
+                },
+                argv: gm_argv,
+                scroll: 0,
+                copied_osc52: false,
+            })));
+            app.screen = Screen::Preview;
+            let gmail_prev_out = render_to_string(&app, w, h);
+            assert!(gmail_prev_out.contains("alice@example.org (auth: oauth-pkce)"));
+            assert!(gmail_prev_out.contains("25 of 25 message(s)"));
+            assert!(gmail_prev_out.contains("Gmail internalDate"));
+
+            // 7. M365LogsForm + inline summary + ConfirmStart modal
+            app.preview_state = None;
+            app.active_mode = Mode::M365Logs;
+            app.screen = Screen::M365LogsForm;
+            app.m365_logs_form.set_focus(M365LogsField::Tenant);
+            let m365_top_out = render_to_string(&app, w, h);
+            assert!(m365_top_out.contains("[M365 Logs]"));
+            assert!(m365_top_out.contains("contoso.example"));
+
+            app.m365_logs_form.set_focus(M365LogsField::StartButton);
+            let m365_form_out = render_to_string(&app, w, h);
+            assert!(m365_form_out.contains("[M365 Logs]"));
+            assert!(
+                m365_form_out.contains("2026-04-01T09:15:00Z .. 2026-04-07T18:30:00Z"),
+                "rounded UTC window must be visible on M365LogsForm at {w}x{h}:\n{m365_form_out}"
+            );
+            assert!(m365_form_out.contains("no dry-run preview"));
+            assert!(!m365_form_out.lines().next_back().unwrap().ends_with('…'));
+
+            app.modal = Some(Modal::ConfirmStart);
+            let m365_confirm_out = render_to_string(&app, w, h);
+            assert!(m365_confirm_out.contains("Confirm Acquisition Start"));
+            assert!(m365_confirm_out.contains("signins"));
+            assert!(m365_confirm_out.contains("2026-04-01T09:15:00Z .. 2026-04-07T18:30:00Z"));
+            app.modal = None;
+
+            // 8. SignIn::DeviceCode screen
+            let console = Arc::new(TuiConsole::new(&STOP, app.secret_tx.clone()));
+            console.sign_in(&SignIn::DeviceCode {
+                message: "To sign in, open https://microsoft.com/devicelogin and enter ABCD-EFGH."
+                    .into(),
+                uri: "https://microsoft.com/devicelogin".into(),
+                code: "ABCD-EFGH".into(),
+                expires_at_ns: 2_000_000_000_000_000_000,
+            });
+            app.preview_state = Some(PreviewState::Running {
+                mode: Mode::Graph,
+                argv: graph_argv(&app.graph_form),
+                progress: Arc::new(Progress::default()),
+                console: console.clone(),
+                started: Instant::now(),
+                handle: None,
+            });
+            app.screen = Screen::Preview;
+            let dc_out = render_to_string(&app, w, h);
+            assert!(dc_out.contains("[Sign-In]"));
+            assert!(dc_out.contains("https://microsoft.com/devicelogin"));
+            assert!(dc_out.contains("ABCD-EFGH"));
+            assert!(dc_out.contains("('y' copies code via OSC 52)"));
+            assert!(!dc_out.lines().next_back().unwrap().ends_with('…'));
+
+            // 9. SignIn::Browser screen (long URL wraps, paste field visible)
+            let long_auth_url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=1234567890-abcdef.apps.googleusercontent.com&redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2F&response_type=code&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly&code_challenge=xyz123_challenge_token";
+            console.sign_in(&SignIn::Browser {
+                url: long_auth_url.into(),
+                expires_at_ns: 2_000_000_000_000_000_000,
+            });
+            app.sign_in_paste = "http://127.0.0.1:54321/?code=4/0AVGzR1".into();
+            app.sign_in_paste_cursor = app.sign_in_paste.len();
+            let br_out = render_to_string(&app, w, h);
+            assert!(br_out.contains("[Sign-In]"));
+            assert!(br_out.contains("Browser OAuth + PKCE"));
+            assert!(
+                br_out.replace('\n', "").contains(long_auth_url),
+                "full wrapped authorize URL must appear contiguously across lines without side borders or clipping at {w}x{h}:\n{br_out}"
+            );
+            assert!(br_out.contains("Signing in can notify the account holder"));
+            assert!(br_out.contains("code=4/0AVGzR1"));
+            assert!(!br_out.lines().next_back().unwrap().ends_with('…'));
+            app.modal = Some(Modal::ConfirmStopSignIn);
+            let stop_signin_out = render_to_string(&app, w, h);
+            assert!(stop_signin_out.contains("Stop signing in? Nothing has been acquired."));
+            app.modal = None;
+            console.sign_in_done();
+            app.preview_state = None;
+
+            // 10. Running screen in Phase::Waiting + M365Logs ConfirmStop modal
+            let progress = Arc::new(Progress::default());
+            progress.set_phase(Phase::Waiting);
+            progress.set_stage("Unified Audit Log query running: 2 of at most 240 min");
+            progress.files.store(2, Ordering::Relaxed);
+            progress.bytes.store(128 * 1024, Ordering::Relaxed);
+            let run_console = Arc::new(TuiConsole::new(&STOP, app.secret_tx.clone()));
+            run_console.notice(Level::Done, "signins: 412 records");
+            run_console.notice(Level::Done, "directory: 88 records");
+            app.run_state = Some(RunState {
+                mode: Mode::M365Logs,
+                source_display: "tenant contoso.example (audit, sign-ins, directory, ual)".into(),
+                output: PathBuf::from("/media/target/sdc1/VG_12345_26/m365-logs"),
+                argv: m365_logs_argv(&app.m365_logs_form),
+                expected_files: 4,
+                expected_bytes: 0,
+                progress,
+                console: run_console,
+                notices_expanded: false,
+                notices_scroll: 0,
+                started: Instant::now(),
+                rate_samples: VecDeque::new(),
+                stop_requested: false,
+                handle: None,
+            });
+            app.screen = Screen::Running;
+            let wait_out = render_to_string(&app, w, h);
+            assert!(
+                wait_out.contains("Phase: 1. Waiting  →  2. Checking container  →  3. Finishing"),
+                "Phase line must not clip at {w}x{h}:\n{wait_out}"
+            );
+            assert!(wait_out.contains("Stage : Unified Audit Log query running"));
+            assert!(wait_out.contains("Waiting for the audit log query (2 of 4 logs)"));
+            assert!(wait_out.contains("Logs           : 2 of 4"));
+            assert!(!wait_out.contains("preview size is an estimate"));
+            assert!(wait_out.contains("[DONE] signins: 412 records"));
+            assert!(wait_out.contains("[DONE] directory: 88 records"));
+
+            app.modal = Some(Modal::ConfirmStop);
+            let m365_stop_out = render_to_string(&app, w, h);
+            assert!(
+                m365_stop_out.contains("The query keeps running in the tenant; stop waiting and")
+            );
+            assert!(m365_stop_out.contains("close the collection as aborted?"));
+            assert!(m365_stop_out.contains("Records fetched so far are kept and verifiable"));
+            app.modal = None;
+            app.run_state = None;
+
+            // 11. Result screen for M365Logs (shows logs + records + total container bytes)
+            app.result_data = Some(ResultData {
+                mode: Mode::M365Logs,
+                code: 0,
+                status: "complete".into(),
+                collection: PathBuf::from("/media/target/sdc1/VG_12345_26/m365-logs"),
+                argv: m365_logs_argv(&app.m365_logs_form),
+                acquired: 4,
+                records: Some(1520),
+                bytes: 2 * 1024 * 1024,
+                out_of_scope_listed: 0,
+                out_of_scope_counted: 0,
+                excluded_trees: 0,
+                trees_outside_includes: 0,
+                errors: 0,
+                skipped: 0,
+                summary_kv: vec![
+                    ("tenant".into(), "contoso.example".into()),
+                    ("logs".into(), "4".into()),
+                    ("records".into(), "1520".into()),
+                ],
+                audit_anchor: None,
+                container_mismatches: Vec::new(),
+                warnings: Vec::new(),
+                problems: vec!["directory/00001.jsonl: HTTP 503 Service Unavailable".into()],
+                fatal_error: None,
+                left_unfinished: false,
+                scroll: 0,
+            });
+            app.screen = Screen::Result;
+            let m365_res_out = render_to_string(&app, w, h);
+            assert!(m365_res_out.contains("4 log(s), 1520 record(s); 2.0 MiB total in container"));
+            assert!(m365_res_out.contains("c copy cmd"));
+            assert!(
+                m365_res_out.contains("[PROBLEM] directory/00001.jsonl: HTTP 503"),
+                "failed item from items.jsonl must appear in Problems pane:\n{m365_res_out}"
+            );
+            if w == 80 && h == 24 {
+                assert!(
+                    m365_res_out.contains("… (press 'c' to copy full command)"),
+                    "80x24 must compress command to show at least 5 problem lines:\n{m365_res_out}"
+                );
+            } else {
+                assert!(
+                    m365_res_out.contains("-e 'KHK Muster'"),
+                    "full wrapped command fits at {w}x{h}:\n{m365_res_out}"
+                );
+            }
+        }
     }
 }

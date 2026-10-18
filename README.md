@@ -65,17 +65,19 @@ stderr (not with `--json`).
 ## Terminal UI
 
 Running `dfcollect` without arguments on a terminal opens the interactive TUI
-for `files`, `verify`, `ingest`, `cloud` and `db` (when `stdin` or `stdout` is
-not a terminal, `dfcollect` prints the command-line help and exits 2). The TUI
-uses the standard 16 ANSI colours and fits 80×24 serial and Linux virtual
-consoles without mouse capture, so paths and hashes stay selectable.
+for all eight acquisition modes (`files`, `ingest`, `cloud`, `db`, `imap`,
+`graph`, `gmail`, `m365-logs`) and `verify` (when `stdin` or `stdout` is not a
+terminal, `dfcollect` prints the command-line help and exits 2). The TUI uses
+the standard 16 ANSI colours and fits 80×24 serial and Linux virtual consoles
+without mouse capture, so paths and hashes stay selectable.
 
 1. **Home.** Choose **Acquire files from a mounted directory** (`dfcollect files`),
-   **Verify a collection** (`dfcollect verify`), **Record a provider or
-   third-party delivery** (`dfcollect ingest`), **Acquire from a pre-configured
-   rclone remote** (`dfcollect cloud`) or **Logical SQL dump from PostgreSQL or
-   MariaDB/MySQL** (`dfcollect db`). The remaining mail and tenant-log modes are
-   listed with their `dfcollect <mode> --help` command.
+   **Verify a collection** (`dfcollect verify`), **Provider delivery package**
+   (`dfcollect ingest`), **Cloud / remote storage (rclone)** (`dfcollect cloud`),
+   **Database dump (PostgreSQL / MariaDB)** (`dfcollect db`), **IMAP mailbox**
+   (`dfcollect imap`), **Microsoft 365 mailbox (Graph)** (`dfcollect graph`),
+   **Gmail / Google Workspace mailbox** (`dfcollect gmail`) or **Microsoft 365 tenant audit logs**
+   (`dfcollect m365-logs`).
 2. **Mode forms.** Every acquisition form shares case metadata (`--case`,
    `--evidence`, `--examiner`, `--description`, `--notes`), target output
    suggestion (`/media/target/<mount>/<case>/<evidence>` with path-safe
@@ -104,52 +106,133 @@ consoles without mouse capture, so paths and hashes stay selectable.
      preview/run), `--tls`, optional `--database` list, `--legal-basis`, and the
      engine-specific option (`--serializable` for PostgreSQL,
      `--binlog-position` for MariaDB/MySQL).
+   - **IMAP mailbox (`dfcollect imap`).** Set the positional `SERVER` (`host`,
+     `host:port` or `[IPv6]:port`), `-u` / `--user`, `--auth` (`auto` default,
+     `plain`, `login`, `xoauth2`), optional `--password-file` or `--token-file`
+     (or leave unset for the masked modal), `--security` (`tls` on port 993,
+     `start-tls` on port 143, or `plaintext`), optional `--tls-sha256` pin,
+     optional `--timeout`, and warrant scope (`INTERNALDATE` time window,
+     folder/message globs, `--unknown-time` or `--scope`).
+   - **Microsoft 365 mailbox (`dfcollect graph`).** Set `--mailbox` (UPN,
+     address or `me` default), `--auth` (`device`, `app`, `token`), `--tenant`
+     (`organizations` default), `--client-id`, optional `--client-secret-file`
+     or `--token-file` (or masked modal), national cloud endpoints
+     (`--graph-endpoint` and `--login-endpoint`, set in the TUI via the Cloud
+     preset for Global, US Gov L4, US Gov DoD, China 21Vianet or Custom, and
+     omitted from argv when global defaults are used; Recoverable
+     Items/Deletions are always read), and warrant scope (`receivedDateTime`
+     time window, folder globs, `--unknown-time` or `--scope`).
+   - **Gmail / Google Workspace mailbox (`dfcollect gmail`).** Set `--mailbox`
+     (address or `me` default), `--auth` (`installed`, `service-account`, `token`),
+     the credentials for that auth mode (`--client-id` and optional
+     `--client-secret-file` for `installed`; `--key-file` and `--mailbox` for
+     `service-account`; `--token-file` for `token`; or entered in the masked
+     secret modal), optional custom endpoints (`--gmail-endpoint`,
+     `--token-endpoint`, `--auth-endpoint`), optional `--timeout`, and
+     warrant scope (`internalDate` time window, label globs, `--unknown-time` or
+     `--scope`).
+   - **Microsoft 365 tenant audit logs (`dfcollect m365-logs`).** Set `--tenant`,
+     `--auth` (`device` default, `app`, `token`), `--client-id`, optional
+     `--client-secret-file` or `--token-file` (or masked modal), national cloud
+     endpoints (`--graph-endpoint` and `--login-endpoint`, filled from the
+     form's Cloud preset), log toggles with `--logs` (`signins`, `directory`,
+     `ual`), required time window (`--not-before` and `--not-after`, with the
+     form showing the whole-second UTC window `Rounded UAL window: start .. end`
+     where start is rounded down and end rounded up so the window never shrinks),
+     optional `--user` (repeatable UPN filter), `--record-type`, `--operation`,
+     `--ual-wait` (minutes) and `--legal-basis`. Because Purview Unified Audit Log
+     searches create an asynchronous server-side query job in the tenant
+     (`POST /security/auditLog/queries`), `m365-logs` has no dry-run preview; an
+     inline query summary is shown on the form and `F2` / `p` opens the start
+     confirmation modal (`Modal::ConfirmStart`) directly.
 
    The bottom line always shows the equivalent `dfcollect <mode> …` CLI command
-   live (passwords are never placed in `argv`).
-3. **Preview (`F2` or `p`).** Runs the active mode in `--dry-run` mode on a
+   live (passwords, tokens and secrets are never placed in `argv`).
+3. **Interactive Sign-In & Masked Secret Modal.** When a mode needs a password,
+   client secret or bearer token and no credential file is set, a masked modal
+   (`•` bullets, held in `Zeroizing<String>`) asks once during preview and
+   reuses the secret for the acquisition run. For OAuth 2.0 flows (`graph --auth device`,
+   `m365-logs --auth device`, `gmail --auth installed`), a full-size **Sign-In**
+   screen displays either:
+   - **Device code (`SignIn::DeviceCode`):** verification URI (`u` copies URI
+     via OSC 52) and user code (`y` copies code via OSC 52) with instructions
+     and live expiry countdown.
+   - **Browser authorization (`SignIn::Browser`):** wrapped OAuth 2.0 + PKCE
+     authorization URL (`u` or `F2` copies URL via OSC 52) together with the
+     `127.0.0.1` loopback listener address and a paste field for the full
+     redirect URL (including `code` and `state`) when signing in from another
+     device.
+
+   Pressing `Esc` opens `"Stop signing in?"` (`Modal::ConfirmStopSignIn`);
+   confirming with `y` stops a preview cleanly or ends an acquisition run as
+   aborted (exit 8). Credentials and OAuth tokens obtained during preview are
+   preserved and handed over to the acquisition run so signing in is only done
+   once; they are cleared when connection or auth fields change, when switching
+   modes, on next acquisition (`n`), or on quit (`q`). `m365-logs` has no dry-run
+   preview and signs in during its run.
+4. **Preview (`F2` or `p`).** Runs the active mode in `--dry-run` mode on a
    background thread (`Esc` or `s` stops early):
    - `files`: in-scope counts and bytes, target free space, out-of-scope counts
      by reason, unlisted excluded/unreachable trees, other filesystems, walk
      errors and up to 1000 in-scope sample paths.
-   - `ingest`: package kind and SHA-256 (for archive packages), provider receipt
-     metadata, companion hash-list verification summary (matched, mismatched,
-     missing, unlisted) and sample entries.
-   - `cloud`: remote type and rclone version, in-scope vs listed objects and
+   - `ingest`: package kind, provider receipt metadata, companion hash-list
+     verification summary (listed present, missing, unlisted) and entries.
+   - `cloud`: remote and provider hash types, in-scope vs listed objects and
      bytes, out-of-scope counts by reason (never out-of-scope object names) and
      in-scope sample objects.
-   - `db`: server and dumper versions, per-database table counts and estimated
-     bytes, target free space and privilege warnings. When a password is entered
-     in the masked modal during preview, it is kept in `Zeroizing` memory and
-     reused once for the acquisition run unless connection fields change.
+   - `db`: server and dumper versions, server clock, per-database estimated
+     bytes and target free space.
+   - `imap`: server greeting and authentication method, target free space,
+     folders with in-scope and total message counts and bytes, skipped folders
+     with their skip reasons, time basis (`IMAP INTERNALDATE`), and out-of-scope
+     counts (internal attributes and `UIDVALIDITY` are recorded in the run's
+     footprint).
+   - `graph`: mailbox account, authentication method, tenant, cloud endpoint,
+     target free space, folders with in-scope message counts and bytes (including
+     Recoverable Items / Deletions), skipped folders with reasons, time basis
+     (`receivedDateTime`), and out-of-scope counts.
+   - `gmail`: mailbox account, authentication method, in-scope vs listed message
+     counts and bytes, target free space, per-label breakdown with message counts
+     and bytes, time basis (`Gmail internalDate`), and out-of-scope counts
+     (account `historyId` is recorded in the run's footprint).
 
    Press `c` to copy the equivalent CLI command via OSC 52. Starting an
-   acquisition (`Enter` → `y`) is only possible when the preview is complete and
-   matches the form.
-4. **Run.** Shows the phase (`Copying → Checking container → Finishing`) and
-   sub-stage, a progress gauge on bytes or items, items acquired, out-of-scope
-   and error counts, 5-second rolling transfer rate, elapsed time, ETA, current
-   item and a live notices pane (`l` expands/collapses the full scrollable
-   50-entry notice log). Pressing `s` or `Ctrl+C` (confirmed with `y`) stops the
-   acquisition cleanly (`aborted`, `"stopped by the examiner"`, or `"cancelled
-   before anything was written"` if stopped during a pre-collection prompt,
-   exit 8); quitting directly with `q` is disabled while running.
-5. **Result & Verify.** Shows the final status and exit-code meaning, collection
-   path, totals, mode-specific summary fields, 64-hex audit anchor on its own
-   line, and scrollable problems/warnings. Press `v` to verify the collection
-   immediately, `n` to start the next acquisition in the same case (keeping
-   case, examiner, source/connection, scope and options, and clearing evidence,
+   acquisition (`Enter` or `F2`/`p` on m365-logs → `y`) is only possible when
+   the preview is complete and matches the form.
+5. **Run.** Shows the phase line (`Phase: 1. Copying  →  2. Checking container  →  3. Finishing`,
+   or for `m365-logs`: `Phase: 1. Waiting  →  2. Checking container  →  3. Finishing`)
+   and active sub-stage (`Stage : …`), a progress gauge, items acquired,
+   out-of-scope and error counts, elapsed time, and live notices pane (`l`
+   expands/collapses the full scrollable 50-entry notice log). For streaming and
+   copying modes, it shows a 5-second rolling transfer rate, ETA, and current
+   item; for `m365-logs`, it shows `Logs`, `Records`, and `Bytes written` instead
+   of rate and ETA. Pressing `s` or `Ctrl+C` (confirmed with `y`) stops the
+   acquisition cleanly (`aborted`, `"stopped by the examiner"`, exit 8); quitting
+   directly with `q` is disabled while running.
+6. **Result & Verify.** Shows the final status and exit-code meaning, collection
+   path, totals (including both log and record counts for `m365-logs`),
+   aligned mode-specific summary fields, 64-hex audit anchor on its own line,
+   the full equivalent CLI command (press `c` to copy via OSC 52; when the
+   command exceeds available space at 80×24, an explicit copy marker is shown
+   so problems stay visible), and scrollable problems and warnings. On runs with
+   errors, the problems pane lists failed items from `items.jsonl` (the first
+   20, followed by `+N more in items.jsonl`). Press `v` to verify the collection
+   immediately, `n` to start the next acquisition in the same case (keeping case,
+   examiner, source/connection, scope and options, and clearing evidence,
    description, notes, reference clock, safety overrides and cached credentials),
    or `q` to quit.
 
 **What it records.** A collection started from the TUI records the equivalent
-`dfcollect <mode> …` command in `manifest.json` (`method.argv`), plus two
+`dfcollect <mode> …` command in `manifest.json` (`method.argv`), plus
 `footprint.jsonl` entries: `"started from the dfcollect TUI; method.argv is the equivalent command line"`
-and the mode's preview note (`Preview::note()` / `IngestPreview::note()` /
-`CloudPreview::note()` / `DbPreview::note()`) with the preview timestamp (`at`).
-When a reference clock reading is given, pressing `Enter` on the field stamps
-the local clock at that moment (`clocks.reference.local`), so `offset_seconds`
-reflects the offset when the reading was taken rather than when the run started.
+and (for the seven modes with `--dry-run`) the mode's preview note
+(`Preview::note()` / `IngestPreview::note()` / `CloudPreview::note()` /
+`DbPreview::note()` / `ImapPreview::note()` / `GraphPreview::note()` /
+`GmailPreview::note()`) with the preview timestamp (`at`), plus a note when a
+credential entered or obtained during preview was reused for the run. When a
+reference clock reading is given, pressing `Enter` on the field stamps the local
+clock at that moment (`clocks.reference.local`), so `offset_seconds` reflects
+the offset when the reading was taken rather than when the run started.
 
 ## What `dfcollect imap` does
 

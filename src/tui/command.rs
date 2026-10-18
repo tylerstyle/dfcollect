@@ -3,12 +3,18 @@
 //! same `clap` definitions as the CLI.
 
 use crate::{
-    args::{Cli, CloudArgs, Command, DbArgs, FilesArgs, IngestArgs, TimeBasis, UnknownTimeArg},
+    args::{
+        Cli, CloudArgs, Command, DbArgs, FilesArgs, GmailArgs, GraphArgs, ImapArgs, IngestArgs,
+        M365LogsArgs, TimeBasis, UnknownTimeArg,
+    },
     tui::{
         autocomplete::expand_tilde,
         form::{
             CaseFields, ClockFields, CloudField, CloudForm, DbField, DbForm, FilesField, FilesForm,
-            IngestField, IngestForm, OutputFields, ScopeFields,
+            GmailField, GmailForm, GraphField, GraphForm, ImapField, ImapForm, IngestField,
+            IngestForm, M365LogsField, M365LogsForm, OutputFields, ScopeFields,
+            DEFAULT_GMAIL_ENDPOINT, DEFAULT_GOOGLE_AUTH_ENDPOINT, DEFAULT_GOOGLE_TOKEN_ENDPOINT,
+            DEFAULT_GRAPH_ENDPOINT, DEFAULT_LOGIN_ENDPOINT,
         },
     },
 };
@@ -140,6 +146,13 @@ fn push_scope_args(argv: &mut Vec<String>, scope: &ScopeFields, emit_time_basis:
                 argv.push("--time-basis".into());
                 argv.push("birth".into());
             }
+        }
+    }
+    match scope.unknown_time {
+        UnknownTimeArg::Exclude => {}
+        UnknownTimeArg::Include => {
+            argv.push("--unknown-time".into());
+            argv.push("include".into());
         }
     }
     if scope.list_out_of_scope {
@@ -451,6 +464,318 @@ pub fn db_argv(form: &DbForm) -> Vec<String> {
     argv
 }
 
+/// Build the equivalent `dfcollect imap ...` argument vector with only the
+/// options set on `form`. Never includes a password or token value.
+pub fn imap_argv(form: &ImapForm) -> Vec<String> {
+    let mut argv = vec!["dfcollect".to_string(), "imap".to_string()];
+
+    if !form.user.trim().is_empty() {
+        push_opt(&mut argv, "-u", "--user", form.user.trim());
+    }
+    if form.applies(ImapField::PasswordFile) && !form.password_file.trim().is_empty() {
+        argv.push("--password-file".into());
+        argv.push(abs_path_str(form.password_file.trim()));
+    }
+    if form.applies(ImapField::TokenFile) && !form.token_file.trim().is_empty() {
+        argv.push("--token-file".into());
+        argv.push(abs_path_str(form.token_file.trim()));
+    }
+    if form.auth != crate::mail::Auth::Auto {
+        argv.push("--auth".into());
+        argv.push(form.auth.as_cli_str().into());
+    }
+    if form.security != crate::mail::Security::Tls {
+        argv.push("--security".into());
+        argv.push(form.security.as_cli_str().into());
+    }
+    if form.applies(ImapField::TlsSha256) && !form.tls_sha256.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--tls-sha256",
+            "--tls-sha256",
+            form.tls_sha256.trim(),
+        );
+    }
+    let timeout = form.timeout.trim();
+    if !timeout.is_empty() && timeout != "120" {
+        push_opt(&mut argv, "--timeout", "--timeout", timeout);
+    }
+
+    let out = form.output.output_path.trim();
+    if !out.is_empty() {
+        argv.push("-o".into());
+        argv.push(abs_path_str(out));
+    }
+
+    push_case_args(&mut argv, &form.case);
+    push_scope_args(&mut argv, &form.scope, false);
+    push_clock_args(&mut argv, &form.clock);
+    push_output_flags(&mut argv, &form.output);
+
+    let srv = form.server.trim();
+    if !srv.is_empty() {
+        if srv.starts_with('-') {
+            argv.push("--".into());
+        }
+        argv.push(srv.to_string());
+    }
+
+    argv
+}
+
+/// Build the equivalent `dfcollect graph ...` argument vector with only the
+/// options set on `form`. Never includes a secret or token value.
+pub fn graph_argv(form: &GraphForm) -> Vec<String> {
+    let mut argv = vec!["dfcollect".to_string(), "graph".to_string()];
+
+    let mb = form.mailbox.trim();
+    if !mb.is_empty() && !mb.eq_ignore_ascii_case("me") {
+        push_opt(&mut argv, "--mailbox", "--mailbox", mb);
+    }
+    if form.auth != crate::graph::GraphAuth::Device {
+        argv.push("--auth".into());
+        argv.push(form.auth.as_cli_str().into());
+    }
+    let tenant = form.tenant.trim();
+    if form.applies(GraphField::Tenant)
+        && !tenant.is_empty()
+        && !tenant.eq_ignore_ascii_case("organizations")
+    {
+        push_opt(&mut argv, "--tenant", "--tenant", tenant);
+    }
+    if form.applies(GraphField::ClientId) && !form.client_id.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--client-id",
+            "--client-id",
+            form.client_id.trim(),
+        );
+    }
+    if form.applies(GraphField::ClientSecretFile) && !form.client_secret_file.trim().is_empty() {
+        argv.push("--client-secret-file".into());
+        argv.push(abs_path_str(form.client_secret_file.trim()));
+    }
+    if form.applies(GraphField::TokenFile) && !form.token_file.trim().is_empty() {
+        argv.push("--token-file".into());
+        argv.push(abs_path_str(form.token_file.trim()));
+    }
+    let graph_ep = form.graph_endpoint.trim();
+    if !graph_ep.is_empty() && !graph_ep.eq_ignore_ascii_case(DEFAULT_GRAPH_ENDPOINT) {
+        push_opt(&mut argv, "--graph-endpoint", "--graph-endpoint", graph_ep);
+    }
+    let login_ep = form.login_endpoint.trim();
+    if !login_ep.is_empty() && !login_ep.eq_ignore_ascii_case(DEFAULT_LOGIN_ENDPOINT) {
+        push_opt(&mut argv, "--login-endpoint", "--login-endpoint", login_ep);
+    }
+    let timeout = form.timeout.trim();
+    if !timeout.is_empty() && timeout != "120" {
+        push_opt(&mut argv, "--timeout", "--timeout", timeout);
+    }
+
+    let out = form.output.output_path.trim();
+    if !out.is_empty() {
+        argv.push("-o".into());
+        argv.push(abs_path_str(out));
+    }
+
+    push_case_args(&mut argv, &form.case);
+    push_scope_args(&mut argv, &form.scope, false);
+    push_clock_args(&mut argv, &form.clock);
+    push_output_flags(&mut argv, &form.output);
+
+    argv
+}
+
+/// Build the equivalent `dfcollect gmail ...` argument vector with only the
+/// options set on `form`. Never includes a secret, key content, or token value.
+pub fn gmail_argv(form: &GmailForm) -> Vec<String> {
+    let mut argv = vec!["dfcollect".to_string(), "gmail".to_string()];
+
+    let mb = form.mailbox.trim();
+    if !mb.is_empty() && !mb.eq_ignore_ascii_case("me") {
+        push_opt(&mut argv, "--mailbox", "--mailbox", mb);
+    }
+    if form.auth != crate::gmail::GmailAuth::Installed {
+        argv.push("--auth".into());
+        argv.push(form.auth.as_cli_str().into());
+    }
+    if form.applies(GmailField::ClientId) && !form.client_id.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--client-id",
+            "--client-id",
+            form.client_id.trim(),
+        );
+    }
+    if form.applies(GmailField::ClientSecretFile) && !form.client_secret_file.trim().is_empty() {
+        argv.push("--client-secret-file".into());
+        argv.push(abs_path_str(form.client_secret_file.trim()));
+    }
+    if form.applies(GmailField::KeyFile) && !form.key_file.trim().is_empty() {
+        argv.push("--key-file".into());
+        argv.push(abs_path_str(form.key_file.trim()));
+    }
+    if form.applies(GmailField::TokenFile) && !form.token_file.trim().is_empty() {
+        argv.push("--token-file".into());
+        argv.push(abs_path_str(form.token_file.trim()));
+    }
+    let gmail_ep = form.gmail_endpoint.trim();
+    if !gmail_ep.is_empty() && !gmail_ep.eq_ignore_ascii_case(DEFAULT_GMAIL_ENDPOINT) {
+        push_opt(&mut argv, "--gmail-endpoint", "--gmail-endpoint", gmail_ep);
+    }
+    let token_ep = form.token_endpoint.trim();
+    if !token_ep.is_empty() && !token_ep.eq_ignore_ascii_case(DEFAULT_GOOGLE_TOKEN_ENDPOINT) {
+        push_opt(&mut argv, "--token-endpoint", "--token-endpoint", token_ep);
+    }
+    let auth_ep = form.auth_endpoint.trim();
+    if form.applies(GmailField::AuthEndpoint)
+        && !auth_ep.is_empty()
+        && !auth_ep.eq_ignore_ascii_case(DEFAULT_GOOGLE_AUTH_ENDPOINT)
+    {
+        push_opt(&mut argv, "--auth-endpoint", "--auth-endpoint", auth_ep);
+    }
+    let timeout = form.timeout.trim();
+    if !timeout.is_empty() && timeout != "120" {
+        push_opt(&mut argv, "--timeout", "--timeout", timeout);
+    }
+
+    let out = form.output.output_path.trim();
+    if !out.is_empty() {
+        argv.push("-o".into());
+        argv.push(abs_path_str(out));
+    }
+
+    push_case_args(&mut argv, &form.case);
+    push_scope_args(&mut argv, &form.scope, false);
+    push_clock_args(&mut argv, &form.clock);
+    push_output_flags(&mut argv, &form.output);
+
+    argv
+}
+
+/// Build the equivalent `dfcollect m365-logs ...` argument vector with only the
+/// options set on `form`. Never includes a secret or token value.
+pub fn m365_logs_argv(form: &M365LogsForm) -> Vec<String> {
+    let mut argv = vec!["dfcollect".to_string(), "m365-logs".to_string()];
+
+    if form.auth != crate::graph::GraphAuth::Device {
+        argv.push("--auth".into());
+        argv.push(form.auth.as_cli_str().into());
+    }
+    let tenant = form.tenant.trim();
+    if form.applies(M365LogsField::Tenant)
+        && !tenant.is_empty()
+        && !tenant.eq_ignore_ascii_case("organizations")
+    {
+        push_opt(&mut argv, "--tenant", "--tenant", tenant);
+    }
+    if form.applies(M365LogsField::ClientId) && !form.client_id.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--client-id",
+            "--client-id",
+            form.client_id.trim(),
+        );
+    }
+    if form.applies(M365LogsField::ClientSecretFile) && !form.client_secret_file.trim().is_empty() {
+        argv.push("--client-secret-file".into());
+        argv.push(abs_path_str(form.client_secret_file.trim()));
+    }
+    if form.applies(M365LogsField::TokenFile) && !form.token_file.trim().is_empty() {
+        argv.push("--token-file".into());
+        argv.push(abs_path_str(form.token_file.trim()));
+    }
+    let graph_ep = form.graph_endpoint.trim();
+    if !graph_ep.is_empty() && !graph_ep.eq_ignore_ascii_case(DEFAULT_GRAPH_ENDPOINT) {
+        push_opt(&mut argv, "--graph-endpoint", "--graph-endpoint", graph_ep);
+    }
+    let login_ep = form.login_endpoint.trim();
+    if !login_ep.is_empty() && !login_ep.eq_ignore_ascii_case(DEFAULT_LOGIN_ENDPOINT) {
+        push_opt(&mut argv, "--login-endpoint", "--login-endpoint", login_ep);
+    }
+    let timeout = form.timeout.trim();
+    if !timeout.is_empty() && timeout != "120" {
+        push_opt(&mut argv, "--timeout", "--timeout", timeout);
+    }
+
+    if !(form.log_signins && form.log_directory && form.log_ual) {
+        let mut logs = Vec::new();
+        if form.log_signins {
+            logs.push("signins");
+        }
+        if form.log_directory {
+            logs.push("directory");
+        }
+        if form.log_ual {
+            logs.push("ual");
+        }
+        if !logs.is_empty() {
+            argv.push("--logs".into());
+            argv.push(logs.join(","));
+        }
+    }
+    for u in &form.users {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            push_opt(&mut argv, "--user", "--user", trimmed);
+        }
+    }
+    if form.log_ual {
+        for rt in &form.record_types {
+            let trimmed = rt.trim();
+            if !trimmed.is_empty() {
+                push_opt(&mut argv, "--record-type", "--record-type", trimmed);
+            }
+        }
+        for op in &form.operations {
+            let trimmed = op.trim();
+            if !trimmed.is_empty() {
+                push_opt(&mut argv, "--operation", "--operation", trimmed);
+            }
+        }
+        let wait = form.ual_wait.trim();
+        if !wait.is_empty() && wait != "240" {
+            push_opt(&mut argv, "--ual-wait", "--ual-wait", wait);
+        }
+    }
+    if !form.not_before.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--not-before",
+            "--not-before",
+            form.not_before.trim(),
+        );
+    }
+    if !form.not_after.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--not-after",
+            "--not-after",
+            form.not_after.trim(),
+        );
+    }
+    if !form.legal_basis.trim().is_empty() {
+        push_opt(
+            &mut argv,
+            "--legal-basis",
+            "--legal-basis",
+            form.legal_basis.trim(),
+        );
+    }
+
+    let out = form.output.output_path.trim();
+    if !out.is_empty() {
+        argv.push("-o".into());
+        argv.push(abs_path_str(out));
+    }
+
+    push_case_args(&mut argv, &form.case);
+    push_clock_args(&mut argv, &form.clock);
+    push_output_flags(&mut argv, &form.output);
+
+    argv
+}
+
 /// Build the equivalent `dfcollect verify DIR` argument vector.
 pub fn verify_argv(dir: &Path) -> Vec<String> {
     let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -698,6 +1023,273 @@ pub fn parse_db_argv(argv: &[String]) -> std::result::Result<DbArgs, (Option<DbF
                 Some(DbField::ReferenceTime)
             } else if invalid_arg.contains("--reference-how") {
                 Some(DbField::ReferenceHow)
+            } else {
+                None
+            };
+            let msg = e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("invalid arguments")
+                .to_string();
+            Err((field, msg))
+        }
+    }
+}
+
+/// Parse `argv` as `dfcollect imap`.
+pub fn parse_imap_argv(
+    argv: &[String],
+) -> std::result::Result<ImapArgs, (Option<ImapField>, String)> {
+    match Cli::try_parse_from(argv) {
+        Ok(Cli {
+            command: Some(Command::Imap(args)),
+        }) => Ok(*args),
+        Ok(_) => Err((None, "command did not parse as `dfcollect imap`".into())),
+        Err(e) => {
+            let invalid_arg = e
+                .get(ContextKind::InvalidArg)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let field = if invalid_arg.contains("<SERVER>") {
+                Some(ImapField::Server)
+            } else if invalid_arg.contains("--user") || invalid_arg.contains("-u ") {
+                Some(ImapField::User)
+            } else if invalid_arg.contains("--password-file") {
+                Some(ImapField::PasswordFile)
+            } else if invalid_arg.contains("--token-file") {
+                Some(ImapField::TokenFile)
+            } else if invalid_arg.contains("--auth") {
+                Some(ImapField::Auth)
+            } else if invalid_arg.contains("--security") {
+                Some(ImapField::Security)
+            } else if invalid_arg.contains("--tls-sha256") {
+                Some(ImapField::TlsSha256)
+            } else if invalid_arg.contains("--timeout") {
+                Some(ImapField::Timeout)
+            } else if invalid_arg.contains("--output") || invalid_arg.contains("-o ") {
+                Some(ImapField::OutputPath)
+            } else if invalid_arg.contains("--case") || invalid_arg.contains("-C ") {
+                Some(ImapField::CaseNumber)
+            } else if invalid_arg.contains("--evidence") || invalid_arg.contains("-E ") {
+                Some(ImapField::EvidenceNumber)
+            } else if invalid_arg.contains("--examiner") || invalid_arg.contains("-e ") {
+                Some(ImapField::Examiner)
+            } else if invalid_arg.contains("--scope") {
+                Some(ImapField::ScopeFile)
+            } else if invalid_arg.contains("--not-before") {
+                Some(ImapField::NotBefore)
+            } else if invalid_arg.contains("--not-after") {
+                Some(ImapField::NotAfter)
+            } else if invalid_arg.contains("--reference-time") {
+                Some(ImapField::ReferenceTime)
+            } else if invalid_arg.contains("--reference-how") {
+                Some(ImapField::ReferenceHow)
+            } else {
+                None
+            };
+            let msg = e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("invalid arguments")
+                .to_string();
+            Err((field, msg))
+        }
+    }
+}
+
+/// Parse `argv` as `dfcollect graph`.
+pub fn parse_graph_argv(
+    argv: &[String],
+) -> std::result::Result<GraphArgs, (Option<GraphField>, String)> {
+    match Cli::try_parse_from(argv) {
+        Ok(Cli {
+            command: Some(Command::Graph(args)),
+        }) => Ok(*args),
+        Ok(_) => Err((None, "command did not parse as `dfcollect graph`".into())),
+        Err(e) => {
+            let invalid_arg = e
+                .get(ContextKind::InvalidArg)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let field = if invalid_arg.contains("--mailbox") {
+                Some(GraphField::Mailbox)
+            } else if invalid_arg.contains("--auth") {
+                Some(GraphField::Auth)
+            } else if invalid_arg.contains("--tenant") {
+                Some(GraphField::Tenant)
+            } else if invalid_arg.contains("--client-id") {
+                Some(GraphField::ClientId)
+            } else if invalid_arg.contains("--client-secret-file") {
+                Some(GraphField::ClientSecretFile)
+            } else if invalid_arg.contains("--token-file") {
+                Some(GraphField::TokenFile)
+            } else if invalid_arg.contains("--graph-endpoint") {
+                Some(GraphField::GraphEndpoint)
+            } else if invalid_arg.contains("--login-endpoint") {
+                Some(GraphField::LoginEndpoint)
+            } else if invalid_arg.contains("--timeout") {
+                Some(GraphField::Timeout)
+            } else if invalid_arg.contains("--output") || invalid_arg.contains("-o ") {
+                Some(GraphField::OutputPath)
+            } else if invalid_arg.contains("--case") || invalid_arg.contains("-C ") {
+                Some(GraphField::CaseNumber)
+            } else if invalid_arg.contains("--evidence") || invalid_arg.contains("-E ") {
+                Some(GraphField::EvidenceNumber)
+            } else if invalid_arg.contains("--examiner") || invalid_arg.contains("-e ") {
+                Some(GraphField::Examiner)
+            } else if invalid_arg.contains("--scope") {
+                Some(GraphField::ScopeFile)
+            } else if invalid_arg.contains("--not-before") {
+                Some(GraphField::NotBefore)
+            } else if invalid_arg.contains("--not-after") {
+                Some(GraphField::NotAfter)
+            } else if invalid_arg.contains("--reference-time") {
+                Some(GraphField::ReferenceTime)
+            } else if invalid_arg.contains("--reference-how") {
+                Some(GraphField::ReferenceHow)
+            } else {
+                None
+            };
+            let msg = e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("invalid arguments")
+                .to_string();
+            Err((field, msg))
+        }
+    }
+}
+
+/// Parse `argv` as `dfcollect gmail`.
+pub fn parse_gmail_argv(
+    argv: &[String],
+) -> std::result::Result<GmailArgs, (Option<GmailField>, String)> {
+    match Cli::try_parse_from(argv) {
+        Ok(Cli {
+            command: Some(Command::Gmail(args)),
+        }) => Ok(*args),
+        Ok(_) => Err((None, "command did not parse as `dfcollect gmail`".into())),
+        Err(e) => {
+            let invalid_arg = e
+                .get(ContextKind::InvalidArg)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let field = if invalid_arg.contains("--mailbox") {
+                Some(GmailField::Mailbox)
+            } else if invalid_arg.contains("--auth") {
+                Some(GmailField::Auth)
+            } else if invalid_arg.contains("--client-id") {
+                Some(GmailField::ClientId)
+            } else if invalid_arg.contains("--client-secret-file") {
+                Some(GmailField::ClientSecretFile)
+            } else if invalid_arg.contains("--key-file") {
+                Some(GmailField::KeyFile)
+            } else if invalid_arg.contains("--token-file") {
+                Some(GmailField::TokenFile)
+            } else if invalid_arg.contains("--gmail-endpoint") {
+                Some(GmailField::GmailEndpoint)
+            } else if invalid_arg.contains("--token-endpoint") {
+                Some(GmailField::TokenEndpoint)
+            } else if invalid_arg.contains("--auth-endpoint") {
+                Some(GmailField::AuthEndpoint)
+            } else if invalid_arg.contains("--timeout") {
+                Some(GmailField::Timeout)
+            } else if invalid_arg.contains("--output") || invalid_arg.contains("-o ") {
+                Some(GmailField::OutputPath)
+            } else if invalid_arg.contains("--case") || invalid_arg.contains("-C ") {
+                Some(GmailField::CaseNumber)
+            } else if invalid_arg.contains("--evidence") || invalid_arg.contains("-E ") {
+                Some(GmailField::EvidenceNumber)
+            } else if invalid_arg.contains("--examiner") || invalid_arg.contains("-e ") {
+                Some(GmailField::Examiner)
+            } else if invalid_arg.contains("--scope") {
+                Some(GmailField::ScopeFile)
+            } else if invalid_arg.contains("--not-before") {
+                Some(GmailField::NotBefore)
+            } else if invalid_arg.contains("--not-after") {
+                Some(GmailField::NotAfter)
+            } else if invalid_arg.contains("--reference-time") {
+                Some(GmailField::ReferenceTime)
+            } else if invalid_arg.contains("--reference-how") {
+                Some(GmailField::ReferenceHow)
+            } else {
+                None
+            };
+            let msg = e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("invalid arguments")
+                .to_string();
+            Err((field, msg))
+        }
+    }
+}
+
+/// Parse `argv` as `dfcollect m365-logs`.
+pub fn parse_m365_logs_argv(
+    argv: &[String],
+) -> std::result::Result<M365LogsArgs, (Option<M365LogsField>, String)> {
+    match Cli::try_parse_from(argv) {
+        Ok(Cli {
+            command: Some(Command::M365Logs(args)),
+        }) => Ok(*args),
+        Ok(_) => Err((
+            None,
+            "command did not parse as `dfcollect m365-logs`".into(),
+        )),
+        Err(e) => {
+            let invalid_arg = e
+                .get(ContextKind::InvalidArg)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let field = if invalid_arg.contains("--auth") {
+                Some(M365LogsField::Auth)
+            } else if invalid_arg.contains("--tenant") {
+                Some(M365LogsField::Tenant)
+            } else if invalid_arg.contains("--client-id") {
+                Some(M365LogsField::ClientId)
+            } else if invalid_arg.contains("--client-secret-file") {
+                Some(M365LogsField::ClientSecretFile)
+            } else if invalid_arg.contains("--token-file") {
+                Some(M365LogsField::TokenFile)
+            } else if invalid_arg.contains("--graph-endpoint") {
+                Some(M365LogsField::GraphEndpoint)
+            } else if invalid_arg.contains("--login-endpoint") {
+                Some(M365LogsField::LoginEndpoint)
+            } else if invalid_arg.contains("--timeout") {
+                Some(M365LogsField::Timeout)
+            } else if invalid_arg.contains("--logs") {
+                Some(M365LogsField::LogSignins)
+            } else if invalid_arg.contains("--user") {
+                Some(M365LogsField::Users)
+            } else if invalid_arg.contains("--record-type") {
+                Some(M365LogsField::RecordTypes)
+            } else if invalid_arg.contains("--operation") {
+                Some(M365LogsField::Operations)
+            } else if invalid_arg.contains("--ual-wait") {
+                Some(M365LogsField::UalWait)
+            } else if invalid_arg.contains("--not-before") {
+                Some(M365LogsField::NotBefore)
+            } else if invalid_arg.contains("--not-after") {
+                Some(M365LogsField::NotAfter)
+            } else if invalid_arg.contains("--legal-basis") {
+                Some(M365LogsField::LegalBasis)
+            } else if invalid_arg.contains("--output") || invalid_arg.contains("-o ") {
+                Some(M365LogsField::OutputPath)
+            } else if invalid_arg.contains("--case") || invalid_arg.contains("-C ") {
+                Some(M365LogsField::CaseNumber)
+            } else if invalid_arg.contains("--evidence") || invalid_arg.contains("-E ") {
+                Some(M365LogsField::EvidenceNumber)
+            } else if invalid_arg.contains("--examiner") || invalid_arg.contains("-e ") {
+                Some(M365LogsField::Examiner)
+            } else if invalid_arg.contains("--reference-time") {
+                Some(M365LogsField::ReferenceTime)
+            } else if invalid_arg.contains("--reference-how") {
+                Some(M365LogsField::ReferenceHow)
             } else {
                 None
             };
@@ -1023,5 +1615,165 @@ mod tests {
         assert!(maria_parsed.no_password);
         assert!(maria_parsed.binlog_position);
         assert!(!maria_parsed.serializable);
+    }
+
+    #[test]
+    fn imap_argv_round_trips_through_clap() {
+        let mut form = ImapForm::default();
+        form.case.case = "VG 12345/26".into();
+        form.case.evidence = "imap01".into();
+        form.case.examiner = "KHK Muster".into();
+        form.server = "mail.example.org:993".into();
+        form.user = "alice@example.org".into();
+        form.auth = crate::mail::Auth::Plain;
+        form.password_file = "/run/secrets/imap_pw".into();
+        form.security = crate::mail::Security::StartTls;
+        form.tls_sha256 = "a".repeat(64);
+        form.timeout = "180".into();
+        form.output.output_path = "/media/target/sdc1/VG_12345_26/imap01".into();
+        form.scope.include = vec!["INBOX/**".into()];
+        form.scope.exclude = vec!["Trash/**".into()];
+        form.scope.not_before = "2026-01-01T00:00:00Z".into();
+        form.scope.not_after = "2026-07-01T00:00:00Z".into();
+        form.scope.unknown_time = UnknownTimeArg::Include;
+        form.output.md5 = true;
+
+        let argv = imap_argv(&form);
+        assert!(!argv.iter().any(|a| a == "--time-basis"));
+        let parsed = parse_imap_argv(&argv).unwrap();
+        assert_eq!(parsed.server, "mail.example.org:993");
+        assert_eq!(parsed.user, "alice@example.org");
+        assert_eq!(parsed.auth, crate::mail::Auth::Plain);
+        assert_eq!(
+            parsed.password_file.as_deref(),
+            Some(Path::new("/run/secrets/imap_pw"))
+        );
+        assert_eq!(parsed.security, crate::mail::Security::StartTls);
+        assert_eq!(parsed.tls_sha256.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(parsed.timeout, 180);
+        assert_eq!(parsed.scope.include, vec!["INBOX/**"]);
+        assert_eq!(parsed.scope.exclude, vec!["Trash/**"]);
+        assert_eq!(parsed.scope.unknown_time, UnknownTimeArg::Include);
+        assert!(parsed.md5);
+    }
+
+    #[test]
+    fn graph_argv_round_trips_through_clap_and_omits_global_endpoints() {
+        let mut form = GraphForm::default();
+        form.case.case = "VG 12345/26".into();
+        form.case.evidence = "m365mail01".into();
+        form.case.examiner = "KHK Muster".into();
+        form.client_id = "00000000-1111-2222-3333-444444444444".into();
+        form.output.output_path = "/media/target/sdc1/VG_12345_26/m365mail01".into();
+
+        // Default global cloud and mailbox "me" are omitted from argv
+        let global_argv = graph_argv(&form);
+        assert!(!global_argv.iter().any(|a| a == "--graph-endpoint"));
+        assert!(!global_argv.iter().any(|a| a == "--login-endpoint"));
+        assert!(!global_argv.iter().any(|a| a == "--mailbox"));
+        assert!(!global_argv.iter().any(|a| a == "--tenant"));
+        let parsed_global = parse_graph_argv(&global_argv).unwrap();
+        assert_eq!(parsed_global.mailbox, "me");
+        assert_eq!(parsed_global.conn.auth, crate::graph::GraphAuth::Device);
+        assert_eq!(parsed_global.conn.tenant, "organizations");
+        assert_eq!(parsed_global.conn.graph_endpoint, DEFAULT_GRAPH_ENDPOINT);
+        assert_eq!(parsed_global.conn.login_endpoint, DEFAULT_LOGIN_ENDPOINT);
+
+        // App auth on US Gov cloud with client secret file
+        form.auth = crate::graph::GraphAuth::App;
+        form.mailbox = "alice@contoso.example".into();
+        form.tenant = "contoso.example".into();
+        form.client_secret_file = "/run/secrets/graph_secret".into();
+        form.toggle_regular(GraphField::Cloud, true); // -> UsGov
+        let gov_argv = graph_argv(&form);
+        assert!(gov_argv.contains(&"https://graph.microsoft.us".to_string()));
+        assert!(gov_argv.contains(&"https://login.microsoftonline.us".to_string()));
+        let parsed_gov = parse_graph_argv(&gov_argv).unwrap();
+        assert_eq!(parsed_gov.mailbox, "alice@contoso.example");
+        assert_eq!(parsed_gov.conn.auth, crate::graph::GraphAuth::App);
+        assert_eq!(parsed_gov.conn.tenant, "contoso.example");
+        assert_eq!(
+            parsed_gov.conn.client_secret_file.as_deref(),
+            Some(Path::new("/run/secrets/graph_secret"))
+        );
+        assert_eq!(parsed_gov.conn.graph_endpoint, "https://graph.microsoft.us");
+        assert_eq!(
+            parsed_gov.conn.login_endpoint,
+            "https://login.microsoftonline.us"
+        );
+    }
+
+    #[test]
+    fn gmail_argv_round_trips_through_clap() {
+        let mut form = GmailForm::default();
+        form.case.case = "VG 12345/26".into();
+        form.case.evidence = "gmail01".into();
+        form.case.examiner = "KHK Muster".into();
+        form.auth = crate::gmail::GmailAuth::ServiceAccount;
+        form.mailbox = "alice@example.org".into();
+        form.key_file = "/run/secrets/sa.json".into();
+        form.client_id = "ignored-for-sa".into();
+        form.output.output_path = "/media/target/sdc1/VG_12345_26/gmail01".into();
+        form.scope.include = vec!["INBOX/**".into()];
+
+        let argv = gmail_argv(&form);
+        // --client-id is not emitted for service-account
+        assert!(!argv.iter().any(|a| a == "--client-id"));
+        assert!(!argv.iter().any(|a| a == "--gmail-endpoint"));
+        let parsed = parse_gmail_argv(&argv).unwrap();
+        assert_eq!(parsed.auth, crate::gmail::GmailAuth::ServiceAccount);
+        assert_eq!(parsed.mailbox, "alice@example.org");
+        assert_eq!(
+            parsed.key_file.as_deref(),
+            Some(Path::new("/run/secrets/sa.json"))
+        );
+        assert!(parsed.client_id.is_none());
+        assert_eq!(parsed.scope.include, vec!["INBOX/**"]);
+    }
+
+    #[test]
+    fn m365_logs_argv_round_trips_through_clap() {
+        let mut form = M365LogsForm::default();
+        form.case.case = "VG 12345/26".into();
+        form.case.evidence = "m365logs01".into();
+        form.case.examiner = "KHK Muster".into();
+        form.auth = crate::graph::GraphAuth::App;
+        form.tenant = "contoso.example".into();
+        form.client_id = "00000000-1111-2222-3333-444444444444".into();
+        form.client_secret_file = "/run/secrets/m365_secret".into();
+        form.log_signins = true;
+        form.log_directory = false;
+        form.log_ual = true;
+        form.users = vec!["alice@contoso.example".into()];
+        form.record_types = vec!["exchangeItem".into()];
+        form.operations = vec!["MailItemsAccessed".into()];
+        form.ual_wait = "180".into();
+        form.not_before = "2026-03-01T00:00:00Z".into();
+        form.not_after = "2026-03-02T00:00:00Z".into();
+        form.legal_basis = "AG Musterstadt 12 Gs 34/26".into();
+        form.output.output_path = "/media/target/sdc1/VG_12345_26/m365logs01".into();
+
+        let argv = m365_logs_argv(&form);
+        assert!(argv.contains(&"signins,ual".to_string()));
+        let parsed = parse_m365_logs_argv(&argv).unwrap();
+        assert_eq!(parsed.conn.auth, crate::graph::GraphAuth::App);
+        assert_eq!(parsed.conn.tenant, "contoso.example");
+        assert_eq!(
+            parsed.logs,
+            vec![
+                crate::m365logs::LogKind::Signins,
+                crate::m365logs::LogKind::Ual
+            ]
+        );
+        assert_eq!(parsed.users, vec!["alice@contoso.example"]);
+        assert_eq!(parsed.record_types, vec!["exchangeItem"]);
+        assert_eq!(parsed.operations, vec!["MailItemsAccessed"]);
+        assert_eq!(parsed.ual_wait, 180);
+        assert_eq!(parsed.not_before, "2026-03-01T00:00:00Z");
+        assert_eq!(parsed.not_after, "2026-03-02T00:00:00Z");
+        assert_eq!(
+            parsed.legal_basis.as_deref(),
+            Some("AG Musterstadt 12 Gs 34/26")
+        );
     }
 }

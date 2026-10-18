@@ -648,12 +648,7 @@ impl FilesForm {
     /// Parsed UTC hint for an RFC 3339 timestamp field (`NotBefore`, `NotAfter`,
     /// `ReferenceTime`), when valid.
     pub fn utc_hint(&self, field: FilesField) -> Option<String> {
-        let raw = self.text(field)?.trim();
-        if raw.is_empty() {
-            return None;
-        }
-        let ns = host::parse_rfc3339(raw).ok()?;
-        Some(format!("UTC: {}", host::rfc3339_utc_ns(ns)))
+        utc_conversion_hint(self.text(field)?)
     }
 
     /// Formatted stamp + offset line (`"entered at <UTC> (offset +5.0 s)"`) when
@@ -869,6 +864,7 @@ impl FilesForm {
                 not_before: self.not_before.clone(),
                 not_after: self.not_after.clone(),
                 time_basis: self.time_basis,
+                unknown_time: self.unknown_time,
                 list_out_of_scope: self.list_out_of_scope,
                 scope_file: self.scope_file.clone(),
             },
@@ -906,6 +902,7 @@ impl FilesForm {
             self.exclude_idx = shared.scope.exclude_idx;
             self.not_before = shared.scope.not_before.clone();
             self.not_after = shared.scope.not_after.clone();
+            self.unknown_time = shared.scope.unknown_time;
             self.list_out_of_scope = shared.scope.list_out_of_scope;
             self.scope_file = shared.scope.scope_file.clone();
         }
@@ -1000,6 +997,61 @@ pub struct CaseFields {
 }
 
 impl CaseFields {
+    pub const fn spec_case() -> FieldSpec {
+        FieldSpec {
+            section: Some("Case metadata (case & examiner kept on 'n')"),
+            label: "Case number*",
+            flag: "-C",
+            placeholder: "e.g. VG 12345/26",
+            kind: FieldKind::Text,
+            required: true,
+        }
+    }
+
+    pub const fn spec_evidence(placeholder: &'static str) -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Evidence number*",
+            flag: "-E",
+            placeholder,
+            kind: FieldKind::Text,
+            required: true,
+        }
+    }
+
+    pub const fn spec_examiner() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Examiner*",
+            flag: "-e",
+            placeholder: "name or ID",
+            kind: FieldKind::Text,
+            required: true,
+        }
+    }
+
+    pub const fn spec_description() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Description",
+            flag: "--description",
+            placeholder: "optional evidence description",
+            kind: FieldKind::Text,
+            required: false,
+        }
+    }
+
+    pub const fn spec_notes() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Notes",
+            flag: "--notes",
+            placeholder: "optional case notes",
+            kind: FieldKind::Text,
+            required: false,
+        }
+    }
+
     pub fn validate_case(&self) -> Option<String> {
         self.case
             .trim()
@@ -1042,6 +1094,61 @@ pub struct OutputFields {
 }
 
 impl OutputFields {
+    pub const fn spec_output_dir(section: Option<&'static str>) -> FieldSpec {
+        FieldSpec {
+            section,
+            label: "Output dir*",
+            flag: "-o",
+            placeholder: "/media/target/<mount>/<case>/<evidence>",
+            kind: FieldKind::Path { dirs_only: true },
+            required: true,
+        }
+    }
+
+    pub const fn spec_md5() -> FieldSpec {
+        FieldSpec {
+            section: Some("Hashes & container options"),
+            label: "Compute MD5",
+            flag: "--md5",
+            placeholder: "",
+            kind: FieldKind::Bool { safety: false },
+            required: false,
+        }
+    }
+
+    pub const fn spec_sha1() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Compute SHA-1",
+            flag: "--sha1",
+            placeholder: "",
+            kind: FieldKind::Bool { safety: false },
+            required: false,
+        }
+    }
+
+    pub const fn spec_compress() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Deflate ZIP",
+            flag: "--compress",
+            placeholder: "",
+            kind: FieldKind::Bool { safety: false },
+            required: false,
+        }
+    }
+
+    pub const fn spec_allow_tmpfs() -> FieldSpec {
+        FieldSpec {
+            section: Some("Safety overrides (require confirmation)"),
+            label: "Allow tmpfs",
+            flag: "--allow-tmpfs",
+            placeholder: "",
+            kind: FieldKind::Bool { safety: true },
+            required: false,
+        }
+    }
+
     pub fn with_targets(target_mounts: Vec<MountChoice>) -> Self {
         Self {
             target_mounts,
@@ -1139,6 +1246,28 @@ pub struct ClockFields {
 }
 
 impl ClockFields {
+    pub const fn spec_time() -> FieldSpec {
+        FieldSpec {
+            section: Some("Reference clock (both or neither)"),
+            label: "Ref. time",
+            flag: "--reference-time",
+            placeholder: "RFC 3339 from radio/GPS/phone clock (press Enter to stamp)",
+            kind: FieldKind::Time,
+            required: false,
+        }
+    }
+
+    pub const fn spec_how() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Ref. source",
+            flag: "--reference-how",
+            placeholder: "e.g. DCF77 radio clock",
+            kind: FieldKind::Text,
+            required: false,
+        }
+    }
+
     pub fn commit_at(&mut self, local_ns: i128) {
         let rt = self.reference_time.trim();
         if !rt.is_empty() && host::parse_rfc3339(rt).is_ok() {
@@ -1164,12 +1293,7 @@ impl ClockFields {
     }
 
     pub fn utc_hint(&self) -> Option<String> {
-        let trimmed = self.reference_time.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let ns = host::parse_rfc3339(trimmed).ok()?;
-        Some(format!("UTC: {}", host::rfc3339_utc_ns(ns)))
+        utc_conversion_hint(&self.reference_time)
     }
 
     pub fn validate_time(&self) -> Option<String> {
@@ -1208,8 +1332,22 @@ impl ClockFields {
     }
 }
 
+pub fn utc_conversion_hint(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let ns = host::parse_rfc3339(trimmed).ok()?;
+    let full = host::rfc3339_utc_ns(ns);
+    let formatted = match full.strip_suffix(".000000000Z") {
+        Some(prefix) => format!("{prefix}Z"),
+        None => full,
+    };
+    Some(format!("UTC: {formatted}"))
+}
+
 /// Shared warrant scope fields (`--scope`, `--legal-basis`, `--include`, `--exclude`,
-/// `--not-before`, `--not-after`, `--time-basis`, `--list-out-of-scope`).
+/// `--not-before`, `--not-after`, `--time-basis`, `--unknown-time`, `--list-out-of-scope`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeFields {
     pub legal_basis: String,
@@ -1220,6 +1358,7 @@ pub struct ScopeFields {
     pub not_before: String,
     pub not_after: String,
     pub time_basis: TimeBasis,
+    pub unknown_time: UnknownTimeArg,
     pub list_out_of_scope: bool,
     pub scope_file: String,
 }
@@ -1235,6 +1374,7 @@ impl Default for ScopeFields {
             not_before: String::new(),
             not_after: String::new(),
             time_basis: TimeBasis::Modified,
+            unknown_time: UnknownTimeArg::Exclude,
             list_out_of_scope: false,
             scope_file: String::new(),
         }
@@ -1242,6 +1382,97 @@ impl Default for ScopeFields {
 }
 
 impl ScopeFields {
+    pub const fn spec_scope_file(section: &'static str) -> FieldSpec {
+        FieldSpec {
+            section: Some(section),
+            label: "Scope JSON",
+            flag: "--scope",
+            placeholder: "leave blank for inline scope fields below",
+            kind: FieldKind::Path { dirs_only: false },
+            required: false,
+        }
+    }
+
+    pub const fn spec_legal_basis() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Legal basis",
+            flag: "--legal-basis",
+            placeholder: "warrant or order reference",
+            kind: FieldKind::Text,
+            required: false,
+        }
+    }
+
+    pub const fn spec_includes(placeholder: &'static str) -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Include globs",
+            flag: "--include",
+            placeholder,
+            kind: FieldKind::List { paths: false },
+            required: false,
+        }
+    }
+
+    pub const fn spec_excludes(placeholder: &'static str) -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Exclude globs",
+            flag: "--exclude",
+            placeholder,
+            kind: FieldKind::List { paths: false },
+            required: false,
+        }
+    }
+
+    pub const fn spec_not_before(required: bool) -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: if required {
+                "Not before*"
+            } else {
+                "Not before"
+            },
+            flag: "--not-before",
+            placeholder: "RFC 3339 with zone, e.g. 2026-01-01T00:00:00+01:00",
+            kind: FieldKind::Time,
+            required,
+        }
+    }
+
+    pub const fn spec_not_after(required: bool) -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: if required { "Not after*" } else { "Not after" },
+            flag: "--not-after",
+            placeholder: "RFC 3339 with zone, e.g. 2026-07-01T00:00:00+02:00",
+            kind: FieldKind::Time,
+            required,
+        }
+    }
+
+    pub const fn spec_unknown_time() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "Unknown time",
+            flag: "--unknown-time",
+            placeholder: "",
+            kind: FieldKind::Enum,
+            required: false,
+        }
+    }
+
+    pub const fn spec_list_out_of_scope() -> FieldSpec {
+        FieldSpec {
+            section: None,
+            label: "List excluded",
+            flag: "--list-out-of-scope",
+            placeholder: "",
+            kind: FieldKind::Bool { safety: false },
+            required: false,
+        }
+    }
     pub fn has_inline_scope(&self, check_time_basis: bool) -> bool {
         !self.legal_basis.trim().is_empty()
             || !self.include.is_empty()
@@ -1249,6 +1480,12 @@ impl ScopeFields {
             || !self.not_before.trim().is_empty()
             || !self.not_after.trim().is_empty()
             || (check_time_basis && self.time_basis != TimeBasis::Modified)
+            || self.unknown_time != UnknownTimeArg::Exclude
+            || self.list_out_of_scope
+    }
+
+    pub fn has_any_inline(&self, check_time_basis: bool) -> bool {
+        self.has_inline_scope(check_time_basis)
     }
 
     pub fn utc_hint(&self, is_not_before: bool) -> Option<String> {
@@ -1257,11 +1494,15 @@ impl ScopeFields {
         } else {
             self.not_after.trim()
         };
-        if raw.is_empty() {
-            return None;
-        }
-        let ns = host::parse_rfc3339(raw).ok()?;
-        Some(format!("UTC: {}", host::rfc3339_utc_ns(ns)))
+        utc_conversion_hint(raw)
+    }
+
+    pub fn utc_hint_not_before(&self) -> Option<String> {
+        self.utc_hint(true)
+    }
+
+    pub fn utc_hint_not_after(&self) -> Option<String> {
+        self.utc_hint(false)
     }
 
     pub fn validate_scope_file(&self, check_time_basis: bool) -> Option<String> {
@@ -1801,14 +2042,7 @@ impl IngestForm {
 
     pub fn utc_hint(&self, f: IngestField) -> Option<String> {
         match f {
-            IngestField::ReceivedAt => {
-                let raw = self.received_at.trim();
-                if raw.is_empty() {
-                    return None;
-                }
-                let ns = host::parse_rfc3339(raw).ok()?;
-                Some(format!("UTC: {}", host::rfc3339_utc_ns(ns)))
-            }
+            IngestField::ReceivedAt => utc_conversion_hint(&self.received_at),
             IngestField::ReferenceTime => self.clock.utc_hint(),
             _ => None,
         }
@@ -3038,6 +3272,7 @@ pub struct DbForm {
     pub output: OutputFields,
     pub clock: ClockFields,
     pub tool_probe: Option<DbToolProbe>,
+    pub tool_probe_fn: fn(crate::db::Engine) -> Vec<(String, Option<String>)>,
     pub field: DbField,
     pub cursor: usize,
     pub editing: bool,
@@ -3068,6 +3303,7 @@ impl DbForm {
             output: OutputFields::with_targets(target_mounts),
             clock: ClockFields::default(),
             tool_probe: None,
+            tool_probe_fn: probe_db_tools,
             field: DbField::CaseNumber,
             cursor: 0,
             editing: false,
@@ -3128,7 +3364,7 @@ impl DbForm {
         {
             return;
         }
-        self.tool_probe = Some((self.engine, probe_db_tools(self.engine)));
+        self.tool_probe = Some((self.engine, (self.tool_probe_fn)(self.engine)));
     }
 
     pub fn refresh_probes(&mut self) {
@@ -3372,6 +3608,2835 @@ impl DbForm {
     }
 }
 
+// ==================================================================
+// Mode 4: ImapForm (`dfcollect imap`)
+// ==================================================================
+
+impl crate::mail::Auth {
+    pub const ALL: [Self; 4] = [Self::Auto, Self::Plain, Self::Login, Self::Xoauth2];
+
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Plain => "plain",
+            Self::Login => "login",
+            Self::Xoauth2 => "xoauth2",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto (XOAUTH2 w/ token, else PLAIN/LOGIN)",
+            Self::Plain => "plain (SASL PLAIN)",
+            Self::Login => "login (IMAP LOGIN)",
+            Self::Xoauth2 => "xoauth2 (OAuth 2.0 bearer token)",
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        if forward {
+            Self::ALL[(idx + 1) % Self::ALL.len()]
+        } else {
+            Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+        }
+    }
+}
+
+impl crate::mail::Security {
+    pub const ALL: [Self; 3] = [Self::Tls, Self::StartTls, Self::Plaintext];
+
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Tls => "tls",
+            Self::StartTls => "start-tls",
+            Self::Plaintext => "plaintext",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tls => "tls (implicit TLS on port 993; default)",
+            Self::StartTls => "start-tls (STARTTLS upgrade on port 143)",
+            Self::Plaintext => "plaintext (no encryption; tests only)",
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        if forward {
+            Self::ALL[(idx + 1) % Self::ALL.len()]
+        } else {
+            Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+        }
+    }
+}
+
+/// Fingerprint of the IMAP connection fields; if any of these change,
+/// a cached preview `Credential` is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImapConnKey {
+    pub server: String,
+    pub user: String,
+    pub auth: crate::mail::Auth,
+    pub security: crate::mail::Security,
+    pub tls_sha256: String,
+    pub password_file: String,
+    pub token_file: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImapField {
+    CaseNumber,
+    EvidenceNumber,
+    Examiner,
+    Description,
+    Notes,
+    Server,
+    User,
+    Auth,
+    PasswordFile,
+    TokenFile,
+    Security,
+    TlsSha256,
+    Timeout,
+    OutputPath,
+    ScopeFile,
+    LegalBasis,
+    Includes,
+    Excludes,
+    NotBefore,
+    NotAfter,
+    UnknownTime,
+    ListOutOfScope,
+    ReferenceTime,
+    ReferenceHow,
+    Md5,
+    Sha1,
+    Compress,
+    AllowTmpfs,
+    PreviewButton,
+}
+
+impl ImapField {
+    pub const ALL: [Self; 29] = [
+        Self::CaseNumber,
+        Self::EvidenceNumber,
+        Self::Examiner,
+        Self::Description,
+        Self::Notes,
+        Self::Server,
+        Self::User,
+        Self::Auth,
+        Self::PasswordFile,
+        Self::TokenFile,
+        Self::Security,
+        Self::TlsSha256,
+        Self::Timeout,
+        Self::OutputPath,
+        Self::ScopeFile,
+        Self::LegalBasis,
+        Self::Includes,
+        Self::Excludes,
+        Self::NotBefore,
+        Self::NotAfter,
+        Self::UnknownTime,
+        Self::ListOutOfScope,
+        Self::ReferenceTime,
+        Self::ReferenceHow,
+        Self::Md5,
+        Self::Sha1,
+        Self::Compress,
+        Self::AllowTmpfs,
+        Self::PreviewButton,
+    ];
+
+    pub fn spec(self) -> FieldSpec {
+        match self {
+            Self::CaseNumber => CaseFields::spec_case(),
+            Self::EvidenceNumber => CaseFields::spec_evidence("e.g. mail01"),
+            Self::Examiner => CaseFields::spec_examiner(),
+            Self::Description => CaseFields::spec_description(),
+            Self::Notes => CaseFields::spec_notes(),
+            Self::Server => FieldSpec {
+                section: Some("IMAP Account & Connection"),
+                label: "IMAP server*",
+                flag: "SERVER",
+                placeholder: "mail.example.org or mail.example.org:993",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::User => FieldSpec {
+                section: None,
+                label: "Account (user)*",
+                flag: "-u / --user",
+                placeholder: "e.g. alice@example.org",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::Auth => FieldSpec {
+                section: None,
+                label: "Authentication",
+                flag: "--auth",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::PasswordFile => FieldSpec {
+                section: None,
+                label: "Password file",
+                flag: "--password-file",
+                placeholder: "blank = ask on preview/start",
+                kind: FieldKind::Path { dirs_only: false },
+                required: false,
+            },
+            Self::TokenFile => FieldSpec {
+                section: None,
+                label: "Token file",
+                flag: "--token-file",
+                placeholder: "file with bearer token (first line)",
+                kind: FieldKind::Path { dirs_only: false },
+                required: false,
+            },
+            Self::Security => FieldSpec {
+                section: None,
+                label: "Security",
+                flag: "--security",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::TlsSha256 => FieldSpec {
+                section: None,
+                label: "Cert SHA-256",
+                flag: "--tls-sha256",
+                placeholder: "optional 64-hex leaf cert SHA-256",
+                kind: FieldKind::Text,
+                required: false,
+            },
+            Self::Timeout => FieldSpec {
+                section: None,
+                label: "Timeout (s)",
+                flag: "--timeout",
+                placeholder: "120",
+                kind: FieldKind::Text,
+                required: false,
+            },
+            Self::OutputPath => OutputFields::spec_output_dir(Some("Output collection directory")),
+            Self::ScopeFile => ScopeFields::spec_scope_file("Scope (INTERNALDATE, <folder>/<uid>)"),
+            Self::LegalBasis => ScopeFields::spec_legal_basis(),
+            Self::Includes => ScopeFields::spec_includes(
+                "Enter adds folder/uid glob (e.g. INBOX/**); Del removes",
+            ),
+            Self::Excludes => {
+                ScopeFields::spec_excludes("Enter adds exclude glob (e.g. Trash/**); Del removes")
+            }
+            Self::NotBefore => ScopeFields::spec_not_before(false),
+            Self::NotAfter => ScopeFields::spec_not_after(false),
+            Self::UnknownTime => ScopeFields::spec_unknown_time(),
+            Self::ListOutOfScope => ScopeFields::spec_list_out_of_scope(),
+            Self::ReferenceTime => ClockFields::spec_time(),
+            Self::ReferenceHow => ClockFields::spec_how(),
+            Self::Md5 => OutputFields::spec_md5(),
+            Self::Sha1 => OutputFields::spec_sha1(),
+            Self::Compress => OutputFields::spec_compress(),
+            Self::AllowTmpfs => OutputFields::spec_allow_tmpfs(),
+            Self::PreviewButton => FieldSpec {
+                section: None,
+                label: "Preview",
+                flag: "--dry-run",
+                placeholder: "",
+                kind: FieldKind::Action,
+                required: false,
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.spec().label
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ImapForm {
+    pub case: CaseFields,
+    pub server: String,
+    pub user: String,
+    pub auth: crate::mail::Auth,
+    pub password_file: String,
+    pub token_file: String,
+    pub security: crate::mail::Security,
+    pub tls_sha256: String,
+    pub timeout: String,
+    pub output: OutputFields,
+    pub scope: ScopeFields,
+    pub clock: ClockFields,
+    pub field: ImapField,
+    pub cursor: usize,
+    pub editing: bool,
+}
+
+impl Default for ImapForm {
+    fn default() -> Self {
+        Self::with_targets(Vec::new())
+    }
+}
+
+impl ImapForm {
+    pub fn with_targets(target_mounts: Vec<MountChoice>) -> Self {
+        Self {
+            case: CaseFields::default(),
+            server: String::new(),
+            user: String::new(),
+            auth: crate::mail::Auth::Auto,
+            password_file: String::new(),
+            token_file: String::new(),
+            security: crate::mail::Security::Tls,
+            tls_sha256: String::new(),
+            timeout: "120".into(),
+            output: OutputFields::with_targets(target_mounts),
+            scope: ScopeFields::default(),
+            clock: ClockFields::default(),
+            field: ImapField::CaseNumber,
+            cursor: 0,
+            editing: false,
+        }
+    }
+
+    pub fn conn_key(&self) -> ImapConnKey {
+        ImapConnKey {
+            server: self.server.trim().to_string(),
+            user: self.user.trim().to_string(),
+            auth: self.auth,
+            security: self.security,
+            tls_sha256: self.tls_sha256.trim().to_ascii_lowercase(),
+            password_file: self.password_file.trim().to_string(),
+            token_file: self.token_file.trim().to_string(),
+        }
+    }
+
+    pub fn export_shared(&self) -> SharedFormState {
+        SharedFormState {
+            case: self.case.case.clone(),
+            examiner: self.case.examiner.clone(),
+            clock: self.clock.clone(),
+            scope: self.scope.clone(),
+            md5: self.output.md5,
+            sha1: self.output.sha1,
+            compress: self.output.compress,
+        }
+    }
+
+    pub fn import_shared(&mut self, shared: &SharedFormState) {
+        if !shared.case.is_empty() {
+            self.case.case = shared.case.clone();
+        }
+        if !shared.examiner.is_empty() {
+            self.case.examiner = shared.examiner.clone();
+        }
+        if !shared.clock.reference_time.is_empty() || !shared.clock.reference_how.is_empty() {
+            self.clock = shared.clock.clone();
+        }
+        if !shared.scope.has_any_inline(false) && shared.scope.scope_file.is_empty() {
+            // keep local scope
+        } else {
+            self.scope = shared.scope.clone();
+        }
+        self.output.md5 = shared.md5;
+        self.output.sha1 = shared.sha1;
+        self.output.compress = shared.compress;
+        self.output
+            .update_suggestion(&self.case.case, &self.case.evidence);
+    }
+
+    pub fn refresh_probes(&mut self) {
+        self.output.refresh_probe(None);
+    }
+
+    pub fn applies(&self, f: ImapField) -> bool {
+        let has_scope = !self.scope.scope_file.trim().is_empty();
+        match f {
+            ImapField::PasswordFile => self.auth != crate::mail::Auth::Xoauth2,
+            ImapField::TokenFile => matches!(
+                self.auth,
+                crate::mail::Auth::Auto | crate::mail::Auth::Xoauth2
+            ),
+            ImapField::TlsSha256 => self.security != crate::mail::Security::Plaintext,
+            ImapField::LegalBasis => !has_scope || !self.scope.legal_basis.trim().is_empty(),
+            ImapField::Includes => !has_scope || !self.scope.include.is_empty(),
+            ImapField::Excludes => !has_scope || !self.scope.exclude.is_empty(),
+            ImapField::NotBefore => !has_scope || !self.scope.not_before.trim().is_empty(),
+            ImapField::NotAfter => !has_scope || !self.scope.not_after.trim().is_empty(),
+            ImapField::UnknownTime => {
+                !has_scope || self.scope.unknown_time != UnknownTimeArg::Exclude
+            }
+            ImapField::ListOutOfScope => !has_scope || self.scope.list_out_of_scope,
+            _ => true,
+        }
+    }
+
+    pub fn focus_order(&self) -> Vec<ImapField> {
+        ImapField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .collect()
+    }
+
+    pub fn text(&self, f: ImapField) -> Option<&String> {
+        match f {
+            ImapField::CaseNumber => Some(&self.case.case),
+            ImapField::EvidenceNumber => Some(&self.case.evidence),
+            ImapField::Examiner => Some(&self.case.examiner),
+            ImapField::Description => Some(&self.case.description),
+            ImapField::Notes => Some(&self.case.notes),
+            ImapField::Server => Some(&self.server),
+            ImapField::User => Some(&self.user),
+            ImapField::PasswordFile => Some(&self.password_file),
+            ImapField::TokenFile => Some(&self.token_file),
+            ImapField::TlsSha256 => Some(&self.tls_sha256),
+            ImapField::Timeout => Some(&self.timeout),
+            ImapField::OutputPath => Some(&self.output.output_path),
+            ImapField::ScopeFile => Some(&self.scope.scope_file),
+            ImapField::LegalBasis => Some(&self.scope.legal_basis),
+            ImapField::NotBefore => Some(&self.scope.not_before),
+            ImapField::NotAfter => Some(&self.scope.not_after),
+            ImapField::ReferenceTime => Some(&self.clock.reference_time),
+            ImapField::ReferenceHow => Some(&self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self, f: ImapField) -> Option<&mut String> {
+        match f {
+            ImapField::CaseNumber => Some(&mut self.case.case),
+            ImapField::EvidenceNumber => Some(&mut self.case.evidence),
+            ImapField::Examiner => Some(&mut self.case.examiner),
+            ImapField::Description => Some(&mut self.case.description),
+            ImapField::Notes => Some(&mut self.case.notes),
+            ImapField::Server => Some(&mut self.server),
+            ImapField::User => Some(&mut self.user),
+            ImapField::PasswordFile => Some(&mut self.password_file),
+            ImapField::TokenFile => Some(&mut self.token_file),
+            ImapField::TlsSha256 => Some(&mut self.tls_sha256),
+            ImapField::Timeout => Some(&mut self.timeout),
+            ImapField::OutputPath => Some(&mut self.output.output_path),
+            ImapField::ScopeFile => Some(&mut self.scope.scope_file),
+            ImapField::LegalBasis => Some(&mut self.scope.legal_basis),
+            ImapField::NotBefore => Some(&mut self.scope.not_before),
+            ImapField::NotAfter => Some(&mut self.scope.not_after),
+            ImapField::ReferenceTime => Some(&mut self.clock.reference_time),
+            ImapField::ReferenceHow => Some(&mut self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn set_focus(&mut self, next: ImapField) {
+        if self.field == ImapField::ReferenceTime
+            && next != ImapField::ReferenceTime
+            && self.clock.reference_entered_ns.is_none()
+            && !self.clock.reference_time.trim().is_empty()
+        {
+            self.clock.commit_now();
+        }
+        self.field = next;
+        self.editing = false;
+        self.cursor = self.text(next).map_or(0, String::len);
+    }
+
+    pub fn focus_next(&mut self, forward: bool) {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let idx = order.iter().position(|f| *f == self.field).unwrap_or(0);
+        let next_idx = if forward {
+            (idx + 1) % order.len()
+        } else {
+            (idx + order.len() - 1) % order.len()
+        };
+        self.set_focus(order[next_idx]);
+    }
+
+    pub fn toggle_regular(&mut self, f: ImapField, forward: bool) {
+        match f {
+            ImapField::Auth => self.auth = self.auth.cycle(forward),
+            ImapField::Security => self.security = self.security.cycle(forward),
+            ImapField::UnknownTime => {
+                self.scope.unknown_time = match self.scope.unknown_time {
+                    UnknownTimeArg::Exclude => UnknownTimeArg::Include,
+                    UnknownTimeArg::Include => UnknownTimeArg::Exclude,
+                };
+            }
+            ImapField::ListOutOfScope => {
+                self.scope.list_out_of_scope = !self.scope.list_out_of_scope
+            }
+            ImapField::Md5 => self.output.md5 = !self.output.md5,
+            ImapField::Sha1 => self.output.sha1 = !self.output.sha1,
+            ImapField::Compress => self.output.compress = !self.output.compress,
+            _ => {}
+        }
+    }
+
+    pub fn value_text(&self, f: ImapField) -> String {
+        match f {
+            ImapField::Auth => format!("◀ {} ▶", self.auth.label()),
+            ImapField::Security => format!("◀ {} ▶", self.security.label()),
+            ImapField::Includes => format_pattern_list(
+                &self.scope.include,
+                self.scope.include_idx,
+                "everything (default)",
+            ),
+            ImapField::Excludes => {
+                format_pattern_list(&self.scope.exclude, self.scope.exclude_idx, "none")
+            }
+            ImapField::UnknownTime => match self.scope.unknown_time {
+                UnknownTimeArg::Exclude => "◀ exclude (default) ▶".into(),
+                UnknownTimeArg::Include => "◀ include ▶".into(),
+            },
+            ImapField::ListOutOfScope => {
+                if self.scope.list_out_of_scope {
+                    "[!] ENABLED (records out-of-scope IDs in items.jsonl)".into()
+                } else {
+                    "[ ] disabled (count by reason only; default)".into()
+                }
+            }
+            ImapField::Md5 => {
+                if self.output.md5 {
+                    "[x] yes (--md5)".into()
+                } else {
+                    "[ ] no (SHA-256 always computed)".into()
+                }
+            }
+            ImapField::Sha1 => {
+                if self.output.sha1 {
+                    "[x] yes (--sha1)".into()
+                } else {
+                    "[ ] no".into()
+                }
+            }
+            ImapField::Compress => {
+                if self.output.compress {
+                    "[x] deflate (--compress)".into()
+                } else {
+                    "[ ] store uncompressed (default)".into()
+                }
+            }
+            ImapField::AllowTmpfs => {
+                if self.output.allow_tmpfs {
+                    "[!] ENABLED (--allow-tmpfs)".into()
+                } else {
+                    "[ ] disabled (refuse RAM output)".into()
+                }
+            }
+            ImapField::PreviewButton => "[ Preview mailbox & scope (F2) ]".into(),
+            _ => self.text(f).cloned().unwrap_or_default(),
+        }
+    }
+
+    pub fn utc_hint(&self, f: ImapField) -> Option<String> {
+        match f {
+            ImapField::NotBefore => self.scope.utc_hint_not_before(),
+            ImapField::NotAfter => self.scope.utc_hint_not_after(),
+            ImapField::ReferenceTime => self.clock.utc_hint(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_field(&self, f: ImapField) -> Option<String> {
+        if !self.applies(f) {
+            return None;
+        }
+        match f {
+            ImapField::CaseNumber => self.case.validate_case(),
+            ImapField::EvidenceNumber => self.case.validate_evidence(),
+            ImapField::Examiner => self.case.validate_examiner(),
+            ImapField::Server => {
+                let s = self.server.trim();
+                if s.is_empty() {
+                    return Some("IMAP server (SERVER) is required".into());
+                }
+                if let Some(rest) = s.strip_prefix('[') {
+                    let Some((host, after)) = rest.split_once(']') else {
+                        return Some("unclosed '[' in IPv6 server address".into());
+                    };
+                    if host.is_empty() {
+                        return Some("server host is empty".into());
+                    }
+                    if let Some(port) = after.strip_prefix(':') {
+                        if port.parse::<u16>().ok().filter(|&p| p > 0).is_none() {
+                            return Some("port in SERVER must be in 1..=65535".into());
+                        }
+                    } else if !after.is_empty() {
+                        return Some("unexpected characters after ']' in SERVER".into());
+                    }
+                } else if let Some((host, port)) = s.rsplit_once(':') {
+                    if !host.contains(':') {
+                        if host.is_empty() {
+                            return Some("server host is empty".into());
+                        }
+                        if port.parse::<u16>().ok().filter(|&p| p > 0).is_none() {
+                            return Some("port in SERVER must be in 1..=65535".into());
+                        }
+                    }
+                }
+                None
+            }
+            ImapField::User => self
+                .user
+                .trim()
+                .is_empty()
+                .then(|| "account (-u / --user) is required".into()),
+            ImapField::PasswordFile => {
+                let pf = self.password_file.trim();
+                if pf.is_empty() {
+                    return None;
+                }
+                if self.applies(ImapField::TokenFile) && !self.token_file.trim().is_empty() {
+                    return Some("--password-file cannot be combined with --token-file".into());
+                }
+                let p = expand_tilde(Path::new(pf));
+                if !p.is_file() {
+                    return Some("password file does not exist".into());
+                }
+                None
+            }
+            ImapField::TokenFile => {
+                let tf = self.token_file.trim();
+                if tf.is_empty() {
+                    if self.auth == crate::mail::Auth::Xoauth2 {
+                        return Some("--token-file is required for --auth xoauth2".into());
+                    }
+                    return None;
+                }
+                if self.applies(ImapField::PasswordFile) && !self.password_file.trim().is_empty() {
+                    return Some("--token-file cannot be combined with --password-file".into());
+                }
+                let p = expand_tilde(Path::new(tf));
+                if !p.is_file() {
+                    return Some("token file does not exist".into());
+                }
+                None
+            }
+            ImapField::TlsSha256 => {
+                let pin = self.tls_sha256.trim();
+                if pin.is_empty() {
+                    return None;
+                }
+                if pin.len() != 64 || !pin.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some("--tls-sha256 must be 64 hexadecimal digits".into());
+                }
+                None
+            }
+            ImapField::Timeout => {
+                let t = self.timeout.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                match t.parse::<u64>() {
+                    Ok(n) if n > 0 => None,
+                    _ => Some("timeout (--timeout) must be a positive integer (seconds)".into()),
+                }
+            }
+            ImapField::OutputPath => self.output.validate_output(),
+            ImapField::ScopeFile => self.scope.validate_scope_file(false),
+            ImapField::NotBefore => self.scope.validate_not_before(),
+            ImapField::NotAfter => self.scope.validate_not_after(),
+            ImapField::ReferenceTime => self.clock.validate_time(),
+            ImapField::ReferenceHow => self.clock.validate_how(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_all(&self) -> Vec<(ImapField, String)> {
+        ImapField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .filter_map(|f| self.validate_field(f).map(|msg| (f, msg)))
+            .collect()
+    }
+
+    pub fn reset_for_next_acquisition(&mut self) {
+        self.case.reset_per_run();
+        self.clock.reset_per_run();
+        self.output.reset_per_run();
+        self.set_focus(ImapField::EvidenceNumber);
+    }
+}
+
+// ==================================================================
+// Mode 5: GraphForm (`dfcollect graph`) & shared Graph cloud/auth
+// ==================================================================
+
+pub const DEFAULT_GRAPH_ENDPOINT: &str = "https://graph.microsoft.com";
+pub const DEFAULT_LOGIN_ENDPOINT: &str = "https://login.microsoftonline.com";
+
+impl crate::graph::GraphAuth {
+    pub const ALL: [Self; 3] = [Self::Device, Self::App, Self::Token];
+
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::App => "app",
+            Self::Token => "token",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Device => "device (device code; delegated access)",
+            Self::App => "app (client secret; application access)",
+            Self::Token => "token (access token from --token-file)",
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        if forward {
+            Self::ALL[(idx + 1) % Self::ALL.len()]
+        } else {
+            Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+        }
+    }
+}
+
+/// National cloud preset for Microsoft Graph (`--graph-endpoint` / `--login-endpoint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphCloud {
+    Global,
+    UsGov,
+    UsGovDod,
+    China,
+    Custom,
+}
+
+impl GraphCloud {
+    pub const ALL: [Self; 5] = [
+        Self::Global,
+        Self::UsGov,
+        Self::UsGovDod,
+        Self::China,
+        Self::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global (graph.microsoft.com; default)",
+            Self::UsGov => "US Gov (graph.microsoft.us)",
+            Self::UsGovDod => "US Gov DoD (dod-graph.microsoft.us)",
+            Self::China => "China (microsoftgraph.chinacloudapi.cn)",
+            Self::Custom => "custom (--graph-endpoint / --login-endpoint)",
+        }
+    }
+
+    pub fn endpoints(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Global => Some((DEFAULT_GRAPH_ENDPOINT, DEFAULT_LOGIN_ENDPOINT)),
+            Self::UsGov => Some((
+                "https://graph.microsoft.us",
+                "https://login.microsoftonline.us",
+            )),
+            Self::UsGovDod => Some((
+                "https://dod-graph.microsoft.us",
+                "https://login.microsoftonline.us",
+            )),
+            Self::China => Some((
+                "https://microsoftgraph.chinacloudapi.cn",
+                "https://login.chinacloudapi.cn",
+            )),
+            Self::Custom => None,
+        }
+    }
+
+    pub fn from_endpoints(graph: &str, login: &str) -> Self {
+        let g = graph.trim().trim_end_matches('/');
+        let l = login.trim().trim_end_matches('/');
+        for preset in [Self::Global, Self::UsGov, Self::UsGovDod, Self::China] {
+            if let Some((pg, pl)) = preset.endpoints() {
+                if g.eq_ignore_ascii_case(pg) && l.eq_ignore_ascii_case(pl) {
+                    return preset;
+                }
+            }
+        }
+        Self::Custom
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        if forward {
+            Self::ALL[(idx + 1) % Self::ALL.len()]
+        } else {
+            Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+        }
+    }
+}
+
+/// Fingerprint of the Graph connection fields; if any of these change,
+/// a cached preview `Credential` is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphConnKey {
+    pub auth: crate::graph::GraphAuth,
+    pub tenant: String,
+    pub client_id: String,
+    pub client_secret_file: String,
+    pub token_file: String,
+    pub graph_endpoint: String,
+    pub login_endpoint: String,
+    pub mailbox: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphField {
+    CaseNumber,
+    EvidenceNumber,
+    Examiner,
+    Description,
+    Notes,
+    Mailbox,
+    Auth,
+    Tenant,
+    ClientId,
+    ClientSecretFile,
+    TokenFile,
+    Cloud,
+    GraphEndpoint,
+    LoginEndpoint,
+    Timeout,
+    OutputPath,
+    ScopeFile,
+    LegalBasis,
+    Includes,
+    Excludes,
+    NotBefore,
+    NotAfter,
+    UnknownTime,
+    ListOutOfScope,
+    ReferenceTime,
+    ReferenceHow,
+    Md5,
+    Sha1,
+    Compress,
+    AllowTmpfs,
+    PreviewButton,
+}
+
+impl GraphField {
+    pub const ALL: [Self; 31] = [
+        Self::CaseNumber,
+        Self::EvidenceNumber,
+        Self::Examiner,
+        Self::Description,
+        Self::Notes,
+        Self::Mailbox,
+        Self::Auth,
+        Self::Tenant,
+        Self::ClientId,
+        Self::ClientSecretFile,
+        Self::TokenFile,
+        Self::Cloud,
+        Self::GraphEndpoint,
+        Self::LoginEndpoint,
+        Self::Timeout,
+        Self::OutputPath,
+        Self::ScopeFile,
+        Self::LegalBasis,
+        Self::Includes,
+        Self::Excludes,
+        Self::NotBefore,
+        Self::NotAfter,
+        Self::UnknownTime,
+        Self::ListOutOfScope,
+        Self::ReferenceTime,
+        Self::ReferenceHow,
+        Self::Md5,
+        Self::Sha1,
+        Self::Compress,
+        Self::AllowTmpfs,
+        Self::PreviewButton,
+    ];
+
+    pub fn spec(self) -> FieldSpec {
+        match self {
+            Self::CaseNumber => CaseFields::spec_case(),
+            Self::EvidenceNumber => CaseFields::spec_evidence("e.g. m365mail01"),
+            Self::Examiner => CaseFields::spec_examiner(),
+            Self::Description => CaseFields::spec_description(),
+            Self::Notes => CaseFields::spec_notes(),
+            Self::Mailbox => FieldSpec {
+                section: Some("Microsoft 365 Account & Connection"),
+                label: "Mailbox*",
+                flag: "--mailbox",
+                placeholder: "me (device/token) or user@contoso.example",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::Auth => FieldSpec {
+                section: None,
+                label: "Authentication",
+                flag: "--auth",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::Tenant => FieldSpec {
+                section: None,
+                label: "Tenant*",
+                flag: "--tenant",
+                placeholder: "organizations or tenant domain / UUID",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::ClientId => FieldSpec {
+                section: None,
+                label: "App client ID*",
+                flag: "--client-id",
+                placeholder: "Entra app registration client ID",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::ClientSecretFile => FieldSpec {
+                section: None,
+                label: "Secret file",
+                flag: "--client-secret-file",
+                placeholder: "blank = ask on preview/start",
+                kind: FieldKind::Path { dirs_only: false },
+                required: false,
+            },
+            Self::TokenFile => FieldSpec {
+                section: None,
+                label: "Token file*",
+                flag: "--token-file",
+                placeholder: "file with Graph access token (first line)",
+                kind: FieldKind::Path { dirs_only: false },
+                required: true,
+            },
+            Self::Cloud => FieldSpec {
+                section: None,
+                label: "Cloud preset",
+                flag: "--graph-endpoint",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::GraphEndpoint => FieldSpec {
+                section: None,
+                label: "Graph endpoint*",
+                flag: "--graph-endpoint",
+                placeholder: DEFAULT_GRAPH_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::LoginEndpoint => FieldSpec {
+                section: None,
+                label: "Login endpoint*",
+                flag: "--login-endpoint",
+                placeholder: DEFAULT_LOGIN_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::Timeout => FieldSpec {
+                section: None,
+                label: "Timeout (s)",
+                flag: "--timeout",
+                placeholder: "120",
+                kind: FieldKind::Text,
+                required: false,
+            },
+            Self::OutputPath => OutputFields::spec_output_dir(Some("Output collection directory")),
+            Self::ScopeFile => ScopeFields::spec_scope_file(
+                "Scope (receivedDateTime, <folder>/<received>Z-<hash>)",
+            ),
+            Self::LegalBasis => ScopeFields::spec_legal_basis(),
+            Self::Includes => {
+                ScopeFields::spec_includes("Enter adds folder glob (e.g. Inbox/**); Del removes")
+            }
+            Self::Excludes => ScopeFields::spec_excludes("Enter adds exclude glob; Del removes"),
+            Self::NotBefore => ScopeFields::spec_not_before(false),
+            Self::NotAfter => ScopeFields::spec_not_after(false),
+            Self::UnknownTime => ScopeFields::spec_unknown_time(),
+            Self::ListOutOfScope => ScopeFields::spec_list_out_of_scope(),
+            Self::ReferenceTime => ClockFields::spec_time(),
+            Self::ReferenceHow => ClockFields::spec_how(),
+            Self::Md5 => OutputFields::spec_md5(),
+            Self::Sha1 => OutputFields::spec_sha1(),
+            Self::Compress => OutputFields::spec_compress(),
+            Self::AllowTmpfs => OutputFields::spec_allow_tmpfs(),
+            Self::PreviewButton => FieldSpec {
+                section: None,
+                label: "Preview",
+                flag: "--dry-run",
+                placeholder: "",
+                kind: FieldKind::Action,
+                required: false,
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.spec().label
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphForm {
+    pub case: CaseFields,
+    pub mailbox: String,
+    pub auth: crate::graph::GraphAuth,
+    pub tenant: String,
+    pub client_id: String,
+    pub client_secret_file: String,
+    pub token_file: String,
+    pub cloud: GraphCloud,
+    pub graph_endpoint: String,
+    pub login_endpoint: String,
+    pub timeout: String,
+    pub output: OutputFields,
+    pub scope: ScopeFields,
+    pub clock: ClockFields,
+    pub field: GraphField,
+    pub cursor: usize,
+    pub editing: bool,
+}
+
+impl Default for GraphForm {
+    fn default() -> Self {
+        Self::with_targets(Vec::new())
+    }
+}
+
+impl GraphForm {
+    pub fn with_targets(target_mounts: Vec<MountChoice>) -> Self {
+        Self {
+            case: CaseFields::default(),
+            mailbox: "me".into(),
+            auth: crate::graph::GraphAuth::Device,
+            tenant: "organizations".into(),
+            client_id: String::new(),
+            client_secret_file: String::new(),
+            token_file: String::new(),
+            cloud: GraphCloud::Global,
+            graph_endpoint: DEFAULT_GRAPH_ENDPOINT.into(),
+            login_endpoint: DEFAULT_LOGIN_ENDPOINT.into(),
+            timeout: "120".into(),
+            output: OutputFields::with_targets(target_mounts),
+            scope: ScopeFields::default(),
+            clock: ClockFields::default(),
+            field: GraphField::CaseNumber,
+            cursor: 0,
+            editing: false,
+        }
+    }
+
+    pub fn conn_key(&self) -> GraphConnKey {
+        GraphConnKey {
+            auth: self.auth,
+            tenant: self.tenant.trim().to_string(),
+            client_id: self.client_id.trim().to_string(),
+            client_secret_file: self.client_secret_file.trim().to_string(),
+            token_file: self.token_file.trim().to_string(),
+            graph_endpoint: self.graph_endpoint.trim().trim_end_matches('/').to_string(),
+            login_endpoint: self.login_endpoint.trim().trim_end_matches('/').to_string(),
+            mailbox: self.mailbox.trim().to_string(),
+        }
+    }
+
+    pub fn sync_cloud_from_endpoints(&mut self) {
+        self.cloud = GraphCloud::from_endpoints(&self.graph_endpoint, &self.login_endpoint);
+    }
+
+    pub fn export_shared(&self) -> SharedFormState {
+        SharedFormState {
+            case: self.case.case.clone(),
+            examiner: self.case.examiner.clone(),
+            clock: self.clock.clone(),
+            scope: self.scope.clone(),
+            md5: self.output.md5,
+            sha1: self.output.sha1,
+            compress: self.output.compress,
+        }
+    }
+
+    pub fn import_shared(&mut self, shared: &SharedFormState) {
+        if !shared.case.is_empty() {
+            self.case.case = shared.case.clone();
+        }
+        if !shared.examiner.is_empty() {
+            self.case.examiner = shared.examiner.clone();
+        }
+        if !shared.clock.reference_time.is_empty() || !shared.clock.reference_how.is_empty() {
+            self.clock = shared.clock.clone();
+        }
+        if !shared.scope.has_any_inline(false) && shared.scope.scope_file.is_empty() {
+            // keep local scope
+        } else {
+            self.scope = shared.scope.clone();
+        }
+        self.output.md5 = shared.md5;
+        self.output.sha1 = shared.sha1;
+        self.output.compress = shared.compress;
+        self.output
+            .update_suggestion(&self.case.case, &self.case.evidence);
+    }
+
+    pub fn refresh_probes(&mut self) {
+        self.output.refresh_probe(None);
+    }
+
+    pub fn applies(&self, f: GraphField) -> bool {
+        let has_scope = !self.scope.scope_file.trim().is_empty();
+        match f {
+            GraphField::Tenant | GraphField::ClientId => {
+                self.auth != crate::graph::GraphAuth::Token
+            }
+            GraphField::ClientSecretFile => self.auth == crate::graph::GraphAuth::App,
+            GraphField::TokenFile => self.auth == crate::graph::GraphAuth::Token,
+            GraphField::GraphEndpoint | GraphField::LoginEndpoint => {
+                self.cloud == GraphCloud::Custom
+                    || self.graph_endpoint.trim() != DEFAULT_GRAPH_ENDPOINT
+                    || self.login_endpoint.trim() != DEFAULT_LOGIN_ENDPOINT
+            }
+            GraphField::LegalBasis => !has_scope || !self.scope.legal_basis.trim().is_empty(),
+            GraphField::Includes => !has_scope || !self.scope.include.is_empty(),
+            GraphField::Excludes => !has_scope || !self.scope.exclude.is_empty(),
+            GraphField::NotBefore => !has_scope || !self.scope.not_before.trim().is_empty(),
+            GraphField::NotAfter => !has_scope || !self.scope.not_after.trim().is_empty(),
+            GraphField::UnknownTime => {
+                !has_scope || self.scope.unknown_time != UnknownTimeArg::Exclude
+            }
+            GraphField::ListOutOfScope => !has_scope || self.scope.list_out_of_scope,
+            _ => true,
+        }
+    }
+
+    pub fn focus_order(&self) -> Vec<GraphField> {
+        GraphField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .collect()
+    }
+
+    pub fn text(&self, f: GraphField) -> Option<&String> {
+        match f {
+            GraphField::CaseNumber => Some(&self.case.case),
+            GraphField::EvidenceNumber => Some(&self.case.evidence),
+            GraphField::Examiner => Some(&self.case.examiner),
+            GraphField::Description => Some(&self.case.description),
+            GraphField::Notes => Some(&self.case.notes),
+            GraphField::Mailbox => Some(&self.mailbox),
+            GraphField::Tenant => Some(&self.tenant),
+            GraphField::ClientId => Some(&self.client_id),
+            GraphField::ClientSecretFile => Some(&self.client_secret_file),
+            GraphField::TokenFile => Some(&self.token_file),
+            GraphField::GraphEndpoint => Some(&self.graph_endpoint),
+            GraphField::LoginEndpoint => Some(&self.login_endpoint),
+            GraphField::Timeout => Some(&self.timeout),
+            GraphField::OutputPath => Some(&self.output.output_path),
+            GraphField::ScopeFile => Some(&self.scope.scope_file),
+            GraphField::LegalBasis => Some(&self.scope.legal_basis),
+            GraphField::NotBefore => Some(&self.scope.not_before),
+            GraphField::NotAfter => Some(&self.scope.not_after),
+            GraphField::ReferenceTime => Some(&self.clock.reference_time),
+            GraphField::ReferenceHow => Some(&self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self, f: GraphField) -> Option<&mut String> {
+        match f {
+            GraphField::CaseNumber => Some(&mut self.case.case),
+            GraphField::EvidenceNumber => Some(&mut self.case.evidence),
+            GraphField::Examiner => Some(&mut self.case.examiner),
+            GraphField::Description => Some(&mut self.case.description),
+            GraphField::Notes => Some(&mut self.case.notes),
+            GraphField::Mailbox => Some(&mut self.mailbox),
+            GraphField::Tenant => Some(&mut self.tenant),
+            GraphField::ClientId => Some(&mut self.client_id),
+            GraphField::ClientSecretFile => Some(&mut self.client_secret_file),
+            GraphField::TokenFile => Some(&mut self.token_file),
+            GraphField::GraphEndpoint => Some(&mut self.graph_endpoint),
+            GraphField::LoginEndpoint => Some(&mut self.login_endpoint),
+            GraphField::Timeout => Some(&mut self.timeout),
+            GraphField::OutputPath => Some(&mut self.output.output_path),
+            GraphField::ScopeFile => Some(&mut self.scope.scope_file),
+            GraphField::LegalBasis => Some(&mut self.scope.legal_basis),
+            GraphField::NotBefore => Some(&mut self.scope.not_before),
+            GraphField::NotAfter => Some(&mut self.scope.not_after),
+            GraphField::ReferenceTime => Some(&mut self.clock.reference_time),
+            GraphField::ReferenceHow => Some(&mut self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn set_focus(&mut self, next: GraphField) {
+        if self.field == GraphField::ReferenceTime
+            && next != GraphField::ReferenceTime
+            && self.clock.reference_entered_ns.is_none()
+            && !self.clock.reference_time.trim().is_empty()
+        {
+            self.clock.commit_now();
+        }
+        self.field = next;
+        self.editing = false;
+        self.cursor = self.text(next).map_or(0, String::len);
+    }
+
+    pub fn focus_next(&mut self, forward: bool) {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let idx = order.iter().position(|f| *f == self.field).unwrap_or(0);
+        let next_idx = if forward {
+            (idx + 1) % order.len()
+        } else {
+            (idx + order.len() - 1) % order.len()
+        };
+        self.set_focus(order[next_idx]);
+    }
+
+    pub fn toggle_regular(&mut self, f: GraphField, forward: bool) {
+        match f {
+            GraphField::Auth => self.auth = self.auth.cycle(forward),
+            GraphField::Cloud => {
+                self.cloud = self.cloud.cycle(forward);
+                if let Some((g, l)) = self.cloud.endpoints() {
+                    self.graph_endpoint = g.into();
+                    self.login_endpoint = l.into();
+                }
+            }
+            GraphField::UnknownTime => {
+                self.scope.unknown_time = match self.scope.unknown_time {
+                    UnknownTimeArg::Exclude => UnknownTimeArg::Include,
+                    UnknownTimeArg::Include => UnknownTimeArg::Exclude,
+                };
+            }
+            GraphField::ListOutOfScope => {
+                self.scope.list_out_of_scope = !self.scope.list_out_of_scope
+            }
+            GraphField::Md5 => self.output.md5 = !self.output.md5,
+            GraphField::Sha1 => self.output.sha1 = !self.output.sha1,
+            GraphField::Compress => self.output.compress = !self.output.compress,
+            _ => {}
+        }
+    }
+
+    pub fn value_text(&self, f: GraphField) -> String {
+        match f {
+            GraphField::Auth => format!("◀ {} ▶", self.auth.label()),
+            GraphField::Cloud => format!("◀ {} ▶", self.cloud.label()),
+            GraphField::Includes => format_pattern_list(
+                &self.scope.include,
+                self.scope.include_idx,
+                "everything (default)",
+            ),
+            GraphField::Excludes => {
+                format_pattern_list(&self.scope.exclude, self.scope.exclude_idx, "none")
+            }
+            GraphField::UnknownTime => match self.scope.unknown_time {
+                UnknownTimeArg::Exclude => "◀ exclude (default) ▶".into(),
+                UnknownTimeArg::Include => "◀ include ▶".into(),
+            },
+            GraphField::ListOutOfScope => {
+                if self.scope.list_out_of_scope {
+                    "[!] ENABLED (records out-of-scope IDs in items.jsonl)".into()
+                } else {
+                    "[ ] disabled (count by reason only; default)".into()
+                }
+            }
+            GraphField::Md5 => {
+                if self.output.md5 {
+                    "[x] yes (--md5)".into()
+                } else {
+                    "[ ] no (SHA-256 always computed)".into()
+                }
+            }
+            GraphField::Sha1 => {
+                if self.output.sha1 {
+                    "[x] yes (--sha1)".into()
+                } else {
+                    "[ ] no".into()
+                }
+            }
+            GraphField::Compress => {
+                if self.output.compress {
+                    "[x] deflate (--compress)".into()
+                } else {
+                    "[ ] store uncompressed (default)".into()
+                }
+            }
+            GraphField::AllowTmpfs => {
+                if self.output.allow_tmpfs {
+                    "[!] ENABLED (--allow-tmpfs)".into()
+                } else {
+                    "[ ] disabled (refuse RAM output)".into()
+                }
+            }
+            GraphField::PreviewButton => "[ Preview mailbox & scope (F2) ]".into(),
+            _ => self.text(f).cloned().unwrap_or_default(),
+        }
+    }
+
+    pub fn utc_hint(&self, f: GraphField) -> Option<String> {
+        match f {
+            GraphField::NotBefore => self.scope.utc_hint_not_before(),
+            GraphField::NotAfter => self.scope.utc_hint_not_after(),
+            GraphField::ReferenceTime => self.clock.utc_hint(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_field(&self, f: GraphField) -> Option<String> {
+        if !self.applies(f) {
+            return None;
+        }
+        match f {
+            GraphField::CaseNumber => self.case.validate_case(),
+            GraphField::EvidenceNumber => self.case.validate_evidence(),
+            GraphField::Examiner => self.case.validate_examiner(),
+            GraphField::Mailbox => {
+                let mb = self.mailbox.trim();
+                if mb.is_empty() {
+                    return Some("mailbox (--mailbox) is required".into());
+                }
+                if self.auth == crate::graph::GraphAuth::App && mb.eq_ignore_ascii_case("me") {
+                    return Some(
+                        "--auth app reads a named mailbox: give --mailbox <user@domain>".into(),
+                    );
+                }
+                None
+            }
+            GraphField::Tenant => {
+                let t = self.tenant.trim();
+                if t.is_empty() {
+                    return Some("tenant (--tenant) is required".into());
+                }
+                if self.auth == crate::graph::GraphAuth::App
+                    && (t.eq_ignore_ascii_case("organizations") || t.eq_ignore_ascii_case("common"))
+                {
+                    return Some(
+                        "--auth app needs a specific tenant ID or domain, not 'organizations'"
+                            .into(),
+                    );
+                }
+                None
+            }
+            GraphField::ClientId => self
+                .client_id
+                .trim()
+                .is_empty()
+                .then(|| "application client ID (--client-id) is required".into()),
+            GraphField::ClientSecretFile => {
+                let sf = self.client_secret_file.trim();
+                if sf.is_empty() {
+                    return None;
+                }
+                let p = expand_tilde(Path::new(sf));
+                if !p.is_file() {
+                    return Some("client secret file does not exist".into());
+                }
+                None
+            }
+            GraphField::TokenFile => {
+                let tf = self.token_file.trim();
+                if tf.is_empty() {
+                    return Some("--token-file is required for --auth token".into());
+                }
+                let p = expand_tilde(Path::new(tf));
+                if !p.is_file() {
+                    return Some("token file does not exist".into());
+                }
+                None
+            }
+            GraphField::GraphEndpoint => {
+                let u = self.graph_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--graph-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--graph-endpoint: {e:#}"))
+            }
+            GraphField::LoginEndpoint => {
+                let u = self.login_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--login-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--login-endpoint: {e:#}"))
+            }
+            GraphField::Timeout => {
+                let t = self.timeout.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                match t.parse::<u64>() {
+                    Ok(n) if n > 0 => None,
+                    _ => Some("timeout (--timeout) must be a positive integer (seconds)".into()),
+                }
+            }
+            GraphField::OutputPath => self.output.validate_output(),
+            GraphField::ScopeFile => self.scope.validate_scope_file(false),
+            GraphField::NotBefore => self.scope.validate_not_before(),
+            GraphField::NotAfter => self.scope.validate_not_after(),
+            GraphField::ReferenceTime => self.clock.validate_time(),
+            GraphField::ReferenceHow => self.clock.validate_how(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_all(&self) -> Vec<(GraphField, String)> {
+        GraphField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .filter_map(|f| self.validate_field(f).map(|msg| (f, msg)))
+            .collect()
+    }
+
+    pub fn reset_for_next_acquisition(&mut self) {
+        self.case.reset_per_run();
+        self.clock.reset_per_run();
+        self.output.reset_per_run();
+        self.set_focus(GraphField::EvidenceNumber);
+    }
+}
+
+// ==================================================================
+// Mode 6: GmailForm (`dfcollect gmail`)
+// ==================================================================
+
+pub const DEFAULT_GMAIL_ENDPOINT: &str = "https://gmail.googleapis.com";
+pub const DEFAULT_GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+pub const DEFAULT_GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+
+impl crate::gmail::GmailAuth {
+    pub const ALL: [Self; 3] = [Self::Installed, Self::ServiceAccount, Self::Token];
+
+    pub fn as_cli_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::ServiceAccount => "service-account",
+            Self::Token => "token",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Installed => "installed (Desktop OAuth 2.0 + PKCE)",
+            Self::ServiceAccount => "service-account (Workspace delegation)",
+            Self::Token => "token (access token from --token-file)",
+        }
+    }
+
+    pub fn cycle(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|x| *x == self).unwrap_or(0);
+        if forward {
+            Self::ALL[(idx + 1) % Self::ALL.len()]
+        } else {
+            Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+        }
+    }
+}
+
+/// Fingerprint of the Gmail connection fields; if any of these change,
+/// a cached preview `Credential` is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmailConnKey {
+    pub mailbox: String,
+    pub auth: crate::gmail::GmailAuth,
+    pub client_id: String,
+    pub client_secret_file: String,
+    pub key_file: String,
+    pub token_file: String,
+    pub gmail_endpoint: String,
+    pub token_endpoint: String,
+    pub auth_endpoint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmailField {
+    CaseNumber,
+    EvidenceNumber,
+    Examiner,
+    Description,
+    Notes,
+    Mailbox,
+    Auth,
+    ClientId,
+    ClientSecretFile,
+    KeyFile,
+    TokenFile,
+    GmailEndpoint,
+    TokenEndpoint,
+    AuthEndpoint,
+    Timeout,
+    OutputPath,
+    ScopeFile,
+    LegalBasis,
+    Includes,
+    Excludes,
+    NotBefore,
+    NotAfter,
+    UnknownTime,
+    ListOutOfScope,
+    ReferenceTime,
+    ReferenceHow,
+    Md5,
+    Sha1,
+    Compress,
+    AllowTmpfs,
+    PreviewButton,
+}
+
+impl GmailField {
+    pub const ALL: [Self; 31] = [
+        Self::CaseNumber,
+        Self::EvidenceNumber,
+        Self::Examiner,
+        Self::Description,
+        Self::Notes,
+        Self::Mailbox,
+        Self::Auth,
+        Self::ClientId,
+        Self::ClientSecretFile,
+        Self::KeyFile,
+        Self::TokenFile,
+        Self::GmailEndpoint,
+        Self::TokenEndpoint,
+        Self::AuthEndpoint,
+        Self::Timeout,
+        Self::OutputPath,
+        Self::ScopeFile,
+        Self::LegalBasis,
+        Self::Includes,
+        Self::Excludes,
+        Self::NotBefore,
+        Self::NotAfter,
+        Self::UnknownTime,
+        Self::ListOutOfScope,
+        Self::ReferenceTime,
+        Self::ReferenceHow,
+        Self::Md5,
+        Self::Sha1,
+        Self::Compress,
+        Self::AllowTmpfs,
+        Self::PreviewButton,
+    ];
+
+    pub fn spec(self) -> FieldSpec {
+        match self {
+            Self::CaseNumber => CaseFields::spec_case(),
+            Self::EvidenceNumber => CaseFields::spec_evidence("e.g. gmail01"),
+            Self::Examiner => CaseFields::spec_examiner(),
+            Self::Description => CaseFields::spec_description(),
+            Self::Notes => CaseFields::spec_notes(),
+            Self::Mailbox => FieldSpec {
+                section: Some("Gmail / Google Workspace Account"),
+                label: "Mailbox*",
+                flag: "--mailbox",
+                placeholder: "me (installed/token) or user@example.org",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::Auth => FieldSpec {
+                section: None,
+                label: "Authentication",
+                flag: "--auth",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::ClientId => FieldSpec {
+                section: None,
+                label: "OAuth client ID*",
+                flag: "--client-id",
+                placeholder: "Desktop app OAuth 2.0 client ID",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::ClientSecretFile => FieldSpec {
+                section: None,
+                label: "Secret file",
+                flag: "--client-secret-file",
+                placeholder: "blank = ask on preview/start",
+                kind: FieldKind::Path { dirs_only: false },
+                required: false,
+            },
+            Self::KeyFile => FieldSpec {
+                section: None,
+                label: "Key file (JSON)*",
+                flag: "--key-file",
+                placeholder: "path to service-account JSON key file",
+                kind: FieldKind::Path { dirs_only: false },
+                required: true,
+            },
+            Self::TokenFile => FieldSpec {
+                section: None,
+                label: "Token file*",
+                flag: "--token-file",
+                placeholder: "file with gmail.readonly token (first line)",
+                kind: FieldKind::Path { dirs_only: false },
+                required: true,
+            },
+            Self::GmailEndpoint => FieldSpec {
+                section: Some("Advanced Endpoints & Connection"),
+                label: "Gmail endpoint*",
+                flag: "--gmail-endpoint",
+                placeholder: DEFAULT_GMAIL_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::TokenEndpoint => FieldSpec {
+                section: None,
+                label: "Token endpoint*",
+                flag: "--token-endpoint",
+                placeholder: DEFAULT_GOOGLE_TOKEN_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::AuthEndpoint => FieldSpec {
+                section: None,
+                label: "Auth endpoint*",
+                flag: "--auth-endpoint",
+                placeholder: DEFAULT_GOOGLE_AUTH_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::Timeout => FieldSpec {
+                section: None,
+                label: "Timeout (s)",
+                flag: "--timeout",
+                placeholder: "120",
+                kind: FieldKind::Text,
+                required: false,
+            },
+            Self::OutputPath => OutputFields::spec_output_dir(Some("Output collection directory")),
+            Self::ScopeFile => {
+                ScopeFields::spec_scope_file("Scope (internalDate, <label>/<internalDate>Z-<id>)")
+            }
+            Self::LegalBasis => ScopeFields::spec_legal_basis(),
+            Self::Includes => {
+                ScopeFields::spec_includes("Enter adds label glob (e.g. INBOX/**); Del removes")
+            }
+            Self::Excludes => {
+                ScopeFields::spec_excludes("Enter adds exclude glob (e.g. SPAM/**); Del removes")
+            }
+            Self::NotBefore => ScopeFields::spec_not_before(false),
+            Self::NotAfter => ScopeFields::spec_not_after(false),
+            Self::UnknownTime => ScopeFields::spec_unknown_time(),
+            Self::ListOutOfScope => ScopeFields::spec_list_out_of_scope(),
+            Self::ReferenceTime => ClockFields::spec_time(),
+            Self::ReferenceHow => ClockFields::spec_how(),
+            Self::Md5 => OutputFields::spec_md5(),
+            Self::Sha1 => OutputFields::spec_sha1(),
+            Self::Compress => OutputFields::spec_compress(),
+            Self::AllowTmpfs => OutputFields::spec_allow_tmpfs(),
+            Self::PreviewButton => FieldSpec {
+                section: None,
+                label: "Preview",
+                flag: "--dry-run",
+                placeholder: "",
+                kind: FieldKind::Action,
+                required: false,
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.spec().label
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GmailForm {
+    pub case: CaseFields,
+    pub mailbox: String,
+    pub auth: crate::gmail::GmailAuth,
+    pub client_id: String,
+    pub client_secret_file: String,
+    pub key_file: String,
+    pub token_file: String,
+    pub gmail_endpoint: String,
+    pub token_endpoint: String,
+    pub auth_endpoint: String,
+    pub timeout: String,
+    pub output: OutputFields,
+    pub scope: ScopeFields,
+    pub clock: ClockFields,
+    pub field: GmailField,
+    pub cursor: usize,
+    pub editing: bool,
+}
+
+impl Default for GmailForm {
+    fn default() -> Self {
+        Self::with_targets(Vec::new())
+    }
+}
+
+impl GmailForm {
+    pub fn with_targets(target_mounts: Vec<MountChoice>) -> Self {
+        Self {
+            case: CaseFields::default(),
+            mailbox: "me".into(),
+            auth: crate::gmail::GmailAuth::Installed,
+            client_id: String::new(),
+            client_secret_file: String::new(),
+            key_file: String::new(),
+            token_file: String::new(),
+            gmail_endpoint: DEFAULT_GMAIL_ENDPOINT.into(),
+            token_endpoint: DEFAULT_GOOGLE_TOKEN_ENDPOINT.into(),
+            auth_endpoint: DEFAULT_GOOGLE_AUTH_ENDPOINT.into(),
+            timeout: "120".into(),
+            output: OutputFields::with_targets(target_mounts),
+            scope: ScopeFields::default(),
+            clock: ClockFields::default(),
+            field: GmailField::CaseNumber,
+            cursor: 0,
+            editing: false,
+        }
+    }
+
+    pub fn conn_key(&self) -> GmailConnKey {
+        GmailConnKey {
+            mailbox: self.mailbox.trim().to_string(),
+            auth: self.auth,
+            client_id: self.client_id.trim().to_string(),
+            client_secret_file: self.client_secret_file.trim().to_string(),
+            key_file: self.key_file.trim().to_string(),
+            token_file: self.token_file.trim().to_string(),
+            gmail_endpoint: self.gmail_endpoint.trim().trim_end_matches('/').to_string(),
+            token_endpoint: self.token_endpoint.trim().trim_end_matches('/').to_string(),
+            auth_endpoint: self.auth_endpoint.trim().trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn export_shared(&self) -> SharedFormState {
+        SharedFormState {
+            case: self.case.case.clone(),
+            examiner: self.case.examiner.clone(),
+            clock: self.clock.clone(),
+            scope: self.scope.clone(),
+            md5: self.output.md5,
+            sha1: self.output.sha1,
+            compress: self.output.compress,
+        }
+    }
+
+    pub fn import_shared(&mut self, shared: &SharedFormState) {
+        if !shared.case.is_empty() {
+            self.case.case = shared.case.clone();
+        }
+        if !shared.examiner.is_empty() {
+            self.case.examiner = shared.examiner.clone();
+        }
+        if !shared.clock.reference_time.is_empty() || !shared.clock.reference_how.is_empty() {
+            self.clock = shared.clock.clone();
+        }
+        if !shared.scope.has_any_inline(false) && shared.scope.scope_file.is_empty() {
+            // keep local scope
+        } else {
+            self.scope = shared.scope.clone();
+        }
+        self.output.md5 = shared.md5;
+        self.output.sha1 = shared.sha1;
+        self.output.compress = shared.compress;
+        self.output
+            .update_suggestion(&self.case.case, &self.case.evidence);
+    }
+
+    pub fn refresh_probes(&mut self) {
+        self.output.refresh_probe(None);
+    }
+
+    pub fn applies(&self, f: GmailField) -> bool {
+        let has_scope = !self.scope.scope_file.trim().is_empty();
+        match f {
+            GmailField::ClientId | GmailField::ClientSecretFile | GmailField::AuthEndpoint => {
+                self.auth == crate::gmail::GmailAuth::Installed
+            }
+            GmailField::KeyFile => self.auth == crate::gmail::GmailAuth::ServiceAccount,
+            GmailField::TokenFile => self.auth == crate::gmail::GmailAuth::Token,
+            GmailField::LegalBasis => !has_scope || !self.scope.legal_basis.trim().is_empty(),
+            GmailField::Includes => !has_scope || !self.scope.include.is_empty(),
+            GmailField::Excludes => !has_scope || !self.scope.exclude.is_empty(),
+            GmailField::NotBefore => !has_scope || !self.scope.not_before.trim().is_empty(),
+            GmailField::NotAfter => !has_scope || !self.scope.not_after.trim().is_empty(),
+            GmailField::UnknownTime => {
+                !has_scope || self.scope.unknown_time != UnknownTimeArg::Exclude
+            }
+            GmailField::ListOutOfScope => !has_scope || self.scope.list_out_of_scope,
+            _ => true,
+        }
+    }
+
+    pub fn focus_order(&self) -> Vec<GmailField> {
+        GmailField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .collect()
+    }
+
+    pub fn text(&self, f: GmailField) -> Option<&String> {
+        match f {
+            GmailField::CaseNumber => Some(&self.case.case),
+            GmailField::EvidenceNumber => Some(&self.case.evidence),
+            GmailField::Examiner => Some(&self.case.examiner),
+            GmailField::Description => Some(&self.case.description),
+            GmailField::Notes => Some(&self.case.notes),
+            GmailField::Mailbox => Some(&self.mailbox),
+            GmailField::ClientId => Some(&self.client_id),
+            GmailField::ClientSecretFile => Some(&self.client_secret_file),
+            GmailField::KeyFile => Some(&self.key_file),
+            GmailField::TokenFile => Some(&self.token_file),
+            GmailField::GmailEndpoint => Some(&self.gmail_endpoint),
+            GmailField::TokenEndpoint => Some(&self.token_endpoint),
+            GmailField::AuthEndpoint => Some(&self.auth_endpoint),
+            GmailField::Timeout => Some(&self.timeout),
+            GmailField::OutputPath => Some(&self.output.output_path),
+            GmailField::ScopeFile => Some(&self.scope.scope_file),
+            GmailField::LegalBasis => Some(&self.scope.legal_basis),
+            GmailField::NotBefore => Some(&self.scope.not_before),
+            GmailField::NotAfter => Some(&self.scope.not_after),
+            GmailField::ReferenceTime => Some(&self.clock.reference_time),
+            GmailField::ReferenceHow => Some(&self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self, f: GmailField) -> Option<&mut String> {
+        match f {
+            GmailField::CaseNumber => Some(&mut self.case.case),
+            GmailField::EvidenceNumber => Some(&mut self.case.evidence),
+            GmailField::Examiner => Some(&mut self.case.examiner),
+            GmailField::Description => Some(&mut self.case.description),
+            GmailField::Notes => Some(&mut self.case.notes),
+            GmailField::Mailbox => Some(&mut self.mailbox),
+            GmailField::ClientId => Some(&mut self.client_id),
+            GmailField::ClientSecretFile => Some(&mut self.client_secret_file),
+            GmailField::KeyFile => Some(&mut self.key_file),
+            GmailField::TokenFile => Some(&mut self.token_file),
+            GmailField::GmailEndpoint => Some(&mut self.gmail_endpoint),
+            GmailField::TokenEndpoint => Some(&mut self.token_endpoint),
+            GmailField::AuthEndpoint => Some(&mut self.auth_endpoint),
+            GmailField::Timeout => Some(&mut self.timeout),
+            GmailField::OutputPath => Some(&mut self.output.output_path),
+            GmailField::ScopeFile => Some(&mut self.scope.scope_file),
+            GmailField::LegalBasis => Some(&mut self.scope.legal_basis),
+            GmailField::NotBefore => Some(&mut self.scope.not_before),
+            GmailField::NotAfter => Some(&mut self.scope.not_after),
+            GmailField::ReferenceTime => Some(&mut self.clock.reference_time),
+            GmailField::ReferenceHow => Some(&mut self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn set_focus(&mut self, next: GmailField) {
+        if self.field == GmailField::ReferenceTime
+            && next != GmailField::ReferenceTime
+            && self.clock.reference_entered_ns.is_none()
+            && !self.clock.reference_time.trim().is_empty()
+        {
+            self.clock.commit_now();
+        }
+        self.field = next;
+        self.editing = false;
+        self.cursor = self.text(next).map_or(0, String::len);
+    }
+
+    pub fn focus_next(&mut self, forward: bool) {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let idx = order.iter().position(|f| *f == self.field).unwrap_or(0);
+        let next_idx = if forward {
+            (idx + 1) % order.len()
+        } else {
+            (idx + order.len() - 1) % order.len()
+        };
+        self.set_focus(order[next_idx]);
+    }
+
+    pub fn toggle_regular(&mut self, f: GmailField, forward: bool) {
+        match f {
+            GmailField::Auth => self.auth = self.auth.cycle(forward),
+            GmailField::UnknownTime => {
+                self.scope.unknown_time = match self.scope.unknown_time {
+                    UnknownTimeArg::Exclude => UnknownTimeArg::Include,
+                    UnknownTimeArg::Include => UnknownTimeArg::Exclude,
+                };
+            }
+            GmailField::ListOutOfScope => {
+                self.scope.list_out_of_scope = !self.scope.list_out_of_scope
+            }
+            GmailField::Md5 => self.output.md5 = !self.output.md5,
+            GmailField::Sha1 => self.output.sha1 = !self.output.sha1,
+            GmailField::Compress => self.output.compress = !self.output.compress,
+            _ => {}
+        }
+    }
+
+    pub fn value_text(&self, f: GmailField) -> String {
+        match f {
+            GmailField::Auth => format!("◀ {} ▶", self.auth.label()),
+            GmailField::Includes => format_pattern_list(
+                &self.scope.include,
+                self.scope.include_idx,
+                "everything (default)",
+            ),
+            GmailField::Excludes => {
+                format_pattern_list(&self.scope.exclude, self.scope.exclude_idx, "none")
+            }
+            GmailField::UnknownTime => match self.scope.unknown_time {
+                UnknownTimeArg::Exclude => "◀ exclude (default) ▶".into(),
+                UnknownTimeArg::Include => "◀ include ▶".into(),
+            },
+            GmailField::ListOutOfScope => {
+                if self.scope.list_out_of_scope {
+                    "[!] ENABLED (records out-of-scope IDs in items.jsonl)".into()
+                } else {
+                    "[ ] disabled (count by reason only; default)".into()
+                }
+            }
+            GmailField::Md5 => {
+                if self.output.md5 {
+                    "[x] yes (--md5)".into()
+                } else {
+                    "[ ] no (SHA-256 always computed)".into()
+                }
+            }
+            GmailField::Sha1 => {
+                if self.output.sha1 {
+                    "[x] yes (--sha1)".into()
+                } else {
+                    "[ ] no".into()
+                }
+            }
+            GmailField::Compress => {
+                if self.output.compress {
+                    "[x] deflate (--compress)".into()
+                } else {
+                    "[ ] store uncompressed (default)".into()
+                }
+            }
+            GmailField::AllowTmpfs => {
+                if self.output.allow_tmpfs {
+                    "[!] ENABLED (--allow-tmpfs)".into()
+                } else {
+                    "[ ] disabled (refuse RAM output)".into()
+                }
+            }
+            GmailField::PreviewButton => "[ Preview mailbox & scope (F2) ]".into(),
+            _ => self.text(f).cloned().unwrap_or_default(),
+        }
+    }
+
+    pub fn utc_hint(&self, f: GmailField) -> Option<String> {
+        match f {
+            GmailField::NotBefore => self.scope.utc_hint_not_before(),
+            GmailField::NotAfter => self.scope.utc_hint_not_after(),
+            GmailField::ReferenceTime => self.clock.utc_hint(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_field(&self, f: GmailField) -> Option<String> {
+        if !self.applies(f) {
+            return None;
+        }
+        match f {
+            GmailField::CaseNumber => self.case.validate_case(),
+            GmailField::EvidenceNumber => self.case.validate_evidence(),
+            GmailField::Examiner => self.case.validate_examiner(),
+            GmailField::Mailbox => {
+                let mb = self.mailbox.trim();
+                if mb.is_empty() {
+                    return Some("mailbox (--mailbox) is required".into());
+                }
+                if self.auth == crate::gmail::GmailAuth::ServiceAccount
+                    && mb.eq_ignore_ascii_case("me")
+                {
+                    return Some(
+                        "--auth service-account requires --mailbox <user@domain>, not 'me'".into(),
+                    );
+                }
+                None
+            }
+            GmailField::ClientId => self
+                .client_id
+                .trim()
+                .is_empty()
+                .then(|| "--client-id is required for --auth installed".into()),
+            GmailField::ClientSecretFile => {
+                let sf = self.client_secret_file.trim();
+                if sf.is_empty() {
+                    return None;
+                }
+                let p = expand_tilde(Path::new(sf));
+                if !p.is_file() {
+                    return Some("client secret file does not exist".into());
+                }
+                None
+            }
+            GmailField::KeyFile => {
+                let kf = self.key_file.trim();
+                if kf.is_empty() {
+                    return Some("--key-file is required for --auth service-account".into());
+                }
+                let p = expand_tilde(Path::new(kf));
+                if !p.is_file() {
+                    return Some("service account key file does not exist".into());
+                }
+                None
+            }
+            GmailField::TokenFile => {
+                let tf = self.token_file.trim();
+                if tf.is_empty() {
+                    return Some("--token-file is required for --auth token".into());
+                }
+                let p = expand_tilde(Path::new(tf));
+                if !p.is_file() {
+                    return Some("token file does not exist".into());
+                }
+                None
+            }
+            GmailField::GmailEndpoint => {
+                let u = self.gmail_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--gmail-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--gmail-endpoint: {e:#}"))
+            }
+            GmailField::TokenEndpoint => {
+                let u = self.token_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--token-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--token-endpoint: {e:#}"))
+            }
+            GmailField::AuthEndpoint => {
+                let u = self.auth_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--auth-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--auth-endpoint: {e:#}"))
+            }
+            GmailField::Timeout => {
+                let t = self.timeout.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                match t.parse::<u64>() {
+                    Ok(n) if n > 0 => None,
+                    _ => Some("timeout (--timeout) must be a positive integer (seconds)".into()),
+                }
+            }
+            GmailField::OutputPath => self.output.validate_output(),
+            GmailField::ScopeFile => self.scope.validate_scope_file(false),
+            GmailField::NotBefore => self.scope.validate_not_before(),
+            GmailField::NotAfter => self.scope.validate_not_after(),
+            GmailField::ReferenceTime => self.clock.validate_time(),
+            GmailField::ReferenceHow => self.clock.validate_how(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_all(&self) -> Vec<(GmailField, String)> {
+        GmailField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .filter_map(|f| self.validate_field(f).map(|msg| (f, msg)))
+            .collect()
+    }
+
+    pub fn reset_for_next_acquisition(&mut self) {
+        self.case.reset_per_run();
+        self.clock.reset_per_run();
+        self.output.reset_per_run();
+        self.set_focus(GmailField::EvidenceNumber);
+    }
+}
+
+// ==================================================================
+// Mode 7: M365LogsForm (`dfcollect m365-logs`)
+// ==================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum M365LogsField {
+    CaseNumber,
+    EvidenceNumber,
+    Examiner,
+    Description,
+    Notes,
+    Auth,
+    Tenant,
+    ClientId,
+    ClientSecretFile,
+    TokenFile,
+    Cloud,
+    GraphEndpoint,
+    LoginEndpoint,
+    Timeout,
+    LogSignins,
+    LogDirectory,
+    LogUal,
+    Users,
+    RecordTypes,
+    Operations,
+    UalWait,
+    NotBefore,
+    NotAfter,
+    LegalBasis,
+    OutputPath,
+    ReferenceTime,
+    ReferenceHow,
+    Md5,
+    Sha1,
+    Compress,
+    AllowTmpfs,
+    StartButton,
+}
+
+impl M365LogsField {
+    pub const ALL: [Self; 32] = [
+        Self::CaseNumber,
+        Self::EvidenceNumber,
+        Self::Examiner,
+        Self::Description,
+        Self::Notes,
+        Self::Auth,
+        Self::Tenant,
+        Self::ClientId,
+        Self::ClientSecretFile,
+        Self::TokenFile,
+        Self::Cloud,
+        Self::GraphEndpoint,
+        Self::LoginEndpoint,
+        Self::Timeout,
+        Self::LogSignins,
+        Self::LogDirectory,
+        Self::LogUal,
+        Self::Users,
+        Self::RecordTypes,
+        Self::Operations,
+        Self::UalWait,
+        Self::NotBefore,
+        Self::NotAfter,
+        Self::LegalBasis,
+        Self::OutputPath,
+        Self::ReferenceTime,
+        Self::ReferenceHow,
+        Self::Md5,
+        Self::Sha1,
+        Self::Compress,
+        Self::AllowTmpfs,
+        Self::StartButton,
+    ];
+
+    pub fn spec(self) -> FieldSpec {
+        match self {
+            Self::CaseNumber => CaseFields::spec_case(),
+            Self::EvidenceNumber => CaseFields::spec_evidence("e.g. m365logs01"),
+            Self::Examiner => CaseFields::spec_examiner(),
+            Self::Description => CaseFields::spec_description(),
+            Self::Notes => CaseFields::spec_notes(),
+            Self::Auth => FieldSpec {
+                section: Some("Microsoft 365 Tenant & Connection"),
+                label: "Authentication",
+                flag: "--auth",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::Tenant => FieldSpec {
+                section: None,
+                label: "Tenant*",
+                flag: "--tenant",
+                placeholder: "organizations or tenant domain / UUID",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::ClientId => FieldSpec {
+                section: None,
+                label: "App client ID*",
+                flag: "--client-id",
+                placeholder: "Entra app registration client ID",
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::ClientSecretFile => FieldSpec {
+                section: None,
+                label: "Secret file",
+                flag: "--client-secret-file",
+                placeholder: "blank = ask on start",
+                kind: FieldKind::Path { dirs_only: false },
+                required: false,
+            },
+            Self::TokenFile => FieldSpec {
+                section: None,
+                label: "Token file*",
+                flag: "--token-file",
+                placeholder: "file with Graph access token (first line)",
+                kind: FieldKind::Path { dirs_only: false },
+                required: true,
+            },
+            Self::Cloud => FieldSpec {
+                section: None,
+                label: "Cloud preset",
+                flag: "--graph-endpoint",
+                placeholder: "",
+                kind: FieldKind::Enum,
+                required: false,
+            },
+            Self::GraphEndpoint => FieldSpec {
+                section: None,
+                label: "Graph endpoint*",
+                flag: "--graph-endpoint",
+                placeholder: DEFAULT_GRAPH_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::LoginEndpoint => FieldSpec {
+                section: None,
+                label: "Login endpoint*",
+                flag: "--login-endpoint",
+                placeholder: DEFAULT_LOGIN_ENDPOINT,
+                kind: FieldKind::Text,
+                required: true,
+            },
+            Self::Timeout => FieldSpec {
+                section: None,
+                label: "Timeout (s)",
+                flag: "--timeout",
+                placeholder: "120",
+                kind: FieldKind::Text,
+                required: false,
+            },
+            Self::LogSignins => FieldSpec {
+                section: Some("Logs & Time Window"),
+                label: "Sign-in logs",
+                flag: "--logs signins",
+                placeholder: "",
+                kind: FieldKind::Bool { safety: false },
+                required: false,
+            },
+            Self::LogDirectory => FieldSpec {
+                section: None,
+                label: "Directory logs",
+                flag: "--logs directory",
+                placeholder: "",
+                kind: FieldKind::Bool { safety: false },
+                required: false,
+            },
+            Self::LogUal => FieldSpec {
+                section: None,
+                label: "Purview UAL",
+                flag: "--logs ual",
+                placeholder: "",
+                kind: FieldKind::Bool { safety: false },
+                required: false,
+            },
+            Self::Users => FieldSpec {
+                section: None,
+                label: "Filter users",
+                flag: "--user",
+                placeholder: "Enter adds UPN (e.g. alice@contoso.example); Del removes",
+                kind: FieldKind::List { paths: false },
+                required: false,
+            },
+            Self::RecordTypes => FieldSpec {
+                section: None,
+                label: "UAL rec. types",
+                flag: "--record-type",
+                placeholder: "Enter adds type (e.g. exchangeItem); Del removes",
+                kind: FieldKind::List { paths: false },
+                required: false,
+            },
+            Self::Operations => FieldSpec {
+                section: None,
+                label: "UAL operations",
+                flag: "--operation",
+                placeholder: "Enter adds operation (e.g. MailItemsAccessed); Del removes",
+                kind: FieldKind::List { paths: false },
+                required: false,
+            },
+            Self::UalWait => FieldSpec {
+                section: None,
+                label: "UAL wait (min)",
+                flag: "--ual-wait",
+                placeholder: "240",
+                kind: FieldKind::Text,
+                required: false,
+            },
+            Self::NotBefore => ScopeFields::spec_not_before(true),
+            Self::NotAfter => ScopeFields::spec_not_after(true),
+            Self::LegalBasis => ScopeFields::spec_legal_basis(),
+            Self::OutputPath => OutputFields::spec_output_dir(Some("Output collection directory")),
+            Self::ReferenceTime => ClockFields::spec_time(),
+            Self::ReferenceHow => ClockFields::spec_how(),
+            Self::Md5 => OutputFields::spec_md5(),
+            Self::Sha1 => OutputFields::spec_sha1(),
+            Self::Compress => OutputFields::spec_compress(),
+            Self::AllowTmpfs => OutputFields::spec_allow_tmpfs(),
+            Self::StartButton => FieldSpec {
+                section: None,
+                label: "Start",
+                flag: "",
+                placeholder: "",
+                kind: FieldKind::Action,
+                required: false,
+            },
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.spec().label
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct M365LogsForm {
+    pub case: CaseFields,
+    pub auth: crate::graph::GraphAuth,
+    pub tenant: String,
+    pub client_id: String,
+    pub client_secret_file: String,
+    pub token_file: String,
+    pub cloud: GraphCloud,
+    pub graph_endpoint: String,
+    pub login_endpoint: String,
+    pub timeout: String,
+    pub log_signins: bool,
+    pub log_directory: bool,
+    pub log_ual: bool,
+    pub users: Vec<String>,
+    pub users_idx: usize,
+    pub record_types: Vec<String>,
+    pub record_types_idx: usize,
+    pub operations: Vec<String>,
+    pub operations_idx: usize,
+    pub ual_wait: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub legal_basis: String,
+    pub output: OutputFields,
+    pub clock: ClockFields,
+    pub field: M365LogsField,
+    pub cursor: usize,
+    pub editing: bool,
+}
+
+impl Default for M365LogsForm {
+    fn default() -> Self {
+        Self::with_targets(Vec::new())
+    }
+}
+
+impl M365LogsForm {
+    pub fn with_targets(target_mounts: Vec<MountChoice>) -> Self {
+        Self {
+            case: CaseFields::default(),
+            auth: crate::graph::GraphAuth::Device,
+            tenant: "organizations".into(),
+            client_id: String::new(),
+            client_secret_file: String::new(),
+            token_file: String::new(),
+            cloud: GraphCloud::Global,
+            graph_endpoint: DEFAULT_GRAPH_ENDPOINT.into(),
+            login_endpoint: DEFAULT_LOGIN_ENDPOINT.into(),
+            timeout: "120".into(),
+            log_signins: true,
+            log_directory: true,
+            log_ual: true,
+            users: Vec::new(),
+            users_idx: 0,
+            record_types: Vec::new(),
+            record_types_idx: 0,
+            operations: Vec::new(),
+            operations_idx: 0,
+            ual_wait: "240".into(),
+            not_before: String::new(),
+            not_after: String::new(),
+            legal_basis: String::new(),
+            output: OutputFields::with_targets(target_mounts),
+            clock: ClockFields::default(),
+            field: M365LogsField::CaseNumber,
+            cursor: 0,
+            editing: false,
+        }
+    }
+
+    pub fn sync_cloud_from_endpoints(&mut self) {
+        self.cloud = GraphCloud::from_endpoints(&self.graph_endpoint, &self.login_endpoint);
+    }
+
+    /// Rounded-outwards UTC window `[from, to)` matching `m365logs::window`,
+    /// if both `not_before` and `not_after` are valid RFC 3339 with `nb < na`.
+    pub fn rounded_utc_window(&self) -> Option<(String, String)> {
+        let nb = dfcore::host::parse_rfc3339(self.not_before.trim()).ok()?;
+        let na = dfcore::host::parse_rfc3339(self.not_after.trim()).ok()?;
+        if nb >= na {
+            return None;
+        }
+        let s = 1_000_000_000i128;
+        let from = nb.div_euclid(s);
+        let to = na.div_euclid(s) + i128::from(na.rem_euclid(s) != 0);
+        let fmt = |t: i128| dfcore::host::rfc3339_utc(u64::try_from(t).unwrap_or(0));
+        Some((fmt(from), fmt(to)))
+    }
+
+    /// Summary lines shown inline on the `m365-logs` form (no preview mode).
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let window_text = match self.rounded_utc_window() {
+            Some((from, to)) => format!("{from} .. {to} (UTC, [from, to))"),
+            None => "(set valid --not-before and --not-after)".into(),
+        };
+        lines.push(format!("UTC window: {window_text}"));
+
+        let mut log_names = Vec::new();
+        if self.log_signins {
+            log_names.push("signins (auditLogs/signIns)");
+        }
+        if self.log_directory {
+            log_names.push("directory (auditLogs/directoryAudits)");
+        }
+        if self.log_ual {
+            log_names.push("ual (Purview Unified Audit Log)");
+        }
+        let logs_text = if log_names.is_empty() {
+            "none selected".to_string()
+        } else {
+            log_names.join(", ")
+        };
+        lines.push(format!("Logs:       {logs_text}"));
+
+        let users_text = if self.users.is_empty() {
+            "all tenant accounts".to_string()
+        } else {
+            self.users.join(", ")
+        };
+        let mut filters = format!("users={users_text}");
+        if self.log_ual {
+            let rt = if self.record_types.is_empty() {
+                "all".to_string()
+            } else {
+                self.record_types.join(",")
+            };
+            let ops = if self.operations.is_empty() {
+                "all".to_string()
+            } else {
+                self.operations.join(",")
+            };
+            filters.push_str(&format!("; record_types={rt}; operations={ops}"));
+        }
+        lines.push(format!("Filters:    {filters}"));
+
+        if self.log_ual {
+            lines.push(
+                "Footprint:  creates one audit log query in the tenant (Purview Audit)".into(),
+            );
+        }
+        lines
+    }
+
+    pub fn export_shared(&self) -> SharedFormState {
+        let mut s = SharedFormState {
+            case: self.case.case.clone(),
+            examiner: self.case.examiner.clone(),
+            clock: self.clock.clone(),
+            scope: ScopeFields::default(),
+            md5: self.output.md5,
+            sha1: self.output.sha1,
+            compress: self.output.compress,
+        };
+        s.scope.legal_basis = self.legal_basis.clone();
+        s
+    }
+
+    pub fn import_shared(&mut self, shared: &SharedFormState) {
+        if !shared.case.is_empty() {
+            self.case.case = shared.case.clone();
+        }
+        if !shared.examiner.is_empty() {
+            self.case.examiner = shared.examiner.clone();
+        }
+        if !shared.clock.reference_time.is_empty() || !shared.clock.reference_how.is_empty() {
+            self.clock = shared.clock.clone();
+        }
+        if !shared.scope.legal_basis.is_empty() && self.legal_basis.is_empty() {
+            self.legal_basis = shared.scope.legal_basis.clone();
+        }
+        self.output.md5 = shared.md5;
+        self.output.sha1 = shared.sha1;
+        self.output.compress = shared.compress;
+        self.output
+            .update_suggestion(&self.case.case, &self.case.evidence);
+    }
+
+    pub fn refresh_probes(&mut self) {
+        self.output.refresh_probe(None);
+    }
+
+    pub fn applies(&self, f: M365LogsField) -> bool {
+        match f {
+            M365LogsField::Tenant | M365LogsField::ClientId => {
+                self.auth != crate::graph::GraphAuth::Token
+            }
+            M365LogsField::ClientSecretFile => self.auth == crate::graph::GraphAuth::App,
+            M365LogsField::TokenFile => self.auth == crate::graph::GraphAuth::Token,
+            M365LogsField::GraphEndpoint | M365LogsField::LoginEndpoint => {
+                self.cloud == GraphCloud::Custom
+                    || self.graph_endpoint.trim() != DEFAULT_GRAPH_ENDPOINT
+                    || self.login_endpoint.trim() != DEFAULT_LOGIN_ENDPOINT
+            }
+            M365LogsField::RecordTypes | M365LogsField::Operations | M365LogsField::UalWait => {
+                self.log_ual
+            }
+            _ => true,
+        }
+    }
+
+    pub fn focus_order(&self) -> Vec<M365LogsField> {
+        M365LogsField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .collect()
+    }
+
+    pub fn text(&self, f: M365LogsField) -> Option<&String> {
+        match f {
+            M365LogsField::CaseNumber => Some(&self.case.case),
+            M365LogsField::EvidenceNumber => Some(&self.case.evidence),
+            M365LogsField::Examiner => Some(&self.case.examiner),
+            M365LogsField::Description => Some(&self.case.description),
+            M365LogsField::Notes => Some(&self.case.notes),
+            M365LogsField::Tenant => Some(&self.tenant),
+            M365LogsField::ClientId => Some(&self.client_id),
+            M365LogsField::ClientSecretFile => Some(&self.client_secret_file),
+            M365LogsField::TokenFile => Some(&self.token_file),
+            M365LogsField::GraphEndpoint => Some(&self.graph_endpoint),
+            M365LogsField::LoginEndpoint => Some(&self.login_endpoint),
+            M365LogsField::Timeout => Some(&self.timeout),
+            M365LogsField::UalWait => Some(&self.ual_wait),
+            M365LogsField::NotBefore => Some(&self.not_before),
+            M365LogsField::NotAfter => Some(&self.not_after),
+            M365LogsField::LegalBasis => Some(&self.legal_basis),
+            M365LogsField::OutputPath => Some(&self.output.output_path),
+            M365LogsField::ReferenceTime => Some(&self.clock.reference_time),
+            M365LogsField::ReferenceHow => Some(&self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self, f: M365LogsField) -> Option<&mut String> {
+        match f {
+            M365LogsField::CaseNumber => Some(&mut self.case.case),
+            M365LogsField::EvidenceNumber => Some(&mut self.case.evidence),
+            M365LogsField::Examiner => Some(&mut self.case.examiner),
+            M365LogsField::Description => Some(&mut self.case.description),
+            M365LogsField::Notes => Some(&mut self.case.notes),
+            M365LogsField::Tenant => Some(&mut self.tenant),
+            M365LogsField::ClientId => Some(&mut self.client_id),
+            M365LogsField::ClientSecretFile => Some(&mut self.client_secret_file),
+            M365LogsField::TokenFile => Some(&mut self.token_file),
+            M365LogsField::GraphEndpoint => Some(&mut self.graph_endpoint),
+            M365LogsField::LoginEndpoint => Some(&mut self.login_endpoint),
+            M365LogsField::Timeout => Some(&mut self.timeout),
+            M365LogsField::UalWait => Some(&mut self.ual_wait),
+            M365LogsField::NotBefore => Some(&mut self.not_before),
+            M365LogsField::NotAfter => Some(&mut self.not_after),
+            M365LogsField::LegalBasis => Some(&mut self.legal_basis),
+            M365LogsField::OutputPath => Some(&mut self.output.output_path),
+            M365LogsField::ReferenceTime => Some(&mut self.clock.reference_time),
+            M365LogsField::ReferenceHow => Some(&mut self.clock.reference_how),
+            _ => None,
+        }
+    }
+
+    pub fn set_focus(&mut self, next: M365LogsField) {
+        if self.field == M365LogsField::ReferenceTime
+            && next != M365LogsField::ReferenceTime
+            && self.clock.reference_entered_ns.is_none()
+            && !self.clock.reference_time.trim().is_empty()
+        {
+            self.clock.commit_now();
+        }
+        self.field = next;
+        self.editing = false;
+        self.cursor = self.text(next).map_or(0, String::len);
+    }
+
+    pub fn focus_next(&mut self, forward: bool) {
+        let order = self.focus_order();
+        if order.is_empty() {
+            return;
+        }
+        let idx = order.iter().position(|f| *f == self.field).unwrap_or(0);
+        let next_idx = if forward {
+            (idx + 1) % order.len()
+        } else {
+            (idx + order.len() - 1) % order.len()
+        };
+        self.set_focus(order[next_idx]);
+    }
+
+    pub fn toggle_regular(&mut self, f: M365LogsField, forward: bool) {
+        match f {
+            M365LogsField::Auth => self.auth = self.auth.cycle(forward),
+            M365LogsField::Cloud => {
+                self.cloud = self.cloud.cycle(forward);
+                if let Some((g, l)) = self.cloud.endpoints() {
+                    self.graph_endpoint = g.into();
+                    self.login_endpoint = l.into();
+                }
+            }
+            M365LogsField::LogSignins => self.log_signins = !self.log_signins,
+            M365LogsField::LogDirectory => self.log_directory = !self.log_directory,
+            M365LogsField::LogUal => self.log_ual = !self.log_ual,
+            M365LogsField::Md5 => self.output.md5 = !self.output.md5,
+            M365LogsField::Sha1 => self.output.sha1 = !self.output.sha1,
+            M365LogsField::Compress => self.output.compress = !self.output.compress,
+            _ => {}
+        }
+    }
+
+    pub fn value_text(&self, f: M365LogsField) -> String {
+        match f {
+            M365LogsField::Auth => format!("◀ {} ▶", self.auth.label()),
+            M365LogsField::Cloud => format!("◀ {} ▶", self.cloud.label()),
+            M365LogsField::LogSignins => {
+                if self.log_signins {
+                    "[x] signins (auditLogs/signIns)".into()
+                } else {
+                    "[ ] signins".into()
+                }
+            }
+            M365LogsField::LogDirectory => {
+                if self.log_directory {
+                    "[x] directory (auditLogs/directoryAudits)".into()
+                } else {
+                    "[ ] directory".into()
+                }
+            }
+            M365LogsField::LogUal => {
+                if self.log_ual {
+                    "[x] ual (Unified Audit Log / Purview Audit)".into()
+                } else {
+                    "[ ] ual".into()
+                }
+            }
+            M365LogsField::Users => {
+                format_pattern_list(&self.users, self.users_idx, "all tenant accounts (default)")
+            }
+            M365LogsField::RecordTypes => format_pattern_list(
+                &self.record_types,
+                self.record_types_idx,
+                "all record types (default)",
+            ),
+            M365LogsField::Operations => format_pattern_list(
+                &self.operations,
+                self.operations_idx,
+                "all operations (default)",
+            ),
+            M365LogsField::Md5 => {
+                if self.output.md5 {
+                    "[x] yes (--md5)".into()
+                } else {
+                    "[ ] no (SHA-256 always computed)".into()
+                }
+            }
+            M365LogsField::Sha1 => {
+                if self.output.sha1 {
+                    "[x] yes (--sha1)".into()
+                } else {
+                    "[ ] no".into()
+                }
+            }
+            M365LogsField::Compress => {
+                if self.output.compress {
+                    "[x] deflate (--compress)".into()
+                } else {
+                    "[ ] store uncompressed (default)".into()
+                }
+            }
+            M365LogsField::AllowTmpfs => {
+                if self.output.allow_tmpfs {
+                    "[!] ENABLED (--allow-tmpfs)".into()
+                } else {
+                    "[ ] disabled (refuse RAM output)".into()
+                }
+            }
+            M365LogsField::StartButton => "[ Start log acquisition (F2) ]".into(),
+            _ => self.text(f).cloned().unwrap_or_default(),
+        }
+    }
+
+    pub fn utc_hint(&self, f: M365LogsField) -> Option<String> {
+        match f {
+            M365LogsField::NotBefore => utc_conversion_hint(&self.not_before),
+            M365LogsField::NotAfter => utc_conversion_hint(&self.not_after),
+            M365LogsField::ReferenceTime => self.clock.utc_hint(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_field(&self, f: M365LogsField) -> Option<String> {
+        if !self.applies(f) {
+            return None;
+        }
+        match f {
+            M365LogsField::CaseNumber => self.case.validate_case(),
+            M365LogsField::EvidenceNumber => self.case.validate_evidence(),
+            M365LogsField::Examiner => self.case.validate_examiner(),
+            M365LogsField::Tenant => {
+                let t = self.tenant.trim();
+                if t.is_empty() {
+                    return Some("tenant (--tenant) is required".into());
+                }
+                if self.auth == crate::graph::GraphAuth::App
+                    && (t.eq_ignore_ascii_case("organizations") || t.eq_ignore_ascii_case("common"))
+                {
+                    return Some(
+                        "--auth app needs a specific tenant ID or domain, not 'organizations'"
+                            .into(),
+                    );
+                }
+                None
+            }
+            M365LogsField::ClientId => self
+                .client_id
+                .trim()
+                .is_empty()
+                .then(|| "application client ID (--client-id) is required".into()),
+            M365LogsField::ClientSecretFile => {
+                let sf = self.client_secret_file.trim();
+                if sf.is_empty() {
+                    return None;
+                }
+                let p = expand_tilde(Path::new(sf));
+                if !p.is_file() {
+                    return Some("client secret file does not exist".into());
+                }
+                None
+            }
+            M365LogsField::TokenFile => {
+                let tf = self.token_file.trim();
+                if tf.is_empty() {
+                    return Some("--token-file is required for --auth token".into());
+                }
+                let p = expand_tilde(Path::new(tf));
+                if !p.is_file() {
+                    return Some("token file does not exist".into());
+                }
+                None
+            }
+            M365LogsField::GraphEndpoint => {
+                let u = self.graph_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--graph-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--graph-endpoint: {e:#}"))
+            }
+            M365LogsField::LoginEndpoint => {
+                let u = self.login_endpoint.trim();
+                if u.is_empty() {
+                    return Some("--login-endpoint is required".into());
+                }
+                crate::http::parse_url(u)
+                    .err()
+                    .map(|e| format!("--login-endpoint: {e:#}"))
+            }
+            M365LogsField::Timeout => {
+                let t = self.timeout.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                match t.parse::<u64>() {
+                    Ok(n) if n > 0 => None,
+                    _ => Some("timeout (--timeout) must be a positive integer (seconds)".into()),
+                }
+            }
+            M365LogsField::LogSignins => {
+                if !self.log_signins && !self.log_directory && !self.log_ual {
+                    Some("select at least one log (--logs signins, directory, or ual)".into())
+                } else {
+                    None
+                }
+            }
+            M365LogsField::UalWait => {
+                let w = self.ual_wait.trim();
+                if w.is_empty() {
+                    return None;
+                }
+                match w.parse::<u64>() {
+                    Ok(n) if n > 0 => None,
+                    _ => Some("--ual-wait must be a positive integer (minutes)".into()),
+                }
+            }
+            M365LogsField::NotBefore => {
+                let nb_s = self.not_before.trim();
+                if nb_s.is_empty() {
+                    return Some("time window start (--not-before) is required".into());
+                }
+                let nb = match dfcore::host::parse_rfc3339(nb_s) {
+                    Ok(v) => v,
+                    Err(e) => return Some(format!("{e:#}")),
+                };
+                if let Ok(na) = dfcore::host::parse_rfc3339(self.not_after.trim()) {
+                    if nb >= na {
+                        return Some("--not-before must be earlier than --not-after".into());
+                    }
+                }
+                None
+            }
+            M365LogsField::NotAfter => {
+                let na_s = self.not_after.trim();
+                if na_s.is_empty() {
+                    return Some("time window end (--not-after) is required".into());
+                }
+                let na = match dfcore::host::parse_rfc3339(na_s) {
+                    Ok(v) => v,
+                    Err(e) => return Some(format!("{e:#}")),
+                };
+                if let Ok(nb) = dfcore::host::parse_rfc3339(self.not_before.trim()) {
+                    if na <= nb {
+                        return Some("--not-after must be later than --not-before".into());
+                    }
+                }
+                None
+            }
+            M365LogsField::OutputPath => self.output.validate_output(),
+            M365LogsField::ReferenceTime => self.clock.validate_time(),
+            M365LogsField::ReferenceHow => self.clock.validate_how(),
+            _ => None,
+        }
+    }
+
+    pub fn validate_all(&self) -> Vec<(M365LogsField, String)> {
+        M365LogsField::ALL
+            .into_iter()
+            .filter(|f| self.applies(*f))
+            .filter_map(|f| self.validate_field(f).map(|msg| (f, msg)))
+            .collect()
+    }
+
+    pub fn reset_for_next_acquisition(&mut self) {
+        self.case.reset_per_run();
+        self.clock.reset_per_run();
+        self.output.reset_per_run();
+        self.set_focus(M365LogsField::EvidenceNumber);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3436,7 +6501,7 @@ mod tests {
         assert!(f.validate_field(FilesField::NotBefore).is_none());
         assert_eq!(
             f.utc_hint(FilesField::NotBefore).as_deref(),
-            Some("UTC: 2026-03-01T10:00:00.000000000Z")
+            Some("UTC: 2026-03-01T10:00:00Z")
         );
 
         // not-after earlier than not-before
@@ -3608,7 +6673,7 @@ mod tests {
         );
         assert_eq!(
             f.utc_hint(IngestField::ReceivedAt).as_deref(),
-            Some("UTC: 2026-10-17T10:00:00.000000000Z")
+            Some("UTC: 2026-10-17T10:00:00Z")
         );
         assert!(f.validate_all().is_empty(), "{:?}", f.validate_all());
 
@@ -3663,7 +6728,12 @@ mod tests {
 
     #[test]
     fn db_form_conditional_fields_and_conn_key() {
-        let mut f = DbForm::default();
+        let mut f = DbForm {
+            tool_probe_fn: |_| vec![("psql".into(), Some("psql 16.4".into()))],
+            ..DbForm::default()
+        };
+        f.probe_tools_if_needed();
+        assert_eq!(f.tool_probe.as_ref().unwrap().1.len(), 1);
         assert_eq!(f.engine, crate::db::Engine::Postgres);
         assert!(f.applies(DbField::Serializable));
         assert!(!f.applies(DbField::BinlogPosition));
@@ -3681,6 +6751,108 @@ mod tests {
         assert!(f.validate_field(DbField::Port).is_some());
         f.port = "3306".into();
         assert!(f.validate_field(DbField::Port).is_none());
+    }
+
+    #[test]
+    fn imap_form_visibility_validation_and_conn_key() {
+        let mut f = ImapForm::default();
+        assert!(f.applies(ImapField::PasswordFile));
+        assert!(f.applies(ImapField::TokenFile));
+        assert!(f.applies(ImapField::TlsSha256));
+
+        let k0 = f.conn_key();
+        f.auth = crate::mail::Auth::Plain;
+        assert!(f.applies(ImapField::PasswordFile));
+        assert!(!f.applies(ImapField::TokenFile));
+        assert_ne!(f.conn_key(), k0);
+
+        f.auth = crate::mail::Auth::Xoauth2;
+        assert!(!f.applies(ImapField::PasswordFile));
+        assert!(f.applies(ImapField::TokenFile));
+        assert!(f.validate_field(ImapField::TokenFile).is_some());
+
+        f.security = crate::mail::Security::Plaintext;
+        assert!(!f.applies(ImapField::TlsSha256));
+        f.security = crate::mail::Security::Tls;
+        f.tls_sha256 = "not-hex".into();
+        assert!(f.validate_field(ImapField::TlsSha256).is_some());
+        f.tls_sha256 = "a".repeat(64);
+        assert!(f.validate_field(ImapField::TlsSha256).is_none());
+    }
+
+    #[test]
+    fn graph_and_gmail_conditional_visibility_and_validation() {
+        let mut g = GraphForm::default();
+        assert_eq!(g.auth, crate::graph::GraphAuth::Device);
+        assert!(g.applies(GraphField::Tenant));
+        assert!(g.applies(GraphField::ClientId));
+        assert!(!g.applies(GraphField::ClientSecretFile));
+        assert!(!g.applies(GraphField::TokenFile));
+
+        // App auth requires a named mailbox and non-"organizations" tenant
+        g.auth = crate::graph::GraphAuth::App;
+        assert!(g.applies(GraphField::ClientSecretFile));
+        assert!(g.validate_field(GraphField::Mailbox).is_some());
+        assert!(g.validate_field(GraphField::Tenant).is_some());
+        g.mailbox = "alice@contoso.example".into();
+        g.tenant = "contoso.example".into();
+        assert!(g.validate_field(GraphField::Mailbox).is_none());
+        assert!(g.validate_field(GraphField::Tenant).is_none());
+
+        // Cloud preset updates endpoints and conn_key
+        let k0 = g.conn_key();
+        g.toggle_regular(GraphField::Cloud, true);
+        assert_eq!(g.cloud, GraphCloud::UsGov);
+        assert_eq!(g.graph_endpoint, "https://graph.microsoft.us");
+        assert_eq!(g.login_endpoint, "https://login.microsoftonline.us");
+        assert_ne!(g.conn_key(), k0);
+
+        // Gmail auth visibility
+        let mut gm = GmailForm::default();
+        assert_eq!(gm.auth, crate::gmail::GmailAuth::Installed);
+        assert!(gm.applies(GmailField::ClientId));
+        assert!(gm.applies(GmailField::ClientSecretFile));
+        assert!(!gm.applies(GmailField::KeyFile));
+        assert!(!gm.applies(GmailField::TokenFile));
+
+        gm.auth = crate::gmail::GmailAuth::ServiceAccount;
+        assert!(!gm.applies(GmailField::ClientId));
+        assert!(gm.applies(GmailField::KeyFile));
+        assert!(gm.validate_field(GmailField::Mailbox).is_some());
+        gm.mailbox = "alice@example.org".into();
+        assert!(gm.validate_field(GmailField::Mailbox).is_none());
+    }
+
+    #[test]
+    fn m365_logs_form_validation_and_inline_summary() {
+        let mut m = M365LogsForm::default();
+        assert!(m.applies(M365LogsField::RecordTypes));
+        assert!(m.applies(M365LogsField::Operations));
+        assert!(m.applies(M365LogsField::UalWait));
+
+        m.not_before = "2026-03-01T12:00:00+02:00".into();
+        m.not_after = "2026-03-02T12:00:00.500+02:00".into();
+        let (from, to) = m.rounded_utc_window().expect("valid window");
+        assert_eq!(from, "2026-03-01T10:00:00Z");
+        assert_eq!(to, "2026-03-02T10:00:01Z");
+
+        let summary = m.summary_lines().join("\n");
+        assert!(summary.contains("2026-03-01T10:00:00Z .. 2026-03-02T10:00:01Z"));
+        assert!(summary.contains("creates one audit log query in the tenant (Purview Audit)"));
+
+        // Deselecting UAL hides UAL-specific fields and removes the Purview Audit note
+        m.toggle_regular(M365LogsField::LogUal, true);
+        assert!(!m.log_ual);
+        assert!(!m.applies(M365LogsField::RecordTypes));
+        assert!(!m
+            .summary_lines()
+            .join("\n")
+            .contains("creates one audit log query"));
+
+        // Deselecting all logs fails validation
+        m.log_signins = false;
+        m.log_directory = false;
+        assert!(m.validate_field(M365LogsField::LogSignins).is_some());
     }
 
     #[test]
@@ -3713,5 +6885,90 @@ mod tests {
         assert_eq!(db.case.examiner, "KHK Muster");
         assert_eq!(db.legal_basis, "AG Musterstadt 12 Gs 34/26");
         assert!(db.output.md5);
+
+        let mut imap = ImapForm::default();
+        imap.import_shared(&shared);
+        assert_eq!(imap.case.case, "VG 12345/26");
+        assert_eq!(imap.scope.legal_basis, "AG Musterstadt 12 Gs 34/26");
+
+        let mut m365 = M365LogsForm::default();
+        m365.import_shared(&shared);
+        assert_eq!(m365.case.case, "VG 12345/26");
+        assert_eq!(m365.legal_basis, "AG Musterstadt 12 Gs 34/26");
+
+        // Mandatory m365-logs window is not exported into shared file/mail scope
+        m365.not_before = "2026-01-01T00:00:00Z".into();
+        m365.not_after = "2026-02-01T00:00:00Z".into();
+        let exported = m365.export_shared();
+        assert!(exported.scope.not_before.is_empty());
+        assert!(exported.scope.not_after.is_empty());
+    }
+
+    #[test]
+    fn all_form_labels_fit_within_label_column() {
+        for f in FilesField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "FilesField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in IngestField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "IngestField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in CloudField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "CloudField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in DbField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "DbField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in ImapField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "ImapField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in GraphField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "GraphField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in GmailField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "GmailField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
+        for f in M365LogsField::ALL {
+            assert!(
+                f.label().chars().count() < 18,
+                "M365LogsField {:?}: {}",
+                f,
+                f.label()
+            );
+        }
     }
 }

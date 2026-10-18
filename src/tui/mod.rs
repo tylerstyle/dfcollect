@@ -159,8 +159,11 @@ pub fn run(stop: &'static Stop) -> Result<u8> {
         )),
         Ok(Err(e)) => Err(e),
         Ok(Ok(())) => {
-            if let Some(outcome) = app.signal_outcome.take() {
+            if let Some(mut outcome) = app.signal_outcome.take() {
                 if !app.headless {
+                    if let Some(map) = outcome.summary.as_object_mut() {
+                        map.remove("items_errors_scanned");
+                    }
                     crate::print(false, &outcome.summary);
                 }
                 return Ok(outcome.code);

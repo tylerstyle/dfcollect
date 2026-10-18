@@ -749,7 +749,6 @@ pub struct GmailPreview {
 
 impl GmailPreview {
     /// For the run's footprint
-    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 2)
     pub fn note(&self) -> PreviewNote {
         PreviewNote {
             at_ns: self.at_ns,

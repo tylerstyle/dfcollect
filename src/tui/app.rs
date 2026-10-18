@@ -1,26 +1,32 @@
 //! Application state, screen transitions, key handling, `TuiConsole` and
 //! worker-thread polling for the `dfcollect` TUI (`files`, `ingest`, `cloud`,
-//! `db` and `verify`).
+//! `db`, `imap`, `graph`, `gmail`, `m365-logs` and `verify`).
 
 use crate::{
-    args::{CloudArgs, DbArgs, FilesArgs, IngestArgs},
+    args::{CloudArgs, DbArgs, FilesArgs, GmailArgs, GraphArgs, ImapArgs, IngestArgs},
     cloud::{self, CloudPreview},
     common::{human_bytes, Credential, PreviewNote, Progress, RunCtx, Stop},
     console::{Cancelled, Console, Level, QuietConsole, SecretAsk, SignIn},
     db::{self, DbPreview},
     files::{self, Preview},
+    gmail::{self, GmailPreview},
+    graph::{self, GraphPreview},
     ingest::{self, IngestPreview},
-    mail::client::base64,
+    m365logs,
+    mail::{self, client::base64, ImapPreview},
     scope,
     tui::{
         autocomplete::{expand_tilde, find_path_completions, longest_common_prefix},
         command::{
-            cloud_argv, db_argv, files_argv, ingest_argv, parse_cloud_argv, parse_db_argv,
-            parse_files_argv, parse_ingest_argv, shell_quote, verify_argv,
+            cloud_argv, db_argv, files_argv, gmail_argv, graph_argv, imap_argv, ingest_argv,
+            m365_logs_argv, parse_cloud_argv, parse_db_argv, parse_files_argv, parse_gmail_argv,
+            parse_graph_argv, parse_imap_argv, parse_ingest_argv, parse_m365_logs_argv,
+            shell_quote, verify_argv,
         },
         form::{
-            CloudField, CloudForm, DbConnKey, DbField, DbForm, FilesField, FilesForm, IngestField,
-            IngestForm, SharedFormState,
+            CloudField, CloudForm, DbConnKey, DbField, DbForm, FilesField, FilesForm, GmailConnKey,
+            GmailField, GmailForm, GraphConnKey, GraphField, GraphForm, ImapConnKey, ImapField,
+            ImapForm, IngestField, IngestForm, M365LogsField, M365LogsForm, SharedFormState,
         },
         input::edit_text,
         mounts::{discover_mounts, MountChoice},
@@ -61,13 +67,15 @@ pub struct SecretRequest {
 }
 
 /// TUI implementation of [`Console`]: routes secret prompts to a masked modal
-/// on the UI thread via an `mpsc` channel, and buffers notices (up to 50) for
+/// on the UI thread via an `mpsc` channel, tracks interactive OAuth / device-code
+/// sign-in state + pasted redirect URLs, and buffers notices (up to 50) for
 /// the Run screen's notices pane.
 pub struct TuiConsole {
     stop: &'static Stop,
     secret_tx: Sender<SecretRequest>,
     pub notices: Mutex<VecDeque<(Level, String)>>,
     pub sign_in: Mutex<Option<SignIn>>,
+    pub pasted: Mutex<Option<String>>,
 }
 
 impl TuiConsole {
@@ -77,6 +85,7 @@ impl TuiConsole {
             secret_tx,
             notices: Mutex::new(VecDeque::with_capacity(MAX_NOTICES)),
             sign_in: Mutex::new(None),
+            pasted: Mutex::new(None),
         }
     }
 
@@ -121,14 +130,20 @@ impl Console for TuiConsole {
         if let Ok(mut guard) = self.sign_in.lock() {
             *guard = Some(s.clone());
         }
+        if let Ok(mut guard) = self.pasted.lock() {
+            *guard = None;
+        }
     }
 
     fn pasted(&self) -> Option<String> {
-        None
+        self.pasted.lock().ok()?.take()
     }
 
     fn sign_in_done(&self) {
         if let Ok(mut guard) = self.sign_in.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.pasted.lock() {
             *guard = None;
         }
     }
@@ -150,6 +165,10 @@ pub enum Mode {
     Ingest,
     Cloud,
     Db,
+    Imap,
+    Graph,
+    Gmail,
+    M365Logs,
 }
 
 impl Mode {
@@ -159,6 +178,10 @@ impl Mode {
             Self::Ingest => "ingest",
             Self::Cloud => "cloud",
             Self::Db => "db",
+            Self::Imap => "imap",
+            Self::Graph => "graph",
+            Self::Gmail => "gmail",
+            Self::M365Logs => "m365-logs",
         }
     }
 
@@ -168,6 +191,10 @@ impl Mode {
             Self::Ingest => "Ingest",
             Self::Cloud => "Cloud",
             Self::Db => "Database",
+            Self::Imap => "IMAP",
+            Self::Graph => "Graph",
+            Self::Gmail => "Gmail",
+            Self::M365Logs => "M365 Logs",
         }
     }
 
@@ -177,6 +204,10 @@ impl Mode {
             Self::Ingest => Screen::IngestForm,
             Self::Cloud => Screen::CloudForm,
             Self::Db => Screen::DbForm,
+            Self::Imap => Screen::ImapForm,
+            Self::Graph => Screen::GraphForm,
+            Self::Gmail => Screen::GmailForm,
+            Self::M365Logs => Screen::M365LogsForm,
         }
     }
 }
@@ -189,16 +220,18 @@ pub enum Screen {
     IngestForm,
     CloudForm,
     DbForm,
+    ImapForm,
+    GraphForm,
+    GmailForm,
+    M365LogsForm,
     Preview,
     Running,
     Result,
     Verify,
 }
 
-/// Items on the Home screen. The first five are interactive TUI workflows in
-/// Batch 1 (`files`, `verify`, `ingest`, `cloud`, `db`); the remaining four
-/// mail/log modes are command-line only until Batch 2 and show their `--help`
-/// command when selected.
+/// Items on the Home screen. All nine modes (eight acquisition modes plus
+/// `verify`) are interactive in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HomeItem {
     pub title: &'static str,
@@ -240,27 +273,27 @@ pub const HOME_ITEMS: [HomeItem; 9] = [
     },
     HomeItem {
         title: "IMAP mailbox",
-        command: "dfcollect imap --help",
-        enabled: false,
-        hint: "CLI only: run `dfcollect imap --help` for read-only IMAP mailbox acquisition",
+        command: "dfcollect imap",
+        enabled: true,
+        hint: "Read-only IMAP EXAMINE + BODY.PEEK[] mailbox acquisition into .eml files",
     },
     HomeItem {
         title: "Microsoft 365 mailbox (Graph)",
-        command: "dfcollect graph --help",
-        enabled: false,
-        hint: "CLI only: run `dfcollect graph --help` for Microsoft 365 Graph acquisition",
+        command: "dfcollect graph",
+        enabled: true,
+        hint: "Read-only Microsoft Graph MIME ($value) mailbox acquisition into .eml files",
     },
     HomeItem {
         title: "Gmail / Google Workspace mailbox",
-        command: "dfcollect gmail --help",
-        enabled: false,
-        hint: "CLI only: run `dfcollect gmail --help` for Gmail API RFC 2822 acquisition",
+        command: "dfcollect gmail",
+        enabled: true,
+        hint: "Read-only Gmail API (format=raw) RFC 2822 mailbox acquisition into .eml files",
     },
     HomeItem {
         title: "Microsoft 365 tenant audit logs",
-        command: "dfcollect m365-logs --help",
-        enabled: false,
-        hint: "CLI only: run `dfcollect m365-logs --help` for Entra & Unified Audit Logs",
+        command: "dfcollect m365-logs",
+        enabled: true,
+        hint: "Entra sign-in logs, directory audits and Purview Unified Audit Log (UAL)",
     },
 ];
 
@@ -286,13 +319,23 @@ pub enum SafetyTarget {
     IngestTmpfs,
     CloudTmpfs,
     DbTmpfs,
+    ImapTmpfs,
+    GraphTmpfs,
+    GmailTmpfs,
+    M365LogsTmpfs,
 }
 
 impl SafetyTarget {
     pub fn label(self) -> &'static str {
         match self {
             Self::Files(f) => f.label(),
-            Self::IngestTmpfs | Self::CloudTmpfs | Self::DbTmpfs => "Allow tmpfs",
+            Self::IngestTmpfs
+            | Self::CloudTmpfs
+            | Self::DbTmpfs
+            | Self::ImapTmpfs
+            | Self::GraphTmpfs
+            | Self::GmailTmpfs
+            | Self::M365LogsTmpfs => "Allow tmpfs",
         }
     }
 
@@ -309,6 +352,15 @@ pub enum ListTarget {
     CloudInclude,
     CloudExclude,
     DbDatabases,
+    ImapInclude,
+    ImapExclude,
+    GraphInclude,
+    GraphExclude,
+    GmailInclude,
+    GmailExclude,
+    M365Users,
+    M365RecordTypes,
+    M365Operations,
 }
 
 /// State of the masked secret prompt modal (`TuiConsole::secret`).
@@ -366,7 +418,7 @@ pub enum Modal {
         error: Option<String>,
     },
     /// Adding or editing an entry in a repeatable list (`--hashes`, `--rclone-arg`,
-    /// cloud `--include`/`--exclude`, `--database`).
+    /// `--include`/`--exclude`, `--database`, `--user`, `--record-type`, `--operation`).
     EditListItem {
         target: ListTarget,
         index: Option<usize>,
@@ -376,10 +428,13 @@ pub enum Modal {
     },
     /// Masked secret input requested by `TuiConsole::secret`.
     Secret(SecretModal),
-    /// Confirmation sheet before starting the acquisition from the Preview screen.
+    /// Confirmation sheet before starting the acquisition from the Preview screen
+    /// (or directly from the `m365-logs` form).
     ConfirmStart,
     /// Confirmation sheet before stopping a running acquisition (`s` or `Ctrl+C`).
     ConfirmStop,
+    /// Confirmation sheet before stopping an interactive OAuth / device-code sign-in.
+    ConfirmStopSignIn,
 }
 
 /// Which path field owns the current autocompletion state.
@@ -389,6 +444,10 @@ pub enum PathTarget {
     Ingest(IngestField),
     Cloud(CloudField),
     Db(DbField),
+    Imap(ImapField),
+    Graph(GraphField),
+    Gmail(GmailField),
+    M365Logs(M365LogsField),
     Verify,
 }
 
@@ -420,6 +479,18 @@ pub enum ModePreview {
         preview: DbPreview,
         args: Box<DbArgs>,
     },
+    Imap {
+        preview: ImapPreview,
+        args: Box<ImapArgs>,
+    },
+    Graph {
+        preview: GraphPreview,
+        args: Box<GraphArgs>,
+    },
+    Gmail {
+        preview: GmailPreview,
+        args: Box<GmailArgs>,
+    },
 }
 
 impl ModePreview {
@@ -429,6 +500,9 @@ impl ModePreview {
             Self::Ingest { .. } => Mode::Ingest,
             Self::Cloud { .. } => Mode::Cloud,
             Self::Db { .. } => Mode::Db,
+            Self::Imap { .. } => Mode::Imap,
+            Self::Graph { .. } => Mode::Graph,
+            Self::Gmail { .. } => Mode::Gmail,
         }
     }
 
@@ -438,6 +512,9 @@ impl ModePreview {
             Self::Ingest { preview, .. } => preview.note(),
             Self::Cloud { preview, .. } => preview.note(),
             Self::Db { preview, .. } => preview.note(),
+            Self::Imap { preview, .. } => preview.note(),
+            Self::Graph { preview, .. } => preview.note(),
+            Self::Gmail { preview, .. } => preview.note(),
         }
     }
 
@@ -447,6 +524,9 @@ impl ModePreview {
             Self::Ingest { preview, .. } => preview.stopped.as_deref(),
             Self::Cloud { preview, .. } => preview.stopped.as_deref(),
             Self::Db { .. } => None,
+            Self::Imap { preview, .. } => preview.stopped.as_deref(),
+            Self::Graph { preview, .. } => preview.stopped.as_deref(),
+            Self::Gmail { preview, .. } => preview.stopped.as_deref(),
         }
     }
 
@@ -456,6 +536,9 @@ impl ModePreview {
             Self::Ingest { preview, .. } => preview.short_of_space(),
             Self::Cloud { preview, .. } => preview.short_of_space(),
             Self::Db { preview, .. } => preview.short_of_space(),
+            Self::Imap { preview, .. } => preview.short_of_space(),
+            Self::Graph { preview, .. } => preview.short_of_space(),
+            Self::Gmail { preview, .. } => preview.short_of_space(),
         }
     }
 
@@ -465,6 +548,9 @@ impl ModePreview {
             Self::Ingest { preview, .. } => preview.summary(),
             Self::Cloud { preview, .. } => preview.summary(),
             Self::Db { preview, .. } => preview.summary(),
+            Self::Imap { preview, .. } => preview.summary(),
+            Self::Graph { preview, .. } => preview.summary(),
+            Self::Gmail { preview, .. } => preview.summary(),
         }
     }
 
@@ -505,14 +591,30 @@ impl ModePreview {
             }
             Self::Cloud { preview, .. } => preview.sample.len().saturating_sub(1),
             Self::Db { preview, .. } => preview.databases.len().saturating_sub(1),
+            Self::Imap { preview, .. } => preview.folders.len().saturating_sub(1),
+            Self::Graph { preview, .. } => preview.folders.len().saturating_sub(1),
+            Self::Gmail { preview, .. } => preview.by_label.len().saturating_sub(1),
         }
     }
 }
 
 /// Output returned by a background preview worker thread.
 pub struct PreviewWorkerOutput {
-    pub mode_preview: ModePreview,
+    pub result: anyhow::Result<ModePreview>,
     pub db_credential: Option<(DbConnKey, Credential)>,
+    pub imap_credential: Option<(ImapConnKey, Credential)>,
+    pub graph_credential: Option<(GraphConnKey, Credential)>,
+    pub gmail_credential: Option<(GmailConnKey, Credential)>,
+}
+
+fn finish_preview<T>(
+    r: anyhow::Result<(T, Option<Credential>)>,
+    ctx: &RunCtx,
+) -> (anyhow::Result<T>, Option<Credential>) {
+    match r {
+        Ok((pv, cred)) => (Ok(pv), cred.or_else(|| ctx.take_credential())),
+        Err(e) => (Err(e), ctx.take_credential()),
+    }
 }
 
 /// Finished preview held on [`Screen::Preview`].
@@ -547,7 +649,7 @@ pub enum PreviewState {
         progress: Arc<Progress>,
         console: Arc<TuiConsole>,
         started: Instant,
-        handle: Option<JoinHandle<anyhow::Result<PreviewWorkerOutput>>>,
+        handle: Option<JoinHandle<PreviewWorkerOutput>>,
     },
     Ready(Box<PreviewData>),
     Failed {
@@ -635,6 +737,111 @@ fn format_summary_value(key: &str, val: &serde_json::Value) -> String {
     }
 }
 
+/// Map a raw JSON summary `(key, value)` pair to a `<= 12`-char human-readable label and value,
+/// or `None` if it is already represented on `Screen::Result`.
+pub fn format_summary_kv_pair(key: &str, raw_val: &str) -> Option<(String, String)> {
+    match key {
+        "collection"
+        | "status"
+        | "acquired"
+        | "files"
+        | "dumps"
+        | "messages"
+        | "logs"
+        | "records"
+        | "bytes"
+        | "errors"
+        | "skipped"
+        | "audit_anchor"
+        | "problems"
+        | "warnings"
+        | "container_mismatches"
+        | "out_of_scope"
+        | "out_of_scope_listed"
+        | "out_of_scope_counted"
+        | "excluded_trees"
+        | "trees_outside_includes"
+        | "items_errors_scanned" => None,
+        "messages_listed" => Some(("Listed".into(), format!("{raw_val} message(s)"))),
+        "folders_examined" => Some(("Folders".into(), format!("{raw_val} examined"))),
+        "folders_listed" => Some(("Folders".into(), format!("{raw_val} listed"))),
+        "remote_changes" => Some(("Changes".into(), raw_val.to_string())),
+        "files_with_problems" => {
+            if raw_val == "0" {
+                None
+            } else {
+                Some(("Mismatched".into(), format!("{raw_val} file(s)")))
+            }
+        }
+        "failed" => {
+            if raw_val == "0" {
+                None
+            } else {
+                Some(("Failed".into(), format!("{raw_val} dump(s)")))
+            }
+        }
+        "remote" => Some(("Remote".into(), raw_val.to_string())),
+        "listed" => Some(("Listed".into(), raw_val.to_string())),
+        "tenant" => Some(("Tenant".into(), raw_val.to_string())),
+        other => {
+            let mut chars = other.chars();
+            let label = match chars.next() {
+                Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str().replace('_', " ")),
+                None => String::new(),
+            };
+            Some((label, raw_val.to_string()))
+        }
+    }
+}
+
+fn collect_failed_items(collection: &Path, problems: &mut Vec<String>) {
+    if !collection.join(dfcore::manifest::ITEMS).is_file() {
+        return;
+    }
+    let mut failed_items = 0usize;
+    let _ = dfcore::manifest::for_each_item(collection, |item| {
+        if item.status == dfcore::manifest::ItemStatus::Error {
+            failed_items += 1;
+            if failed_items <= 20 {
+                let reason = item.reason.as_deref().unwrap_or("error");
+                let entry = format!("{}: {}", sanitize_line(&item.path), sanitize_line(reason));
+                if !problems.contains(&entry) {
+                    problems.push(entry);
+                }
+            }
+        }
+        Ok(())
+    });
+    if failed_items > 20 {
+        let more = format!("+{} more in items.jsonl", failed_items - 20);
+        if !problems.contains(&more) {
+            problems.push(more);
+        }
+    }
+}
+
+fn finish_run_outcome(code: u8, mut summary: serde_json::Value, output: &Path) -> verify::Outcome {
+    let errors = summary.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+    let status = summary.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if errors > 0 || status == "completed_with_errors" {
+        let mut probs: Vec<String> = summary
+            .get("problems")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(ToString::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        collect_failed_items(output, &mut probs);
+        if let Some(map) = summary.as_object_mut() {
+            map.insert("problems".into(), serde_json::json!(probs));
+            map.insert("items_errors_scanned".into(), serde_json::json!(true));
+        }
+    }
+    verify::Outcome { code, summary }
+}
+
 /// Structured result of a finished (or failed/aborted/cancelled) acquisition run.
 #[derive(Debug, Clone)]
 pub struct ResultData {
@@ -644,6 +851,7 @@ pub struct ResultData {
     pub collection: PathBuf,
     pub argv: Vec<String>,
     pub acquired: u64,
+    pub records: Option<u64>,
     pub bytes: u64,
     pub out_of_scope_listed: u64,
     pub out_of_scope_counted: u64,
@@ -681,48 +889,66 @@ impl ResultData {
         };
         let mut summary_kv = Vec::new();
         if let Some(map) = s.as_object() {
+            if map.contains_key("verified") && map.contains_key("mismatched") {
+                let ver = map.get("verified").and_then(|v| v.as_u64()).unwrap_or(0);
+                let mis = map.get("mismatched").and_then(|v| v.as_u64()).unwrap_or(0);
+                let msg = map.get("missing").and_then(|v| v.as_u64()).unwrap_or(0);
+                let unl = map.get("unlisted").and_then(|v| v.as_u64()).unwrap_or(0);
+                summary_kv.push((
+                    "Hash lists".into(),
+                    format!("{ver} verified, {mis} mismatched, {msg} missing, {unl} unlisted"),
+                ));
+            }
             for (k, v) in map {
                 if matches!(
                     k.as_str(),
-                    "collection"
-                        | "status"
-                        | "acquired"
-                        | "files"
-                        | "dumps"
-                        | "bytes"
-                        | "errors"
-                        | "skipped"
-                        | "audit_anchor"
-                        | "problems"
-                        | "warnings"
-                        | "container_mismatches"
-                ) {
+                    "verified" | "mismatched" | "missing" | "unlisted"
+                ) && map.contains_key("verified")
+                {
                     continue;
                 }
-                summary_kv.push((k.clone(), format_summary_value(k, v)));
+                let raw_val = format_summary_value(k, v);
+                if let Some(pair) = format_summary_kv_pair(k, &raw_val) {
+                    summary_kv.push(pair);
+                }
             }
         }
         let acquired = s
             .get("acquired")
             .or_else(|| s.get("files"))
             .or_else(|| s.get("dumps"))
+            .or_else(|| s.get("messages"))
+            .or_else(|| s.get("logs"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let records = s.get("records").and_then(|v| v.as_u64());
+        let collection = s
+            .get("collection")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or(collection);
+        let status = s
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let errors = s.get("errors").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut problems = str_vec("problems");
+        let already_scanned = s
+            .get("items_errors_scanned")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !already_scanned && (errors > 0 || status == "completed_with_errors") {
+            collect_failed_items(&collection, &mut problems);
+        }
         Self {
             mode,
             code: outcome.code,
-            status: s
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            collection: s
-                .get("collection")
-                .and_then(|v| v.as_str())
-                .map(PathBuf::from)
-                .unwrap_or(collection),
+            status,
+            collection,
             argv,
             acquired,
+            records,
             bytes: s.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
             out_of_scope_listed: s
                 .get("out_of_scope_listed")
@@ -740,7 +966,7 @@ impl ResultData {
                 .get("trees_outside_includes")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            errors: s.get("errors").and_then(|v| v.as_u64()).unwrap_or(0),
+            errors,
             skipped: s.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0),
             summary_kv,
             audit_anchor: s
@@ -749,7 +975,7 @@ impl ResultData {
                 .map(ToString::to_string),
             container_mismatches: str_vec("container_mismatches"),
             warnings: str_vec("warnings"),
-            problems: str_vec("problems"),
+            problems,
             fatal_error: None,
             left_unfinished: false,
             scroll: 0,
@@ -776,6 +1002,7 @@ impl ResultData {
             collection,
             argv,
             acquired: 0,
+            records: None,
             bytes: 0,
             out_of_scope_listed: 0,
             out_of_scope_counted: 0,
@@ -807,6 +1034,7 @@ impl ResultData {
             collection,
             argv,
             acquired: 0,
+            records: None,
             bytes: 0,
             out_of_scope_listed: 0,
             out_of_scope_counted: 0,
@@ -1026,7 +1254,16 @@ pub struct App {
     pub ingest_form: IngestForm,
     pub cloud_form: CloudForm,
     pub db_form: DbForm,
+    pub imap_form: ImapForm,
+    pub graph_form: GraphForm,
+    pub gmail_form: GmailForm,
+    pub m365_logs_form: M365LogsForm,
     pub db_credential: Option<(DbConnKey, Credential)>,
+    pub imap_credential: Option<(ImapConnKey, Credential)>,
+    pub graph_credential: Option<(GraphConnKey, Credential)>,
+    pub gmail_credential: Option<(GmailConnKey, Credential)>,
+    pub sign_in_paste: String,
+    pub sign_in_paste_cursor: usize,
     pub secret_tx: Sender<SecretRequest>,
     pub secret_rx: Receiver<SecretRequest>,
     pub preview_state: Option<PreviewState>,
@@ -1071,8 +1308,17 @@ impl App {
             files_form: FilesForm::with_mounts(source_mounts, target_mounts.clone()),
             ingest_form: IngestForm::with_targets(target_mounts.clone()),
             cloud_form: CloudForm::with_remotes(Vec::new(), target_mounts.clone()),
-            db_form: DbForm::with_targets(target_mounts),
+            db_form: DbForm::with_targets(target_mounts.clone()),
+            imap_form: ImapForm::with_targets(target_mounts.clone()),
+            graph_form: GraphForm::with_targets(target_mounts.clone()),
+            gmail_form: GmailForm::with_targets(target_mounts.clone()),
+            m365_logs_form: M365LogsForm::with_targets(target_mounts),
             db_credential: None,
+            imap_credential: None,
+            graph_credential: None,
+            gmail_credential: None,
+            sign_in_paste: String::new(),
+            sign_in_paste_cursor: 0,
             secret_tx,
             secret_rx,
             preview_state: None,
@@ -1105,7 +1351,19 @@ impl App {
             Mode::Ingest => self.ingest_form.export_shared(),
             Mode::Cloud => self.cloud_form.export_shared(),
             Mode::Db => self.db_form.export_shared(),
+            Mode::Imap => self.imap_form.export_shared(),
+            Mode::Graph => self.graph_form.export_shared(),
+            Mode::Gmail => self.gmail_form.export_shared(),
+            Mode::M365Logs => self.m365_logs_form.export_shared(),
         };
+    }
+
+    /// Drop all cached preview credentials (called on mode switch, after a run, on `'n'`, or on quit).
+    pub fn clear_all_credentials(&mut self) {
+        self.db_credential = None;
+        self.imap_credential = None;
+        self.graph_credential = None;
+        self.gmail_credential = None;
     }
 
     /// Drop any cached DB preview credential if the connection fields no longer match.
@@ -1117,6 +1375,51 @@ impl App {
         }
     }
 
+    /// Drop any cached IMAP preview credential if the connection fields no longer match.
+    pub fn check_imap_credential(&mut self) {
+        if let Some((saved_key, _)) = &self.imap_credential {
+            if *saved_key != self.imap_form.conn_key() {
+                self.imap_credential = None;
+            }
+        }
+    }
+
+    /// Drop any cached Graph preview credential if the connection fields no longer match.
+    pub fn check_graph_credential(&mut self) {
+        if let Some((saved_key, _)) = &self.graph_credential {
+            if *saved_key != self.graph_form.conn_key() {
+                self.graph_credential = None;
+            }
+        }
+    }
+
+    /// Drop any cached Gmail preview credential if the connection fields no longer match.
+    pub fn check_gmail_credential(&mut self) {
+        if let Some((saved_key, _)) = &self.gmail_credential {
+            if *saved_key != self.gmail_form.conn_key() {
+                self.gmail_credential = None;
+            }
+        }
+    }
+
+    /// Console of the currently running preview or acquisition worker, if any.
+    pub fn active_console(&self) -> Option<Arc<TuiConsole>> {
+        if let Some(PreviewState::Running { console, .. }) = &self.preview_state {
+            return Some(console.clone());
+        }
+        if let Some(run) = &self.run_state {
+            return Some(run.console.clone());
+        }
+        None
+    }
+
+    /// Active interactive OAuth / device-code sign-in state from a running worker, if any.
+    pub fn active_sign_in(&self) -> Option<SignIn> {
+        let console = self.active_console()?;
+        let guard = console.sign_in.lock().ok()?;
+        guard.clone()
+    }
+
     /// Current mode's equivalent CLI command vector for the footer / preview check.
     pub fn current_mode_argv(&self, mode: Mode) -> Vec<String> {
         match mode {
@@ -1124,6 +1427,10 @@ impl App {
             Mode::Ingest => ingest_argv(&self.ingest_form),
             Mode::Cloud => cloud_argv(&self.cloud_form),
             Mode::Db => db_argv(&self.db_form),
+            Mode::Imap => imap_argv(&self.imap_form),
+            Mode::Graph => graph_argv(&self.graph_form),
+            Mode::Gmail => gmail_argv(&self.gmail_form),
+            Mode::M365Logs => m365_logs_argv(&self.m365_logs_form),
         }
     }
 
@@ -1163,13 +1470,17 @@ impl App {
             return true;
         }
         let mode = data.mode_preview.mode();
-        self.current_mode_argv(mode) != data.argv
+        self.active_mode == Mode::M365Logs || self.current_mode_argv(mode) != data.argv
     }
 
     /// Poll running worker threads, service `TuiConsole::secret` requests, and
     /// update transfer rate / spinner state.
     pub fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+
+        if self.modal == Some(Modal::ConfirmStopSignIn) && self.active_sign_in().is_none() {
+            self.modal = None;
+        }
 
         // 0. Service or cancel secret requests from TuiConsole
         if self.headless || self.stop.is_set() {
@@ -1204,74 +1515,96 @@ impl App {
                 ..
             }) = self.preview_state.take()
             {
-                if let Some(Modal::Secret(mut sm)) = self.modal.take() {
-                    sm.buffer.zeroize();
-                    let _ = sm.reply.send(None);
+                if matches!(
+                    self.modal,
+                    Some(Modal::ConfirmStopSignIn | Modal::Secret(_))
+                ) {
+                    if let Some(Modal::Secret(mut sm)) = self.modal.take() {
+                        sm.buffer.zeroize();
+                        let _ = sm.reply.send(None);
+                    }
+                    self.modal = None;
                 }
+                self.sign_in_paste.clear();
+                self.sign_in_paste_cursor = 0;
                 if let Some(h) = handle.take() {
                     match h.join() {
-                        Ok(Ok(out)) => {
+                        Ok(out) => {
                             if let Some(cred) = out.db_credential {
                                 self.db_credential = Some(cred);
                             }
-                            let mp = out.mode_preview;
-                            if self.stop.signal.load(Ordering::Relaxed) {
-                                self.signal_outcome = Some(verify::Outcome {
-                                    code: mp.stopped().map_or(0, |_| 8),
-                                    summary: mp.summary(),
-                                });
-                                self.should_quit = true;
-                                return;
+                            if let Some(cred) = out.imap_credential {
+                                self.imap_credential = Some(cred);
                             }
-                            if let Some(reason) = mp.stopped() {
-                                self.notify(
-                                    NoticeLevel::Warning,
-                                    format!(
-                                        "Preview stopped ({reason}); re-run preview before starting."
-                                    ),
-                                );
-                            } else if let Some(block_err) = mp.start_block_reason() {
-                                self.notify(NoticeLevel::Error, block_err);
-                            } else {
-                                self.notice = None;
+                            if let Some(cred) = out.graph_credential {
+                                self.graph_credential = Some(cred);
                             }
-                            self.preview_state = Some(PreviewState::Ready(Box::new(PreviewData {
-                                mode_preview: mp,
-                                argv,
-                                scroll: 0,
-                                copied_osc52: false,
-                            })));
-                        }
-                        Ok(Err(e)) => {
-                            let is_cancelled = e.downcast_ref::<Cancelled>().is_some();
-                            let is_stopped = e.downcast_ref::<crate::common::Stopped>().is_some();
-                            let code = classify_error(&e);
-                            let msg = if is_cancelled {
-                                "Preview cancelled before anything was written".to_string()
-                            } else if is_stopped {
-                                let reason = if self.stop.signal.load(Ordering::Relaxed) {
-                                    "by a signal"
-                                } else {
-                                    "by the examiner"
-                                };
-                                format!("Preview stopped ({reason})")
-                            } else {
-                                format!("{e:#}")
-                            };
-                            self.notify(
-                                if is_cancelled || is_stopped || code == 8 {
-                                    NoticeLevel::Warning
-                                } else {
-                                    NoticeLevel::Error
-                                },
-                                &msg,
-                            );
-                            self.preview_state = Some(PreviewState::Failed {
-                                mode,
-                                argv,
-                                error: msg,
-                                code,
-                            });
+                            if let Some(cred) = out.gmail_credential {
+                                self.gmail_credential = Some(cred);
+                            }
+                            match out.result {
+                                Ok(mp) => {
+                                    if self.stop.signal.load(Ordering::Relaxed) {
+                                        self.signal_outcome = Some(verify::Outcome {
+                                            code: mp.stopped().map_or(0, |_| 8),
+                                            summary: mp.summary(),
+                                        });
+                                        self.should_quit = true;
+                                        return;
+                                    }
+                                    if let Some(reason) = mp.stopped() {
+                                        self.notify(
+                                            NoticeLevel::Warning,
+                                            format!(
+                                                "Preview stopped ({reason}); re-run preview before starting."
+                                            ),
+                                        );
+                                    } else if let Some(block_err) = mp.start_block_reason() {
+                                        self.notify(NoticeLevel::Error, block_err);
+                                    } else {
+                                        self.notice = None;
+                                    }
+                                    self.preview_state =
+                                        Some(PreviewState::Ready(Box::new(PreviewData {
+                                            mode_preview: mp,
+                                            argv,
+                                            scroll: 0,
+                                            copied_osc52: false,
+                                        })));
+                                }
+                                Err(e) => {
+                                    let is_cancelled = e.downcast_ref::<Cancelled>().is_some();
+                                    let is_stopped =
+                                        e.downcast_ref::<crate::common::Stopped>().is_some();
+                                    let code = classify_error(&e);
+                                    let msg = if is_cancelled {
+                                        "Preview cancelled before anything was written".to_string()
+                                    } else if is_stopped {
+                                        let reason = if self.stop.signal.load(Ordering::Relaxed) {
+                                            "by a signal"
+                                        } else {
+                                            "by the examiner"
+                                        };
+                                        format!("Preview stopped ({reason})")
+                                    } else {
+                                        format!("{e:#}")
+                                    };
+                                    self.notify(
+                                        if is_cancelled || is_stopped || code == 8 {
+                                            NoticeLevel::Warning
+                                        } else {
+                                            NoticeLevel::Error
+                                        },
+                                        &msg,
+                                    );
+                                    self.preview_state = Some(PreviewState::Failed {
+                                        mode,
+                                        argv,
+                                        error: msg,
+                                        code,
+                                    });
+                                }
+                            }
                         }
                         Err(payload) => {
                             let msg = format!(
@@ -1310,15 +1643,20 @@ impl App {
         );
         if run_done {
             if let Some(mut run) = self.run_state.take() {
-                if matches!(self.modal, Some(Modal::ConfirmStop | Modal::Secret(_))) {
+                if matches!(
+                    self.modal,
+                    Some(Modal::ConfirmStop | Modal::ConfirmStopSignIn | Modal::Secret(_))
+                ) {
                     if let Some(Modal::Secret(mut sm)) = self.modal.take() {
                         sm.buffer.zeroize();
                         let _ = sm.reply.send(None);
                     }
                     self.modal = None;
                 }
-                // Always drop any cached DB credential after a run completes
-                self.db_credential = None;
+                self.sign_in_paste.clear();
+                self.sign_in_paste_cursor = 0;
+                // Always drop any cached preview credentials after a run completes
+                self.clear_all_credentials();
                 if let Some(h) = run.handle.take() {
                     let mode = run.mode;
                     let output = run.output.clone();
@@ -1330,8 +1668,11 @@ impl App {
                         self.session_collections.push(output.clone());
                     }
                     match joined {
-                        Ok(Ok(outcome)) => {
+                        Ok(Ok(mut outcome)) => {
                             if self.stop.signal.load(Ordering::Relaxed) || self.headless {
+                                if let Some(map) = outcome.summary.as_object_mut() {
+                                    map.remove("items_errors_scanned");
+                                }
                                 self.signal_outcome = Some(outcome);
                                 self.should_quit = true;
                                 return;
@@ -1426,7 +1767,7 @@ impl App {
 
         // 4. If an external signal arrived while idle, quit immediately
         if self.stop.signal.load(Ordering::Relaxed) && !self.is_worker_running() {
-            self.db_credential = None;
+            self.clear_all_credentials();
             self.should_quit = true;
         }
     }
@@ -1450,6 +1791,16 @@ impl App {
             return;
         }
 
+        // If an interactive OAuth / device-code sign-in is active, route keys to the Sign-In screen
+        if let Some(sign_in) = self.active_sign_in() {
+            if key.code == KeyCode::F(1) {
+                self.modal = Some(Modal::Help);
+            } else {
+                self.handle_sign_in_key(key, sign_in);
+            }
+            return;
+        }
+
         // Ctrl+C on Running screen asks to stop; elsewhere exits if idle
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             match self.screen {
@@ -1466,7 +1817,7 @@ impl App {
                     return;
                 }
                 _ => {
-                    self.db_credential = None;
+                    self.clear_all_credentials();
                     self.should_quit = true;
                     return;
                 }
@@ -1484,10 +1835,84 @@ impl App {
             Screen::IngestForm => self.handle_ingest_form_key(key),
             Screen::CloudForm => self.handle_cloud_form_key(key),
             Screen::DbForm => self.handle_db_form_key(key),
+            Screen::ImapForm => self.handle_imap_form_key(key),
+            Screen::GraphForm => self.handle_graph_form_key(key),
+            Screen::GmailForm => self.handle_gmail_form_key(key),
+            Screen::M365LogsForm => self.handle_m365_logs_form_key(key),
             Screen::Preview => self.handle_preview_key(key),
             Screen::Running => self.handle_running_key(key),
             Screen::Result => self.handle_result_key(key),
             Screen::Verify => self.handle_verify_key(key),
+        }
+    }
+
+    fn handle_sign_in_key(&mut self, key: KeyEvent, sign_in: SignIn) {
+        if key.code == KeyCode::Esc
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+        {
+            self.modal = Some(Modal::ConfirmStopSignIn);
+            return;
+        }
+
+        match sign_in {
+            SignIn::DeviceCode { uri, code, .. } => match key.code {
+                KeyCode::Char('?') => self.modal = Some(Modal::Help),
+                KeyCode::Char('u') => {
+                    self.pending_osc52 = Some(base64(uri.as_bytes()));
+                    self.notify(
+                        NoticeLevel::Info,
+                        "Verification URL copied to clipboard (OSC 52).",
+                    );
+                }
+                KeyCode::Char('y') => {
+                    self.pending_osc52 = Some(base64(code.as_bytes()));
+                    self.notify(NoticeLevel::Info, "User code copied to clipboard (OSC 52).");
+                }
+                _ => {}
+            },
+            SignIn::Browser { url, .. } => match key.code {
+                KeyCode::F(2) => {
+                    self.pending_osc52 = Some(base64(url.as_bytes()));
+                    self.notify(
+                        NoticeLevel::Info,
+                        "Authorization URL copied to clipboard (OSC 52).",
+                    );
+                }
+                KeyCode::Char('u') if self.sign_in_paste.is_empty() && key.modifiers.is_empty() => {
+                    self.pending_osc52 = Some(base64(url.as_bytes()));
+                    self.notify(
+                        NoticeLevel::Info,
+                        "Authorization URL copied to clipboard (OSC 52).",
+                    );
+                }
+                KeyCode::Char('?') if self.sign_in_paste.is_empty() => {
+                    self.modal = Some(Modal::Help);
+                }
+                KeyCode::Enter => {
+                    let trimmed = self.sign_in_paste.trim().to_string();
+                    if trimmed.is_empty() {
+                        self.notify(
+                            NoticeLevel::Warning,
+                            "Paste the redirect URL (http://127.0.0.1:.../?code=...) before pressing Enter.",
+                        );
+                        return;
+                    }
+                    if let Some(console) = self.active_console() {
+                        if let Ok(mut guard) = console.pasted.lock() {
+                            *guard = Some(trimmed);
+                        }
+                    }
+                    self.sign_in_paste.clear();
+                    self.sign_in_paste_cursor = 0;
+                    self.notify(
+                        NoticeLevel::Info,
+                        "Redirect URL submitted — completing sign-in...",
+                    );
+                }
+                _ => {
+                    edit_text(&mut self.sign_in_paste, &mut self.sign_in_paste_cursor, key);
+                }
+            },
         }
     }
 
@@ -1527,6 +1952,22 @@ impl App {
                         SafetyTarget::DbTmpfs => {
                             self.db_form.output.allow_tmpfs = true;
                             self.db_form.refresh_probes();
+                        }
+                        SafetyTarget::ImapTmpfs => {
+                            self.imap_form.output.allow_tmpfs = true;
+                            self.imap_form.refresh_probes();
+                        }
+                        SafetyTarget::GraphTmpfs => {
+                            self.graph_form.output.allow_tmpfs = true;
+                            self.graph_form.refresh_probes();
+                        }
+                        SafetyTarget::GmailTmpfs => {
+                            self.gmail_form.output.allow_tmpfs = true;
+                            self.gmail_form.refresh_probes();
+                        }
+                        SafetyTarget::M365LogsTmpfs => {
+                            self.m365_logs_form.output.allow_tmpfs = true;
+                            self.m365_logs_form.refresh_probes();
                         }
                     }
                     self.notify(
@@ -1653,6 +2094,42 @@ impl App {
                         ListTarget::DbDatabases => {
                             (&mut self.db_form.databases, &mut self.db_form.databases_idx)
                         }
+                        ListTarget::ImapInclude => (
+                            &mut self.imap_form.scope.include,
+                            &mut self.imap_form.scope.include_idx,
+                        ),
+                        ListTarget::ImapExclude => (
+                            &mut self.imap_form.scope.exclude,
+                            &mut self.imap_form.scope.exclude_idx,
+                        ),
+                        ListTarget::GraphInclude => (
+                            &mut self.graph_form.scope.include,
+                            &mut self.graph_form.scope.include_idx,
+                        ),
+                        ListTarget::GraphExclude => (
+                            &mut self.graph_form.scope.exclude,
+                            &mut self.graph_form.scope.exclude_idx,
+                        ),
+                        ListTarget::GmailInclude => (
+                            &mut self.gmail_form.scope.include,
+                            &mut self.gmail_form.scope.include_idx,
+                        ),
+                        ListTarget::GmailExclude => (
+                            &mut self.gmail_form.scope.exclude,
+                            &mut self.gmail_form.scope.exclude_idx,
+                        ),
+                        ListTarget::M365Users => (
+                            &mut self.m365_logs_form.users,
+                            &mut self.m365_logs_form.users_idx,
+                        ),
+                        ListTarget::M365RecordTypes => (
+                            &mut self.m365_logs_form.record_types,
+                            &mut self.m365_logs_form.record_types_idx,
+                        ),
+                        ListTarget::M365Operations => (
+                            &mut self.m365_logs_form.operations,
+                            &mut self.m365_logs_form.operations_idx,
+                        ),
                     };
                     if let Some(i) = index {
                         if i < list.len() {
@@ -1721,13 +2198,34 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
                 _ => self.modal = Some(Modal::ConfirmStop),
             },
+            Modal::ConfirmStopSignIn => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if self.active_sign_in().is_some() {
+                        self.stop.examiner.store(true, Ordering::Relaxed);
+                        if let Some(console) = self.active_console() {
+                            console.sign_in_done();
+                        }
+                        if let Some(run) = &mut self.run_state {
+                            run.stop_requested = true;
+                        }
+                        self.sign_in_paste.clear();
+                        self.sign_in_paste_cursor = 0;
+                        self.notify(
+                            NoticeLevel::Warning,
+                            "Stopping sign-in — nothing has been acquired.",
+                        );
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
+                _ => self.modal = Some(Modal::ConfirmStopSignIn),
+            },
         }
     }
 
     fn handle_home_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.db_credential = None;
+                self.clear_all_credentials();
                 self.should_quit = true;
             }
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
@@ -1748,63 +2246,97 @@ impl App {
             KeyCode::Char('i') => self.open_ingest_form(),
             KeyCode::Char('c') => self.open_cloud_form(),
             KeyCode::Char('d') => self.open_db_form(),
+            KeyCode::Char('m') => self.open_imap_form(),
+            KeyCode::Char('g') => self.open_graph_form(),
+            KeyCode::Char('w') => self.open_gmail_form(),
+            KeyCode::Char('l') => self.open_m365_logs_form(),
             KeyCode::Enter | KeyCode::Char(' ') => match self.home_idx {
                 0 => self.open_files_form(),
                 1 => self.open_verify(None, false),
                 2 => self.open_ingest_form(),
                 3 => self.open_cloud_form(),
                 4 => self.open_db_form(),
-                i => {
-                    let item = &HOME_ITEMS[i];
-                    self.notify(
-                        NoticeLevel::Info,
-                        format!(
-                            "Command-line only for now — run `{}` in a shell.",
-                            item.command
-                        ),
-                    );
-                }
+                5 => self.open_imap_form(),
+                6 => self.open_graph_form(),
+                7 => self.open_gmail_form(),
+                8 => self.open_m365_logs_form(),
+                _ => {}
             },
             _ => {}
         }
     }
 
-    pub fn open_files_form(&mut self) {
-        self.files_form.import_shared(&self.shared);
-        self.files_form.refresh_probes();
-        self.active_mode = Mode::Files;
+    fn switch_to_mode(&mut self, mode: Mode) {
+        if self.active_mode != mode {
+            self.clear_all_credentials();
+            self.preview_state = None;
+        } else if let Some(PreviewState::Ready(data)) = &self.preview_state {
+            if data.mode_preview.mode() != mode {
+                self.preview_state = None;
+            }
+        }
+        self.active_mode = mode;
         self.completion = None;
         self.notice = None;
+    }
+
+    pub fn open_files_form(&mut self) {
+        self.switch_to_mode(Mode::Files);
+        self.files_form.import_shared(&self.shared);
+        self.files_form.refresh_probes();
         self.screen = Screen::FilesForm;
     }
 
     pub fn open_ingest_form(&mut self) {
+        self.switch_to_mode(Mode::Ingest);
         self.ingest_form.import_shared(&self.shared);
         self.ingest_form.refresh_probes();
-        self.active_mode = Mode::Ingest;
-        self.completion = None;
-        self.notice = None;
         self.screen = Screen::IngestForm;
     }
 
     pub fn open_cloud_form(&mut self) {
+        self.switch_to_mode(Mode::Cloud);
         self.cloud_form.import_shared(&self.shared);
         self.cloud_form.probe_remotes_if_needed();
         self.cloud_form.refresh_probes();
-        self.active_mode = Mode::Cloud;
-        self.completion = None;
-        self.notice = None;
         self.screen = Screen::CloudForm;
     }
 
     pub fn open_db_form(&mut self) {
+        self.switch_to_mode(Mode::Db);
         self.db_form.import_shared(&self.shared);
         self.db_form.probe_tools_if_needed();
         self.db_form.refresh_probes();
-        self.active_mode = Mode::Db;
-        self.completion = None;
-        self.notice = None;
         self.screen = Screen::DbForm;
+    }
+
+    pub fn open_imap_form(&mut self) {
+        self.switch_to_mode(Mode::Imap);
+        self.imap_form.import_shared(&self.shared);
+        self.imap_form.refresh_probes();
+        self.screen = Screen::ImapForm;
+    }
+
+    pub fn open_graph_form(&mut self) {
+        self.switch_to_mode(Mode::Graph);
+        self.graph_form.import_shared(&self.shared);
+        self.graph_form.refresh_probes();
+        self.screen = Screen::GraphForm;
+    }
+
+    pub fn open_gmail_form(&mut self) {
+        self.switch_to_mode(Mode::Gmail);
+        self.gmail_form.import_shared(&self.shared);
+        self.gmail_form.refresh_probes();
+        self.screen = Screen::GmailForm;
+    }
+
+    pub fn open_m365_logs_form(&mut self) {
+        self.switch_to_mode(Mode::M365Logs);
+        self.preview_state = None;
+        self.m365_logs_form.import_shared(&self.shared);
+        self.m365_logs_form.refresh_probes();
+        self.screen = Screen::M365LogsForm;
     }
 
     pub fn open_verify(&mut self, prefill: Option<PathBuf>, run_immediately: bool) {
@@ -2662,6 +3194,902 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // ImapForm key handling
+    // ------------------------------------------------------------------
+
+    fn handle_imap_form_key(&mut self, key: KeyEvent) {
+        self.active_mode = Mode::Imap;
+        let field = self.imap_form.field;
+        let spec = field.spec();
+        let tab_completes = spec.kind.is_path()
+            && (self.imap_form.editing || self.completion.is_some())
+            && key.code == KeyCode::Tab;
+
+        if key.code != KeyCode::F(4) && !tab_completes {
+            self.completion = None;
+        }
+
+        if key.code == KeyCode::F(2)
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+        {
+            self.start_preview();
+            return;
+        }
+
+        if key.code == KeyCode::F(4) || tab_completes {
+            if spec.kind.is_path() {
+                self.complete_path(PathTarget::Imap(field));
+            } else {
+                self.notify(
+                    NoticeLevel::Info,
+                    "Path autocompletion (F4 / Tab) applies to path fields.",
+                );
+            }
+            return;
+        }
+
+        let list_target = match field {
+            ImapField::Includes => Some(ListTarget::ImapInclude),
+            ImapField::Excludes => Some(ListTarget::ImapExclude),
+            _ => None,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                if self.imap_form.editing {
+                    self.imap_form.editing = false;
+                    self.imap_form.refresh_probes();
+                } else {
+                    self.capture_shared_from_active();
+                    self.screen = Screen::Home;
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.imap_form.refresh_probes();
+                self.imap_form.focus_next(true);
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.imap_form.refresh_probes();
+                self.imap_form.focus_next(false);
+            }
+            KeyCode::Enter => {
+                if field == ImapField::PreviewButton {
+                    self.start_preview();
+                } else if let Some(lt) = list_target {
+                    self.open_list_modal(lt, true);
+                } else if spec.kind.is_safety() {
+                    if self.imap_form.output.allow_tmpfs {
+                        self.imap_form.output.allow_tmpfs = false;
+                        self.imap_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::ImapTmpfs,
+                        });
+                    }
+                } else if spec.kind.is_text() {
+                    if field == ImapField::ReferenceTime
+                        && !self.imap_form.clock.reference_time.trim().is_empty()
+                    {
+                        self.imap_form.clock.commit_now();
+                        self.imap_form.editing = false;
+                        self.imap_form.refresh_probes();
+                        self.imap_form.focus_next(true);
+                    } else if self.imap_form.editing {
+                        self.imap_form.editing = false;
+                        self.imap_form.refresh_probes();
+                        self.imap_form.focus_next(true);
+                    } else {
+                        self.imap_form.editing = true;
+                        self.imap_form.cursor = self.imap_form.text(field).map_or(0, String::len);
+                    }
+                } else {
+                    self.imap_form.toggle_regular(field, true);
+                    self.check_imap_credential();
+                    self.imap_form.refresh_probes();
+                }
+            }
+            KeyCode::Char('a') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), false);
+            }
+            KeyCode::Char('e') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), true);
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if list_target.is_some() => {
+                match list_target.unwrap() {
+                    ListTarget::ImapInclude => remove_selected(
+                        &mut self.imap_form.scope.include,
+                        &mut self.imap_form.scope.include_idx,
+                    ),
+                    ListTarget::ImapExclude => remove_selected(
+                        &mut self.imap_form.scope.exclude,
+                        &mut self.imap_form.scope.exclude_idx,
+                    ),
+                    _ => {}
+                }
+            }
+            KeyCode::Left if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::ImapInclude => cycle_selected(
+                    self.imap_form.scope.include.len(),
+                    &mut self.imap_form.scope.include_idx,
+                    false,
+                ),
+                ListTarget::ImapExclude => cycle_selected(
+                    self.imap_form.scope.exclude.len(),
+                    &mut self.imap_form.scope.exclude_idx,
+                    false,
+                ),
+                _ => {}
+            },
+            KeyCode::Right if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::ImapInclude => cycle_selected(
+                    self.imap_form.scope.include.len(),
+                    &mut self.imap_form.scope.include_idx,
+                    true,
+                ),
+                ListTarget::ImapExclude => cycle_selected(
+                    self.imap_form.scope.exclude.len(),
+                    &mut self.imap_form.scope.exclude_idx,
+                    true,
+                ),
+                _ => {}
+            },
+            KeyCode::Char('p') if !spec.kind.is_text() => self.start_preview(),
+            KeyCode::Char('?') if !spec.kind.is_text() => self.modal = Some(Modal::Help),
+            KeyCode::Char('q') if !spec.kind.is_text() => {
+                self.capture_shared_from_active();
+                self.screen = Screen::Home;
+            }
+            KeyCode::Char(' ') if field == ImapField::PreviewButton => self.start_preview(),
+            KeyCode::Char(' ') | KeyCode::Right if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    if self.imap_form.output.allow_tmpfs {
+                        self.imap_form.output.allow_tmpfs = false;
+                        self.imap_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::ImapTmpfs,
+                        });
+                    }
+                } else {
+                    self.imap_form.toggle_regular(field, true);
+                    self.check_imap_credential();
+                    self.imap_form.refresh_probes();
+                }
+            }
+            KeyCode::Left if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    self.imap_form.output.allow_tmpfs = false;
+                    self.imap_form.refresh_probes();
+                } else {
+                    self.imap_form.toggle_regular(field, false);
+                    self.check_imap_credential();
+                    self.imap_form.refresh_probes();
+                }
+            }
+            _ if spec.kind.is_text() => {
+                let mut cursor = self.imap_form.cursor;
+                if let Some(t) = self.imap_form.text_mut(field) {
+                    let before = t.clone();
+                    edit_text(t, &mut cursor, key);
+                    let changed = *t != before;
+                    self.imap_form.cursor = cursor;
+                    if changed {
+                        self.imap_form.editing = true;
+                        match field {
+                            ImapField::CaseNumber | ImapField::EvidenceNumber => {
+                                self.imap_form.output.update_suggestion(
+                                    &self.imap_form.case.case,
+                                    &self.imap_form.case.evidence,
+                                );
+                                self.imap_form.refresh_probes();
+                            }
+                            ImapField::Server
+                            | ImapField::User
+                            | ImapField::PasswordFile
+                            | ImapField::TokenFile
+                            | ImapField::TlsSha256 => {
+                                self.check_imap_credential();
+                            }
+                            ImapField::OutputPath => {
+                                self.imap_form.output.output_customized =
+                                    !self.imap_form.output.output_path.trim().is_empty();
+                                self.imap_form.refresh_probes();
+                            }
+                            ImapField::ReferenceTime => {
+                                self.imap_form.clock.reference_entered_ns = None;
+                            }
+                            _ => {}
+                        }
+                        if self.imap_form.validate_field(field).is_none()
+                            && matches!(&self.notice, Some(n) if n.level == NoticeLevel::Error)
+                        {
+                            self.notice = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GraphForm key handling
+    // ------------------------------------------------------------------
+
+    fn handle_graph_form_key(&mut self, key: KeyEvent) {
+        self.active_mode = Mode::Graph;
+        let field = self.graph_form.field;
+        let spec = field.spec();
+        let tab_completes = spec.kind.is_path()
+            && (self.graph_form.editing || self.completion.is_some())
+            && key.code == KeyCode::Tab;
+
+        if key.code != KeyCode::F(4) && !tab_completes {
+            self.completion = None;
+        }
+
+        if key.code == KeyCode::F(2)
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+        {
+            self.start_preview();
+            return;
+        }
+
+        if key.code == KeyCode::F(4) || tab_completes {
+            if spec.kind.is_path() {
+                self.complete_path(PathTarget::Graph(field));
+            } else {
+                self.notify(
+                    NoticeLevel::Info,
+                    "Path autocompletion (F4 / Tab) applies to path fields.",
+                );
+            }
+            return;
+        }
+
+        let list_target = match field {
+            GraphField::Includes => Some(ListTarget::GraphInclude),
+            GraphField::Excludes => Some(ListTarget::GraphExclude),
+            _ => None,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                if self.graph_form.editing {
+                    self.graph_form.editing = false;
+                    self.graph_form.refresh_probes();
+                } else {
+                    self.capture_shared_from_active();
+                    self.screen = Screen::Home;
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.graph_form.refresh_probes();
+                self.graph_form.focus_next(true);
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.graph_form.refresh_probes();
+                self.graph_form.focus_next(false);
+            }
+            KeyCode::Enter => {
+                if field == GraphField::PreviewButton {
+                    self.start_preview();
+                } else if let Some(lt) = list_target {
+                    self.open_list_modal(lt, true);
+                } else if spec.kind.is_safety() {
+                    if self.graph_form.output.allow_tmpfs {
+                        self.graph_form.output.allow_tmpfs = false;
+                        self.graph_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::GraphTmpfs,
+                        });
+                    }
+                } else if spec.kind.is_text() {
+                    if field == GraphField::ReferenceTime
+                        && !self.graph_form.clock.reference_time.trim().is_empty()
+                    {
+                        self.graph_form.clock.commit_now();
+                        self.graph_form.editing = false;
+                        self.graph_form.refresh_probes();
+                        self.graph_form.focus_next(true);
+                    } else if self.graph_form.editing {
+                        self.graph_form.editing = false;
+                        self.graph_form.refresh_probes();
+                        self.graph_form.focus_next(true);
+                    } else {
+                        self.graph_form.editing = true;
+                        self.graph_form.cursor = self.graph_form.text(field).map_or(0, String::len);
+                    }
+                } else {
+                    self.graph_form.toggle_regular(field, true);
+                    self.check_graph_credential();
+                    self.graph_form.refresh_probes();
+                }
+            }
+            KeyCode::Char('a') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), false);
+            }
+            KeyCode::Char('e') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), true);
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if list_target.is_some() => {
+                match list_target.unwrap() {
+                    ListTarget::GraphInclude => remove_selected(
+                        &mut self.graph_form.scope.include,
+                        &mut self.graph_form.scope.include_idx,
+                    ),
+                    ListTarget::GraphExclude => remove_selected(
+                        &mut self.graph_form.scope.exclude,
+                        &mut self.graph_form.scope.exclude_idx,
+                    ),
+                    _ => {}
+                }
+            }
+            KeyCode::Left if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::GraphInclude => cycle_selected(
+                    self.graph_form.scope.include.len(),
+                    &mut self.graph_form.scope.include_idx,
+                    false,
+                ),
+                ListTarget::GraphExclude => cycle_selected(
+                    self.graph_form.scope.exclude.len(),
+                    &mut self.graph_form.scope.exclude_idx,
+                    false,
+                ),
+                _ => {}
+            },
+            KeyCode::Right if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::GraphInclude => cycle_selected(
+                    self.graph_form.scope.include.len(),
+                    &mut self.graph_form.scope.include_idx,
+                    true,
+                ),
+                ListTarget::GraphExclude => cycle_selected(
+                    self.graph_form.scope.exclude.len(),
+                    &mut self.graph_form.scope.exclude_idx,
+                    true,
+                ),
+                _ => {}
+            },
+            KeyCode::Char('p') if !spec.kind.is_text() => self.start_preview(),
+            KeyCode::Char('?') if !spec.kind.is_text() => self.modal = Some(Modal::Help),
+            KeyCode::Char('q') if !spec.kind.is_text() => {
+                self.capture_shared_from_active();
+                self.screen = Screen::Home;
+            }
+            KeyCode::Char(' ') if field == GraphField::PreviewButton => self.start_preview(),
+            KeyCode::Char(' ') | KeyCode::Right if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    if self.graph_form.output.allow_tmpfs {
+                        self.graph_form.output.allow_tmpfs = false;
+                        self.graph_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::GraphTmpfs,
+                        });
+                    }
+                } else {
+                    self.graph_form.toggle_regular(field, true);
+                    self.check_graph_credential();
+                    self.graph_form.refresh_probes();
+                }
+            }
+            KeyCode::Left if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    self.graph_form.output.allow_tmpfs = false;
+                    self.graph_form.refresh_probes();
+                } else {
+                    self.graph_form.toggle_regular(field, false);
+                    self.check_graph_credential();
+                    self.graph_form.refresh_probes();
+                }
+            }
+            _ if spec.kind.is_text() => {
+                let mut cursor = self.graph_form.cursor;
+                if let Some(t) = self.graph_form.text_mut(field) {
+                    let before = t.clone();
+                    edit_text(t, &mut cursor, key);
+                    let changed = *t != before;
+                    self.graph_form.cursor = cursor;
+                    if changed {
+                        self.graph_form.editing = true;
+                        match field {
+                            GraphField::CaseNumber | GraphField::EvidenceNumber => {
+                                self.graph_form.output.update_suggestion(
+                                    &self.graph_form.case.case,
+                                    &self.graph_form.case.evidence,
+                                );
+                                self.graph_form.refresh_probes();
+                            }
+                            GraphField::GraphEndpoint | GraphField::LoginEndpoint => {
+                                self.graph_form.sync_cloud_from_endpoints();
+                                self.check_graph_credential();
+                            }
+                            GraphField::Mailbox
+                            | GraphField::Tenant
+                            | GraphField::ClientId
+                            | GraphField::ClientSecretFile
+                            | GraphField::TokenFile => {
+                                self.check_graph_credential();
+                            }
+                            GraphField::OutputPath => {
+                                self.graph_form.output.output_customized =
+                                    !self.graph_form.output.output_path.trim().is_empty();
+                                self.graph_form.refresh_probes();
+                            }
+                            GraphField::ReferenceTime => {
+                                self.graph_form.clock.reference_entered_ns = None;
+                            }
+                            _ => {}
+                        }
+                        if self.graph_form.validate_field(field).is_none()
+                            && matches!(&self.notice, Some(n) if n.level == NoticeLevel::Error)
+                        {
+                            self.notice = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GmailForm key handling
+    // ------------------------------------------------------------------
+
+    fn handle_gmail_form_key(&mut self, key: KeyEvent) {
+        self.active_mode = Mode::Gmail;
+        let field = self.gmail_form.field;
+        let spec = field.spec();
+        let tab_completes = spec.kind.is_path()
+            && (self.gmail_form.editing || self.completion.is_some())
+            && key.code == KeyCode::Tab;
+
+        if key.code != KeyCode::F(4) && !tab_completes {
+            self.completion = None;
+        }
+
+        if key.code == KeyCode::F(2)
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+        {
+            self.start_preview();
+            return;
+        }
+
+        if key.code == KeyCode::F(4) || tab_completes {
+            if spec.kind.is_path() {
+                self.complete_path(PathTarget::Gmail(field));
+            } else {
+                self.notify(
+                    NoticeLevel::Info,
+                    "Path autocompletion (F4 / Tab) applies to path fields.",
+                );
+            }
+            return;
+        }
+
+        let list_target = match field {
+            GmailField::Includes => Some(ListTarget::GmailInclude),
+            GmailField::Excludes => Some(ListTarget::GmailExclude),
+            _ => None,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                if self.gmail_form.editing {
+                    self.gmail_form.editing = false;
+                    self.gmail_form.refresh_probes();
+                } else {
+                    self.capture_shared_from_active();
+                    self.screen = Screen::Home;
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.gmail_form.refresh_probes();
+                self.gmail_form.focus_next(true);
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.gmail_form.refresh_probes();
+                self.gmail_form.focus_next(false);
+            }
+            KeyCode::Enter => {
+                if field == GmailField::PreviewButton {
+                    self.start_preview();
+                } else if let Some(lt) = list_target {
+                    self.open_list_modal(lt, true);
+                } else if spec.kind.is_safety() {
+                    if self.gmail_form.output.allow_tmpfs {
+                        self.gmail_form.output.allow_tmpfs = false;
+                        self.gmail_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::GmailTmpfs,
+                        });
+                    }
+                } else if spec.kind.is_text() {
+                    if field == GmailField::ReferenceTime
+                        && !self.gmail_form.clock.reference_time.trim().is_empty()
+                    {
+                        self.gmail_form.clock.commit_now();
+                        self.gmail_form.editing = false;
+                        self.gmail_form.refresh_probes();
+                        self.gmail_form.focus_next(true);
+                    } else if self.gmail_form.editing {
+                        self.gmail_form.editing = false;
+                        self.gmail_form.refresh_probes();
+                        self.gmail_form.focus_next(true);
+                    } else {
+                        self.gmail_form.editing = true;
+                        self.gmail_form.cursor = self.gmail_form.text(field).map_or(0, String::len);
+                    }
+                } else {
+                    self.gmail_form.toggle_regular(field, true);
+                    self.check_gmail_credential();
+                    self.gmail_form.refresh_probes();
+                }
+            }
+            KeyCode::Char('a') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), false);
+            }
+            KeyCode::Char('e') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), true);
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if list_target.is_some() => {
+                match list_target.unwrap() {
+                    ListTarget::GmailInclude => remove_selected(
+                        &mut self.gmail_form.scope.include,
+                        &mut self.gmail_form.scope.include_idx,
+                    ),
+                    ListTarget::GmailExclude => remove_selected(
+                        &mut self.gmail_form.scope.exclude,
+                        &mut self.gmail_form.scope.exclude_idx,
+                    ),
+                    _ => {}
+                }
+            }
+            KeyCode::Left if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::GmailInclude => cycle_selected(
+                    self.gmail_form.scope.include.len(),
+                    &mut self.gmail_form.scope.include_idx,
+                    false,
+                ),
+                ListTarget::GmailExclude => cycle_selected(
+                    self.gmail_form.scope.exclude.len(),
+                    &mut self.gmail_form.scope.exclude_idx,
+                    false,
+                ),
+                _ => {}
+            },
+            KeyCode::Right if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::GmailInclude => cycle_selected(
+                    self.gmail_form.scope.include.len(),
+                    &mut self.gmail_form.scope.include_idx,
+                    true,
+                ),
+                ListTarget::GmailExclude => cycle_selected(
+                    self.gmail_form.scope.exclude.len(),
+                    &mut self.gmail_form.scope.exclude_idx,
+                    true,
+                ),
+                _ => {}
+            },
+            KeyCode::Char('p') if !spec.kind.is_text() => self.start_preview(),
+            KeyCode::Char('?') if !spec.kind.is_text() => self.modal = Some(Modal::Help),
+            KeyCode::Char('q') if !spec.kind.is_text() => {
+                self.capture_shared_from_active();
+                self.screen = Screen::Home;
+            }
+            KeyCode::Char(' ') if field == GmailField::PreviewButton => self.start_preview(),
+            KeyCode::Char(' ') | KeyCode::Right if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    if self.gmail_form.output.allow_tmpfs {
+                        self.gmail_form.output.allow_tmpfs = false;
+                        self.gmail_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::GmailTmpfs,
+                        });
+                    }
+                } else {
+                    self.gmail_form.toggle_regular(field, true);
+                    self.check_gmail_credential();
+                    self.gmail_form.refresh_probes();
+                }
+            }
+            KeyCode::Left if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    self.gmail_form.output.allow_tmpfs = false;
+                    self.gmail_form.refresh_probes();
+                } else {
+                    self.gmail_form.toggle_regular(field, false);
+                    self.check_gmail_credential();
+                    self.gmail_form.refresh_probes();
+                }
+            }
+            _ if spec.kind.is_text() => {
+                let mut cursor = self.gmail_form.cursor;
+                if let Some(t) = self.gmail_form.text_mut(field) {
+                    let before = t.clone();
+                    edit_text(t, &mut cursor, key);
+                    let changed = *t != before;
+                    self.gmail_form.cursor = cursor;
+                    if changed {
+                        self.gmail_form.editing = true;
+                        match field {
+                            GmailField::CaseNumber | GmailField::EvidenceNumber => {
+                                self.gmail_form.output.update_suggestion(
+                                    &self.gmail_form.case.case,
+                                    &self.gmail_form.case.evidence,
+                                );
+                                self.gmail_form.refresh_probes();
+                            }
+                            GmailField::Mailbox
+                            | GmailField::ClientId
+                            | GmailField::ClientSecretFile
+                            | GmailField::KeyFile
+                            | GmailField::TokenFile
+                            | GmailField::GmailEndpoint
+                            | GmailField::TokenEndpoint
+                            | GmailField::AuthEndpoint => {
+                                self.check_gmail_credential();
+                            }
+                            GmailField::OutputPath => {
+                                self.gmail_form.output.output_customized =
+                                    !self.gmail_form.output.output_path.trim().is_empty();
+                                self.gmail_form.refresh_probes();
+                            }
+                            GmailField::ReferenceTime => {
+                                self.gmail_form.clock.reference_entered_ns = None;
+                            }
+                            _ => {}
+                        }
+                        if self.gmail_form.validate_field(field).is_none()
+                            && matches!(&self.notice, Some(n) if n.level == NoticeLevel::Error)
+                        {
+                            self.notice = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // M365LogsForm key handling (direct Start, no preview screen)
+    // ------------------------------------------------------------------
+
+    fn handle_m365_logs_form_key(&mut self, key: KeyEvent) {
+        self.active_mode = Mode::M365Logs;
+        let field = self.m365_logs_form.field;
+        let spec = field.spec();
+        let tab_completes = spec.kind.is_path()
+            && (self.m365_logs_form.editing || self.completion.is_some())
+            && key.code == KeyCode::Tab;
+
+        if key.code != KeyCode::F(4) && !tab_completes {
+            self.completion = None;
+        }
+
+        if key.code == KeyCode::F(2)
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+        {
+            self.request_start_m365_logs();
+            return;
+        }
+
+        if key.code == KeyCode::F(4) || tab_completes {
+            if spec.kind.is_path() {
+                self.complete_path(PathTarget::M365Logs(field));
+            } else {
+                self.notify(
+                    NoticeLevel::Info,
+                    "Path autocompletion (F4 / Tab) applies to path fields.",
+                );
+            }
+            return;
+        }
+
+        let list_target = match field {
+            M365LogsField::Users => Some(ListTarget::M365Users),
+            M365LogsField::RecordTypes => Some(ListTarget::M365RecordTypes),
+            M365LogsField::Operations => Some(ListTarget::M365Operations),
+            _ => None,
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                if self.m365_logs_form.editing {
+                    self.m365_logs_form.editing = false;
+                    self.m365_logs_form.refresh_probes();
+                } else {
+                    self.capture_shared_from_active();
+                    self.screen = Screen::Home;
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.m365_logs_form.refresh_probes();
+                self.m365_logs_form.focus_next(true);
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.m365_logs_form.refresh_probes();
+                self.m365_logs_form.focus_next(false);
+            }
+            KeyCode::Enter => {
+                if field == M365LogsField::StartButton {
+                    self.request_start_m365_logs();
+                } else if let Some(lt) = list_target {
+                    self.open_list_modal(lt, true);
+                } else if spec.kind.is_safety() {
+                    if self.m365_logs_form.output.allow_tmpfs {
+                        self.m365_logs_form.output.allow_tmpfs = false;
+                        self.m365_logs_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::M365LogsTmpfs,
+                        });
+                    }
+                } else if spec.kind.is_text() {
+                    if field == M365LogsField::ReferenceTime
+                        && !self.m365_logs_form.clock.reference_time.trim().is_empty()
+                    {
+                        self.m365_logs_form.clock.commit_now();
+                        self.m365_logs_form.editing = false;
+                        self.m365_logs_form.refresh_probes();
+                        self.m365_logs_form.focus_next(true);
+                    } else if self.m365_logs_form.editing {
+                        self.m365_logs_form.editing = false;
+                        self.m365_logs_form.refresh_probes();
+                        self.m365_logs_form.focus_next(true);
+                    } else {
+                        self.m365_logs_form.editing = true;
+                        self.m365_logs_form.cursor =
+                            self.m365_logs_form.text(field).map_or(0, String::len);
+                    }
+                } else {
+                    self.m365_logs_form.toggle_regular(field, true);
+                    self.m365_logs_form.refresh_probes();
+                }
+            }
+            KeyCode::Char('a') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), false);
+            }
+            KeyCode::Char('e') if list_target.is_some() => {
+                self.open_list_modal(list_target.unwrap(), true);
+            }
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace if list_target.is_some() => {
+                match list_target.unwrap() {
+                    ListTarget::M365Users => remove_selected(
+                        &mut self.m365_logs_form.users,
+                        &mut self.m365_logs_form.users_idx,
+                    ),
+                    ListTarget::M365RecordTypes => remove_selected(
+                        &mut self.m365_logs_form.record_types,
+                        &mut self.m365_logs_form.record_types_idx,
+                    ),
+                    ListTarget::M365Operations => remove_selected(
+                        &mut self.m365_logs_form.operations,
+                        &mut self.m365_logs_form.operations_idx,
+                    ),
+                    _ => {}
+                }
+            }
+            KeyCode::Left if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::M365Users => cycle_selected(
+                    self.m365_logs_form.users.len(),
+                    &mut self.m365_logs_form.users_idx,
+                    false,
+                ),
+                ListTarget::M365RecordTypes => cycle_selected(
+                    self.m365_logs_form.record_types.len(),
+                    &mut self.m365_logs_form.record_types_idx,
+                    false,
+                ),
+                ListTarget::M365Operations => cycle_selected(
+                    self.m365_logs_form.operations.len(),
+                    &mut self.m365_logs_form.operations_idx,
+                    false,
+                ),
+                _ => {}
+            },
+            KeyCode::Right if list_target.is_some() => match list_target.unwrap() {
+                ListTarget::M365Users => cycle_selected(
+                    self.m365_logs_form.users.len(),
+                    &mut self.m365_logs_form.users_idx,
+                    true,
+                ),
+                ListTarget::M365RecordTypes => cycle_selected(
+                    self.m365_logs_form.record_types.len(),
+                    &mut self.m365_logs_form.record_types_idx,
+                    true,
+                ),
+                ListTarget::M365Operations => cycle_selected(
+                    self.m365_logs_form.operations.len(),
+                    &mut self.m365_logs_form.operations_idx,
+                    true,
+                ),
+                _ => {}
+            },
+            KeyCode::Char('p') if !spec.kind.is_text() => {
+                self.request_start_m365_logs();
+            }
+            KeyCode::Char('?') if !spec.kind.is_text() => self.modal = Some(Modal::Help),
+            KeyCode::Char('q') if !spec.kind.is_text() => {
+                self.capture_shared_from_active();
+                self.screen = Screen::Home;
+            }
+            KeyCode::Char(' ') if field == M365LogsField::StartButton => {
+                self.request_start_m365_logs();
+            }
+            KeyCode::Char(' ') | KeyCode::Right if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    if self.m365_logs_form.output.allow_tmpfs {
+                        self.m365_logs_form.output.allow_tmpfs = false;
+                        self.m365_logs_form.refresh_probes();
+                    } else {
+                        self.modal = Some(Modal::ConfirmSafety {
+                            target: SafetyTarget::M365LogsTmpfs,
+                        });
+                    }
+                } else {
+                    self.m365_logs_form.toggle_regular(field, true);
+                    self.m365_logs_form.refresh_probes();
+                }
+            }
+            KeyCode::Left if !spec.kind.is_text() => {
+                if spec.kind.is_safety() {
+                    self.m365_logs_form.output.allow_tmpfs = false;
+                    self.m365_logs_form.refresh_probes();
+                } else {
+                    self.m365_logs_form.toggle_regular(field, false);
+                    self.m365_logs_form.refresh_probes();
+                }
+            }
+            _ if spec.kind.is_text() => {
+                let mut cursor = self.m365_logs_form.cursor;
+                if let Some(t) = self.m365_logs_form.text_mut(field) {
+                    let before = t.clone();
+                    edit_text(t, &mut cursor, key);
+                    let changed = *t != before;
+                    self.m365_logs_form.cursor = cursor;
+                    if changed {
+                        self.m365_logs_form.editing = true;
+                        match field {
+                            M365LogsField::CaseNumber | M365LogsField::EvidenceNumber => {
+                                self.m365_logs_form.output.update_suggestion(
+                                    &self.m365_logs_form.case.case,
+                                    &self.m365_logs_form.case.evidence,
+                                );
+                                self.m365_logs_form.refresh_probes();
+                            }
+                            M365LogsField::GraphEndpoint | M365LogsField::LoginEndpoint => {
+                                self.m365_logs_form.sync_cloud_from_endpoints();
+                            }
+                            M365LogsField::OutputPath => {
+                                self.m365_logs_form.output.output_customized =
+                                    !self.m365_logs_form.output.output_path.trim().is_empty();
+                                self.m365_logs_form.refresh_probes();
+                            }
+                            M365LogsField::ReferenceTime => {
+                                self.m365_logs_form.clock.reference_entered_ns = None;
+                            }
+                            _ => {}
+                        }
+                        if self.m365_logs_form.validate_field(field).is_none()
+                            && matches!(&self.notice, Some(n) if n.level == NoticeLevel::Error)
+                        {
+                            self.notice = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn open_pattern_modal(&mut self, is_include: bool, edit_existing: bool) {
         let (list, idx) = if is_include {
             (&self.files_form.include, self.files_form.include_idx)
@@ -2706,6 +4134,39 @@ impl App {
                 self.cloud_form.scope.exclude_idx,
             ),
             ListTarget::DbDatabases => (&self.db_form.databases, self.db_form.databases_idx),
+            ListTarget::ImapInclude => (
+                &self.imap_form.scope.include,
+                self.imap_form.scope.include_idx,
+            ),
+            ListTarget::ImapExclude => (
+                &self.imap_form.scope.exclude,
+                self.imap_form.scope.exclude_idx,
+            ),
+            ListTarget::GraphInclude => (
+                &self.graph_form.scope.include,
+                self.graph_form.scope.include_idx,
+            ),
+            ListTarget::GraphExclude => (
+                &self.graph_form.scope.exclude,
+                self.graph_form.scope.exclude_idx,
+            ),
+            ListTarget::GmailInclude => (
+                &self.gmail_form.scope.include,
+                self.gmail_form.scope.include_idx,
+            ),
+            ListTarget::GmailExclude => (
+                &self.gmail_form.scope.exclude,
+                self.gmail_form.scope.exclude_idx,
+            ),
+            ListTarget::M365Users => (&self.m365_logs_form.users, self.m365_logs_form.users_idx),
+            ListTarget::M365RecordTypes => (
+                &self.m365_logs_form.record_types,
+                self.m365_logs_form.record_types_idx,
+            ),
+            ListTarget::M365Operations => (
+                &self.m365_logs_form.operations,
+                self.m365_logs_form.operations_idx,
+            ),
         };
         if edit_existing && !list.is_empty() {
             let clamped = idx.min(list.len() - 1);
@@ -2750,6 +4211,10 @@ impl App {
             PathTarget::Ingest(f) => f.spec().kind.is_dirs_only_path(),
             PathTarget::Cloud(f) => f.spec().kind.is_dirs_only_path(),
             PathTarget::Db(f) => f.spec(self.db_form.engine).kind.is_dirs_only_path(),
+            PathTarget::Imap(f) => f.spec().kind.is_dirs_only_path(),
+            PathTarget::Graph(f) => f.spec().kind.is_dirs_only_path(),
+            PathTarget::Gmail(f) => f.spec().kind.is_dirs_only_path(),
+            PathTarget::M365Logs(f) => f.spec().kind.is_dirs_only_path(),
             PathTarget::Verify => true,
         };
         let (text, cursor) = match target {
@@ -2776,6 +4241,30 @@ impl App {
                     return;
                 };
                 (t.clone(), self.db_form.cursor)
+            }
+            PathTarget::Imap(f) => {
+                let Some(t) = self.imap_form.text(f) else {
+                    return;
+                };
+                (t.clone(), self.imap_form.cursor)
+            }
+            PathTarget::Graph(f) => {
+                let Some(t) = self.graph_form.text(f) else {
+                    return;
+                };
+                (t.clone(), self.graph_form.cursor)
+            }
+            PathTarget::Gmail(f) => {
+                let Some(t) = self.gmail_form.text(f) else {
+                    return;
+                };
+                (t.clone(), self.gmail_form.cursor)
+            }
+            PathTarget::M365Logs(f) => {
+                let Some(t) = self.m365_logs_form.text(f) else {
+                    return;
+                };
+                (t.clone(), self.m365_logs_form.cursor)
             }
             PathTarget::Verify => (self.verify_state.path.clone(), self.verify_state.cursor),
         };
@@ -2868,6 +4357,59 @@ impl App {
                 }
                 self.db_form.refresh_probes();
             }
+            PathTarget::Imap(f) => {
+                if let Some(t) = self.imap_form.text_mut(f) {
+                    *t = new_text;
+                }
+                self.imap_form.cursor = new_cursor;
+                self.imap_form.editing = true;
+                if f == ImapField::OutputPath {
+                    self.imap_form.output.output_customized = true;
+                } else if matches!(f, ImapField::PasswordFile | ImapField::TokenFile) {
+                    self.check_imap_credential();
+                }
+                self.imap_form.refresh_probes();
+            }
+            PathTarget::Graph(f) => {
+                if let Some(t) = self.graph_form.text_mut(f) {
+                    *t = new_text;
+                }
+                self.graph_form.cursor = new_cursor;
+                self.graph_form.editing = true;
+                if f == GraphField::OutputPath {
+                    self.graph_form.output.output_customized = true;
+                } else if matches!(f, GraphField::ClientSecretFile | GraphField::TokenFile) {
+                    self.check_graph_credential();
+                }
+                self.graph_form.refresh_probes();
+            }
+            PathTarget::Gmail(f) => {
+                if let Some(t) = self.gmail_form.text_mut(f) {
+                    *t = new_text;
+                }
+                self.gmail_form.cursor = new_cursor;
+                self.gmail_form.editing = true;
+                if f == GmailField::OutputPath {
+                    self.gmail_form.output.output_customized = true;
+                } else if matches!(
+                    f,
+                    GmailField::ClientSecretFile | GmailField::KeyFile | GmailField::TokenFile
+                ) {
+                    self.check_gmail_credential();
+                }
+                self.gmail_form.refresh_probes();
+            }
+            PathTarget::M365Logs(f) => {
+                if let Some(t) = self.m365_logs_form.text_mut(f) {
+                    *t = new_text;
+                }
+                self.m365_logs_form.cursor = new_cursor;
+                self.m365_logs_form.editing = true;
+                if f == M365LogsField::OutputPath {
+                    self.m365_logs_form.output.output_customized = true;
+                }
+                self.m365_logs_form.refresh_probes();
+            }
             PathTarget::Verify => {
                 self.verify_state.path = new_text;
                 self.verify_state.cursor = new_cursor;
@@ -2889,6 +4431,12 @@ impl App {
             Mode::Ingest => self.start_ingest_preview(),
             Mode::Cloud => self.start_cloud_preview(),
             Mode::Db => self.start_db_preview(),
+            Mode::Imap => self.start_imap_preview(),
+            Mode::Graph => self.start_graph_preview(),
+            Mode::Gmail => self.start_gmail_preview(),
+            Mode::M365Logs => {
+                self.request_start_m365_logs();
+            }
         }
     }
 
@@ -2947,14 +4495,17 @@ impl App {
                 reference_entered_ns: None,
                 console: console_worker,
             };
-            let pv = files::preview(&args_worker, &ctx)?;
-            Ok(PreviewWorkerOutput {
-                mode_preview: ModePreview::Files {
-                    preview: pv,
-                    args: Box::new(args_worker),
-                },
+            let result = files::preview(&args_worker, &ctx).map(|preview| ModePreview::Files {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
                 db_credential: None,
-            })
+                imap_credential: None,
+                graph_credential: None,
+                gmail_credential: None,
+            }
         });
 
         self.notice = None;
@@ -3010,14 +4561,17 @@ impl App {
                 reference_entered_ns: None,
                 console: console_worker,
             };
-            let pv = ingest::preview(&args_worker, &ctx)?;
-            Ok(PreviewWorkerOutput {
-                mode_preview: ModePreview::Ingest {
-                    preview: pv,
-                    args: Box::new(args_worker),
-                },
+            let result = ingest::preview(&args_worker, &ctx).map(|preview| ModePreview::Ingest {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
                 db_credential: None,
-            })
+                imap_credential: None,
+                graph_credential: None,
+                gmail_credential: None,
+            }
         });
 
         self.notice = None;
@@ -3087,14 +4641,17 @@ impl App {
                 reference_entered_ns: None,
                 console: console_worker,
             };
-            let pv = cloud::preview(&args_worker, &ctx)?;
-            Ok(PreviewWorkerOutput {
-                mode_preview: ModePreview::Cloud {
-                    preview: pv,
-                    args: Box::new(args_worker),
-                },
+            let result = cloud::preview(&args_worker, &ctx).map(|preview| ModePreview::Cloud {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
                 db_credential: None,
-            })
+                imap_credential: None,
+                graph_credential: None,
+                gmail_credential: None,
+            }
         });
 
         self.notice = None;
@@ -3158,14 +4715,18 @@ impl App {
                 reference_entered_ns: None,
                 console: console_worker,
             };
-            let (pv, cred) = db::preview(&args_worker, &ctx)?;
-            Ok(PreviewWorkerOutput {
-                mode_preview: ModePreview::Db {
-                    preview: pv,
-                    args: Box::new(args_worker),
-                },
+            let (res, cred) = finish_preview(db::preview(&args_worker, &ctx), &ctx);
+            let result = res.map(|preview| ModePreview::Db {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
                 db_credential: cred.map(|c| (conn_key, c)),
-            })
+                imap_credential: None,
+                graph_credential: None,
+                gmail_credential: None,
+            }
         });
 
         self.notice = None;
@@ -3178,6 +4739,385 @@ impl App {
             handle: Some(handle),
         });
         self.screen = Screen::Preview;
+    }
+
+    fn start_imap_preview(&mut self) {
+        self.imap_form.refresh_probes();
+        let errors = self.imap_form.validate_all();
+        if let Some((first_field, msg)) = errors.first() {
+            self.imap_form.set_focus(*first_field);
+            self.notify(NoticeLevel::Error, msg.clone());
+            return;
+        }
+
+        let argv = imap_argv(&self.imap_form);
+        let args = match parse_imap_argv(&argv) {
+            Ok(a) => a,
+            Err((maybe_field, msg)) => {
+                if let Some(f) = maybe_field {
+                    self.imap_form.set_focus(f);
+                }
+                self.notify(NoticeLevel::Error, msg);
+                return;
+            }
+        };
+
+        match scope::build(&args.scope).and_then(|s| s.rules()) {
+            Ok(_) => {}
+            Err(e) => {
+                let target_field = if !self.imap_form.scope.scope_file.trim().is_empty() {
+                    ImapField::ScopeFile
+                } else {
+                    ImapField::Includes
+                };
+                self.imap_form.set_focus(target_field);
+                self.notify(NoticeLevel::Error, format!("{e:#}"));
+                return;
+            }
+        }
+
+        self.check_imap_credential();
+        let conn_key = self.imap_form.conn_key();
+        let reused_cred = self
+            .imap_credential
+            .take()
+            .filter(|(k, _)| *k == conn_key)
+            .map(|(_, c)| c);
+
+        self.stop.clear_examiner();
+        self.sign_in_paste.clear();
+        self.sign_in_paste_cursor = 0;
+        let progress = Arc::new(Progress::default());
+        let progress_worker = Arc::clone(&progress);
+        let console = Arc::new(TuiConsole::new(self.stop, self.secret_tx.clone()));
+        let console_worker: Arc<dyn Console> = Arc::clone(&console) as Arc<dyn Console>;
+        let args_worker = args;
+        let argv_worker = argv.clone();
+        let stop_ref = self.stop;
+
+        let handle = std::thread::spawn(move || {
+            let ctx = RunCtx {
+                stop: stop_ref,
+                progress: Some(&progress_worker),
+                argv: Some(argv_worker),
+                interactive: true,
+                preview: None,
+                credential: Mutex::new(reused_cred),
+                reference_entered_ns: None,
+                console: console_worker,
+            };
+            let (res, cred) = finish_preview(mail::preview(&args_worker, &ctx), &ctx);
+            let result = res.map(|preview| ModePreview::Imap {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
+                db_credential: None,
+                imap_credential: cred.map(|c| (conn_key, c)),
+                graph_credential: None,
+                gmail_credential: None,
+            }
+        });
+
+        self.notice = None;
+        self.preview_state = Some(PreviewState::Running {
+            mode: Mode::Imap,
+            argv,
+            progress,
+            console,
+            started: Instant::now(),
+            handle: Some(handle),
+        });
+        self.screen = Screen::Preview;
+    }
+
+    fn start_graph_preview(&mut self) {
+        self.graph_form.refresh_probes();
+        let errors = self.graph_form.validate_all();
+        if let Some((first_field, msg)) = errors.first() {
+            self.graph_form.set_focus(*first_field);
+            self.notify(NoticeLevel::Error, msg.clone());
+            return;
+        }
+
+        let argv = graph_argv(&self.graph_form);
+        let args = match parse_graph_argv(&argv) {
+            Ok(a) => a,
+            Err((maybe_field, msg)) => {
+                if let Some(f) = maybe_field {
+                    self.graph_form.set_focus(f);
+                }
+                self.notify(NoticeLevel::Error, msg);
+                return;
+            }
+        };
+
+        match scope::build(&args.scope).and_then(|s| s.rules()) {
+            Ok(_) => {}
+            Err(e) => {
+                let target_field = if !self.graph_form.scope.scope_file.trim().is_empty() {
+                    GraphField::ScopeFile
+                } else {
+                    GraphField::Includes
+                };
+                self.graph_form.set_focus(target_field);
+                self.notify(NoticeLevel::Error, format!("{e:#}"));
+                return;
+            }
+        }
+
+        self.check_graph_credential();
+        let conn_key = self.graph_form.conn_key();
+        let reused_cred = self
+            .graph_credential
+            .take()
+            .filter(|(k, _)| *k == conn_key)
+            .map(|(_, c)| c);
+
+        self.stop.clear_examiner();
+        self.sign_in_paste.clear();
+        self.sign_in_paste_cursor = 0;
+        let progress = Arc::new(Progress::default());
+        let progress_worker = Arc::clone(&progress);
+        let console = Arc::new(TuiConsole::new(self.stop, self.secret_tx.clone()));
+        let console_worker: Arc<dyn Console> = Arc::clone(&console) as Arc<dyn Console>;
+        let args_worker = args;
+        let argv_worker = argv.clone();
+        let stop_ref = self.stop;
+
+        let handle = std::thread::spawn(move || {
+            let ctx = RunCtx {
+                stop: stop_ref,
+                progress: Some(&progress_worker),
+                argv: Some(argv_worker),
+                interactive: true,
+                preview: None,
+                credential: Mutex::new(reused_cred),
+                reference_entered_ns: None,
+                console: console_worker,
+            };
+            let (res, cred) = finish_preview(graph::preview(&args_worker, &ctx), &ctx);
+            let result = res.map(|preview| ModePreview::Graph {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
+                db_credential: None,
+                imap_credential: None,
+                graph_credential: cred.map(|c| (conn_key, c)),
+                gmail_credential: None,
+            }
+        });
+
+        self.notice = None;
+        self.preview_state = Some(PreviewState::Running {
+            mode: Mode::Graph,
+            argv,
+            progress,
+            console,
+            started: Instant::now(),
+            handle: Some(handle),
+        });
+        self.screen = Screen::Preview;
+    }
+
+    fn start_gmail_preview(&mut self) {
+        self.gmail_form.refresh_probes();
+        let errors = self.gmail_form.validate_all();
+        if let Some((first_field, msg)) = errors.first() {
+            self.gmail_form.set_focus(*first_field);
+            self.notify(NoticeLevel::Error, msg.clone());
+            return;
+        }
+
+        let argv = gmail_argv(&self.gmail_form);
+        let args = match parse_gmail_argv(&argv) {
+            Ok(a) => a,
+            Err((maybe_field, msg)) => {
+                if let Some(f) = maybe_field {
+                    self.gmail_form.set_focus(f);
+                }
+                self.notify(NoticeLevel::Error, msg);
+                return;
+            }
+        };
+
+        match scope::build(&args.scope).and_then(|s| s.rules()) {
+            Ok(_) => {}
+            Err(e) => {
+                let target_field = if !self.gmail_form.scope.scope_file.trim().is_empty() {
+                    GmailField::ScopeFile
+                } else {
+                    GmailField::Includes
+                };
+                self.gmail_form.set_focus(target_field);
+                self.notify(NoticeLevel::Error, format!("{e:#}"));
+                return;
+            }
+        }
+
+        self.check_gmail_credential();
+        let conn_key = self.gmail_form.conn_key();
+        let reused_cred = self
+            .gmail_credential
+            .take()
+            .filter(|(k, _)| *k == conn_key)
+            .map(|(_, c)| c);
+
+        self.stop.clear_examiner();
+        self.sign_in_paste.clear();
+        self.sign_in_paste_cursor = 0;
+        let progress = Arc::new(Progress::default());
+        let progress_worker = Arc::clone(&progress);
+        let console = Arc::new(TuiConsole::new(self.stop, self.secret_tx.clone()));
+        let console_worker: Arc<dyn Console> = Arc::clone(&console) as Arc<dyn Console>;
+        let args_worker = args;
+        let argv_worker = argv.clone();
+        let stop_ref = self.stop;
+
+        let handle = std::thread::spawn(move || {
+            let ctx = RunCtx {
+                stop: stop_ref,
+                progress: Some(&progress_worker),
+                argv: Some(argv_worker),
+                interactive: true,
+                preview: None,
+                credential: Mutex::new(reused_cred),
+                reference_entered_ns: None,
+                console: console_worker,
+            };
+            let (res, cred) = finish_preview(gmail::preview(&args_worker, &ctx), &ctx);
+            let result = res.map(|preview| ModePreview::Gmail {
+                preview,
+                args: Box::new(args_worker),
+            });
+            PreviewWorkerOutput {
+                result,
+                db_credential: None,
+                imap_credential: None,
+                graph_credential: None,
+                gmail_credential: cred.map(|c| (conn_key, c)),
+            }
+        });
+
+        self.notice = None;
+        self.preview_state = Some(PreviewState::Running {
+            mode: Mode::Gmail,
+            argv,
+            progress,
+            console,
+            started: Instant::now(),
+            handle: Some(handle),
+        });
+        self.screen = Screen::Preview;
+    }
+
+    /// Validate `M365LogsForm` and open the Start confirmation modal directly.
+    pub fn request_start_m365_logs(&mut self) -> bool {
+        if self.is_worker_running() {
+            return false;
+        }
+        self.m365_logs_form.refresh_probes();
+        let errors = self.m365_logs_form.validate_all();
+        if let Some((first_field, msg)) = errors.first() {
+            self.m365_logs_form.set_focus(*first_field);
+            self.notify(NoticeLevel::Error, msg.clone());
+            return false;
+        }
+        let argv = m365_logs_argv(&self.m365_logs_form);
+        if let Err((maybe_field, msg)) = parse_m365_logs_argv(&argv) {
+            if let Some(f) = maybe_field {
+                self.m365_logs_form.set_focus(f);
+            }
+            self.notify(NoticeLevel::Error, msg);
+            return false;
+        }
+        self.notice = None;
+        self.modal = Some(Modal::ConfirmStart);
+        true
+    }
+
+    fn start_m365_logs_run(&mut self) -> bool {
+        if self.is_worker_running() {
+            return false;
+        }
+        self.m365_logs_form.refresh_probes();
+        let errors = self.m365_logs_form.validate_all();
+        if let Some((first_field, msg)) = errors.first() {
+            self.m365_logs_form.set_focus(*first_field);
+            self.notify(NoticeLevel::Error, msg.clone());
+            return false;
+        }
+        let argv = m365_logs_argv(&self.m365_logs_form);
+        let args = match parse_m365_logs_argv(&argv) {
+            Ok(a) => a,
+            Err((maybe_field, msg)) => {
+                if let Some(f) = maybe_field {
+                    self.m365_logs_form.set_focus(f);
+                }
+                self.notify(NoticeLevel::Error, msg);
+                return false;
+            }
+        };
+
+        self.stop.clear_examiner();
+        self.sign_in_paste.clear();
+        self.sign_in_paste_cursor = 0;
+        let progress = Arc::new(Progress::default());
+        let progress_worker = Arc::clone(&progress);
+        let console = Arc::new(TuiConsole::new(self.stop, self.secret_tx.clone()));
+        let console_worker: Arc<dyn Console> = Arc::clone(&console) as Arc<dyn Console>;
+        let stop_ref = self.stop;
+
+        let mut args_w = args;
+        args_w.json = false;
+        let argv_w = argv.clone();
+        let src = format!("tenant {}", args_w.conn.tenant);
+        let out = args_w.output.clone();
+        let exp_f = args_w.logs.len() as u64;
+        let exp_b = 0;
+        let ref_ns = self.m365_logs_form.clock.reference_entered_ns;
+
+        let handle = std::thread::spawn(move || {
+            let ctx = RunCtx {
+                stop: stop_ref,
+                progress: Some(&progress_worker),
+                argv: Some(argv_w),
+                interactive: true,
+                preview: None,
+                credential: Default::default(),
+                reference_entered_ns: ref_ns,
+                console: console_worker,
+            };
+            let o = m365logs::run_with(&args_w, &ctx)?;
+            Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
+        });
+
+        let now = Instant::now();
+        let mut rate_samples = VecDeque::new();
+        rate_samples.push_back((now, 0));
+
+        self.notice = None;
+        self.run_state = Some(RunState {
+            mode: Mode::M365Logs,
+            source_display: src,
+            output: out,
+            argv,
+            expected_files: exp_f,
+            expected_bytes: exp_b,
+            progress,
+            console,
+            notices_expanded: false,
+            notices_scroll: 0,
+            started: now,
+            rate_samples,
+            stop_requested: false,
+            handle: Some(handle),
+        });
+        self.screen = Screen::Running;
+        true
     }
 
     fn handle_preview_key(&mut self, key: KeyEvent) {
@@ -3269,8 +5209,12 @@ impl App {
         self.start_active_run()
     }
 
-    /// Launch the active mode's `run_with` on the worker thread using the previewed arguments.
+    /// Launch the active mode's `run_with` on the worker thread using the previewed arguments
+    /// (or directly from the form for `Mode::M365Logs`).
     pub fn start_active_run(&mut self) -> bool {
+        if self.active_mode == Mode::M365Logs && self.screen == Screen::M365LogsForm {
+            return self.start_m365_logs_run();
+        }
         if self.is_worker_running() || self.is_preview_stale() {
             self.notify(
                 NoticeLevel::Error,
@@ -3286,6 +5230,8 @@ impl App {
         let preview_note = Some(data.mode_preview.note());
 
         self.stop.clear_examiner();
+        self.sign_in_paste.clear();
+        self.sign_in_paste_cursor = 0;
         let progress = Arc::new(Progress::default());
         let progress_worker = Arc::clone(&progress);
         let console = Arc::new(TuiConsole::new(self.stop, self.secret_tx.clone()));
@@ -3315,10 +5261,7 @@ impl App {
                         console: console_worker,
                     };
                     let o = files::run_with(&args_w, &ctx)?;
-                    Ok(verify::Outcome {
-                        code: o.code,
-                        summary: o.summary,
-                    })
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
                 });
                 (src, out, exp_f, exp_b, h)
             }
@@ -3360,10 +5303,7 @@ impl App {
                         console: console_worker,
                     };
                     let o = ingest::run_with(&args_w, &ctx)?;
-                    Ok(verify::Outcome {
-                        code: o.code,
-                        summary: o.summary,
-                    })
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
                 });
                 (src, out, exp_f, exp_b, h)
             }
@@ -3401,10 +5341,7 @@ impl App {
                         console: console_worker,
                     };
                     let o = cloud::run_with(&args_w, &ctx)?;
-                    Ok(verify::Outcome {
-                        code: o.code,
-                        summary: o.summary,
-                    })
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
                 });
                 (src, out, exp_f, exp_b, h)
             }
@@ -3461,10 +5398,159 @@ impl App {
                         console: console_worker,
                     };
                     let o = db::run_with(&args_w, &ctx)?;
-                    Ok(verify::Outcome {
-                        code: o.code,
-                        summary: o.summary,
-                    })
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
+                });
+                (src, out, exp_f, exp_b, h)
+            }
+            ModePreview::Imap { preview, args } => {
+                let args_w = ImapArgs {
+                    server: args.server.clone(),
+                    user: args.user.clone(),
+                    auth: args.auth,
+                    password_file: args.password_file.clone(),
+                    token_file: args.token_file.clone(),
+                    security: args.security,
+                    tls_sha256: args.tls_sha256.clone(),
+                    timeout: args.timeout,
+                    output: args.output.clone(),
+                    case: args.case.clone(),
+                    scope: args.scope.clone(),
+                    clock: args.clock.clone(),
+                    md5: args.md5,
+                    sha1: args.sha1,
+                    compress: args.compress,
+                    allow_tmpfs: args.allow_tmpfs,
+                    dry_run: false,
+                    json: false,
+                };
+                let argv_w = argv.clone();
+                let src = format!("{}@{}", args_w.user, args_w.server);
+                let out = args_w.output.clone();
+                let exp_f = preview.in_scope;
+                let exp_b = preview.bytes;
+                let ref_ns = self.imap_form.clock.reference_entered_ns;
+                let conn_key = self.imap_form.conn_key();
+                let reused_cred = self
+                    .imap_credential
+                    .take()
+                    .filter(|(k, _)| *k == conn_key)
+                    .map(|(_, c)| c);
+                let h = std::thread::spawn(move || {
+                    let ctx = RunCtx {
+                        stop: stop_ref,
+                        progress: Some(&progress_worker),
+                        argv: Some(argv_w),
+                        interactive: true,
+                        preview: preview_note,
+                        credential: Mutex::new(reused_cred),
+                        reference_entered_ns: ref_ns,
+                        console: console_worker,
+                    };
+                    let o = mail::run_with(&args_w, &ctx)?;
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
+                });
+                (src, out, exp_f, exp_b, h)
+            }
+            ModePreview::Graph { preview, args } => {
+                let args_w = GraphArgs {
+                    mailbox: args.mailbox.clone(),
+                    conn: crate::args::GraphConnArgs {
+                        auth: args.conn.auth,
+                        tenant: args.conn.tenant.clone(),
+                        client_id: args.conn.client_id.clone(),
+                        client_secret_file: args.conn.client_secret_file.clone(),
+                        token_file: args.conn.token_file.clone(),
+                        graph_endpoint: args.conn.graph_endpoint.clone(),
+                        login_endpoint: args.conn.login_endpoint.clone(),
+                        timeout: args.conn.timeout,
+                    },
+                    output: args.output.clone(),
+                    case: args.case.clone(),
+                    scope: args.scope.clone(),
+                    clock: args.clock.clone(),
+                    md5: args.md5,
+                    sha1: args.sha1,
+                    compress: args.compress,
+                    allow_tmpfs: args.allow_tmpfs,
+                    dry_run: false,
+                    json: false,
+                };
+                let argv_w = argv.clone();
+                let src = format!("graph:{}", args_w.mailbox);
+                let out = args_w.output.clone();
+                let exp_f = preview.in_scope;
+                let exp_b = preview.bytes;
+                let ref_ns = self.graph_form.clock.reference_entered_ns;
+                let conn_key = self.graph_form.conn_key();
+                let reused_cred = self
+                    .graph_credential
+                    .take()
+                    .filter(|(k, _)| *k == conn_key)
+                    .map(|(_, c)| c);
+                let h = std::thread::spawn(move || {
+                    let ctx = RunCtx {
+                        stop: stop_ref,
+                        progress: Some(&progress_worker),
+                        argv: Some(argv_w),
+                        interactive: true,
+                        preview: preview_note,
+                        credential: Mutex::new(reused_cred),
+                        reference_entered_ns: ref_ns,
+                        console: console_worker,
+                    };
+                    let o = graph::run_with(&args_w, &ctx)?;
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
+                });
+                (src, out, exp_f, exp_b, h)
+            }
+            ModePreview::Gmail { preview, args } => {
+                let args_w = GmailArgs {
+                    mailbox: args.mailbox.clone(),
+                    auth: args.auth,
+                    client_id: args.client_id.clone(),
+                    client_secret_file: args.client_secret_file.clone(),
+                    key_file: args.key_file.clone(),
+                    token_file: args.token_file.clone(),
+                    gmail_endpoint: args.gmail_endpoint.clone(),
+                    token_endpoint: args.token_endpoint.clone(),
+                    auth_endpoint: args.auth_endpoint.clone(),
+                    timeout: args.timeout,
+                    output: args.output.clone(),
+                    case: args.case.clone(),
+                    scope: args.scope.clone(),
+                    clock: args.clock.clone(),
+                    md5: args.md5,
+                    sha1: args.sha1,
+                    compress: args.compress,
+                    allow_tmpfs: args.allow_tmpfs,
+                    dry_run: false,
+                    json: false,
+                };
+                let argv_w = argv.clone();
+                let src = format!("gmail:{}", args_w.mailbox);
+                let out = args_w.output.clone();
+                let exp_f = preview.in_scope;
+                let exp_b = preview.bytes;
+                let ref_ns = self.gmail_form.clock.reference_entered_ns;
+                let conn_key = self.gmail_form.conn_key();
+                let reused_cred = self
+                    .gmail_credential
+                    .take()
+                    .filter(|(k, _)| *k == conn_key)
+                    .map(|(_, c)| c);
+                let h = std::thread::spawn(move || {
+                    let ctx = RunCtx {
+                        stop: stop_ref,
+                        progress: Some(&progress_worker),
+                        argv: Some(argv_w),
+                        interactive: true,
+                        preview: preview_note,
+                        credential: Mutex::new(reused_cred),
+                        reference_entered_ns: ref_ns,
+                        console: console_worker,
+                    };
+                    let o = gmail::run_with(&args_w, &ctx)?;
+                    Ok(finish_run_outcome(o.code, o.summary, &args_w.output))
                 });
                 (src, out, exp_f, exp_b, h)
             }
@@ -3563,12 +5649,12 @@ impl App {
     fn handle_result_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => {
-                self.db_credential = None;
+                self.clear_all_credentials();
                 self.should_quit = true;
             }
             KeyCode::Char('h') | KeyCode::Esc => {
                 self.capture_shared_from_active();
-                self.db_credential = None;
+                self.clear_all_credentials();
                 self.screen = Screen::Home;
             }
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
@@ -3579,12 +5665,16 @@ impl App {
                     .map(|r| r.mode)
                     .unwrap_or(self.active_mode);
                 self.active_mode = mode;
-                self.db_credential = None;
+                self.clear_all_credentials();
                 match mode {
                     Mode::Files => self.files_form.reset_for_next_acquisition(),
                     Mode::Ingest => self.ingest_form.reset_for_next_acquisition(),
                     Mode::Cloud => self.cloud_form.reset_for_next_acquisition(),
                     Mode::Db => self.db_form.reset_for_next_acquisition(),
+                    Mode::Imap => self.imap_form.reset_for_next_acquisition(),
+                    Mode::Graph => self.graph_form.reset_for_next_acquisition(),
+                    Mode::Gmail => self.gmail_form.reset_for_next_acquisition(),
+                    Mode::M365Logs => self.m365_logs_form.reset_for_next_acquisition(),
                 }
                 self.capture_shared_from_active();
                 self.preview_state = None;
@@ -3597,6 +5687,16 @@ impl App {
                     let path = res.collection.clone();
                     let has_manifest = path.join(dfcore::manifest::MANIFEST).is_file();
                     self.open_verify(Some(path), has_manifest);
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(res) = &self.result_data {
+                    let quoted = shell_quote(&res.argv);
+                    self.pending_osc52 = Some(base64(quoted.as_bytes()));
+                    self.notify(
+                        NoticeLevel::Info,
+                        "Equivalent command copied to clipboard (OSC 52).",
+                    );
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => self.scroll_result(-1),
@@ -3732,7 +5832,7 @@ impl App {
                 self.verify_state.scroll = self.verify_state.scroll.saturating_add(10);
             }
             KeyCode::Char('q') if focus != VerifyFocus::PathInput => {
-                self.db_credential = None;
+                self.clear_all_credentials();
                 self.should_quit = true;
             }
             KeyCode::Char('?') if focus != VerifyFocus::PathInput => {
@@ -3847,8 +5947,14 @@ fn validate_single_pattern(pat: &str, is_include: bool) -> Result<(), String> {
 
 fn validate_list_item(target: ListTarget, val: &str) -> Result<(), String> {
     match target {
-        ListTarget::CloudInclude => validate_single_pattern(val, true),
-        ListTarget::CloudExclude => validate_single_pattern(val, false),
+        ListTarget::CloudInclude
+        | ListTarget::ImapInclude
+        | ListTarget::GraphInclude
+        | ListTarget::GmailInclude => validate_single_pattern(val, true),
+        ListTarget::CloudExclude
+        | ListTarget::ImapExclude
+        | ListTarget::GraphExclude
+        | ListTarget::GmailExclude => validate_single_pattern(val, false),
         ListTarget::IngestHashes => {
             let p = expand_tilde(Path::new(val));
             let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -3860,7 +5966,11 @@ fn validate_list_item(target: ListTarget, val: &str) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
         }
-        ListTarget::CloudRcloneArgs | ListTarget::DbDatabases => Ok(()),
+        ListTarget::CloudRcloneArgs
+        | ListTarget::DbDatabases
+        | ListTarget::M365Users
+        | ListTarget::M365RecordTypes
+        | ListTarget::M365Operations => Ok(()),
     }
 }
 
@@ -3877,6 +5987,32 @@ pub fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Summary lines for the confirmation modal before starting an `m365-logs` run (no preview).
+pub fn confirm_start_m365_logs_lines(app: &App) -> Vec<(String, String)> {
+    let form = &app.m365_logs_form;
+    let mut lines = vec![
+        ("Tenant".into(), form.tenant.trim().to_string()),
+        ("Output".into(), form.output.output_path.trim().to_string()),
+        (
+            "Case/Evid.".into(),
+            format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
+        ),
+        ("Examiner".into(), form.case.examiner.trim().to_string()),
+    ];
+    for s in form.summary_lines() {
+        if let Some((k, v)) = s.split_once(':') {
+            lines.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    if let Some(stamp) = form.clock.stamp_hint() {
+        lines.push(("Ref. clock".into(), stamp));
+    }
+    if form.output.allow_tmpfs {
+        lines.push(("Overrides".into(), "--allow-tmpfs".into()));
+    }
+    lines
+}
+
 /// Summary lines for the confirmation modal before starting an acquisition.
 pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, String)> {
     match &preview.mode_preview {
@@ -3884,14 +6020,14 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
             let form = &app.files_form;
             let mut lines = vec![
                 ("Source".into(), pv.source.display().to_string()),
-                ("Output collection".into(), pv.output.display().to_string()),
+                ("Output".into(), pv.output.display().to_string()),
                 (
-                    "Case / Evidence".into(),
+                    "Case/Evid.".into(),
                     format!("{} / {}", form.case.trim(), form.evidence.trim()),
                 ),
                 ("Examiner".into(), form.examiner.trim().to_string()),
                 (
-                    "In-scope items".into(),
+                    "In scope".into(),
                     format!(
                         "{} files ({}), {} dirs, {} symlinks",
                         pv.files,
@@ -3905,7 +6041,7 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
                 lines.push(("Ref. clock".into(), stamp));
             }
             if let Some(free) = pv.target_free {
-                lines.push(("Target free space".into(), human_bytes(free)));
+                lines.push(("Target free".into(), human_bytes(free)));
             }
             if form.allow_tmpfs || form.allow_writable_source {
                 let mut flags = Vec::new();
@@ -3915,7 +6051,7 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
                 if form.allow_writable_source {
                     flags.push("--allow-writable-source");
                 }
-                lines.push(("Safety overrides".into(), flags.join(", ")));
+                lines.push(("Overrides".into(), flags.join(", ")));
             }
             lines
         }
@@ -3924,17 +6060,14 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
             let mut lines = vec![
                 ("Package".into(), args.package.display().to_string()),
                 ("Provider".into(), args.provider.clone()),
+                ("Output".into(), args.output.display().to_string()),
                 (
-                    "Output collection".into(),
-                    args.output.display().to_string(),
-                ),
-                (
-                    "Case / Evidence".into(),
+                    "Case/Evid.".into(),
                     format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
                 ),
                 ("Examiner".into(), form.case.examiner.trim().to_string()),
                 (
-                    "Package items".into(),
+                    "In scope".into(),
                     format!(
                         "{} files ({}), {} listed, {} unlisted, {} missing",
                         pv.files,
@@ -3949,28 +6082,25 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
                 lines.push(("Ref. clock".into(), stamp));
             }
             if let Some(free) = pv.target_free {
-                lines.push(("Target free space".into(), human_bytes(free)));
+                lines.push(("Target free".into(), human_bytes(free)));
             }
             if form.output.allow_tmpfs {
-                lines.push(("Safety overrides".into(), "--allow-tmpfs".into()));
+                lines.push(("Overrides".into(), "--allow-tmpfs".into()));
             }
             lines
         }
         ModePreview::Cloud { preview: pv, args } => {
             let form = &app.cloud_form;
             let mut lines = vec![
-                ("Remote source".into(), args.source.clone()),
+                ("Remote".into(), args.source.clone()),
+                ("Output".into(), args.output.display().to_string()),
                 (
-                    "Output collection".into(),
-                    args.output.display().to_string(),
-                ),
-                (
-                    "Case / Evidence".into(),
+                    "Case/Evid.".into(),
                     format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
                 ),
                 ("Examiner".into(), form.case.examiner.trim().to_string()),
                 (
-                    "In-scope items".into(),
+                    "In scope".into(),
                     format!(
                         "{} of {} listed files ({})",
                         pv.files,
@@ -3983,10 +6113,10 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
                 lines.push(("Ref. clock".into(), stamp));
             }
             if let Some(free) = pv.target_free {
-                lines.push(("Target free space".into(), human_bytes(free)));
+                lines.push(("Target free".into(), human_bytes(free)));
             }
             if form.output.allow_tmpfs {
-                lines.push(("Safety overrides".into(), "--allow-tmpfs".into()));
+                lines.push(("Overrides".into(), "--allow-tmpfs".into()));
             }
             lines
         }
@@ -3995,20 +6125,17 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
             let in_scope = pv.databases.iter().filter(|(_, _, s)| *s).count();
             let mut lines = vec![
                 (
-                    "Database server".into(),
+                    "DB server".into(),
                     format!("{}://{}@{}", args.engine.as_cli_str(), args.user, args.host),
                 ),
+                ("Output".into(), args.output.display().to_string()),
                 (
-                    "Output collection".into(),
-                    args.output.display().to_string(),
-                ),
-                (
-                    "Case / Evidence".into(),
+                    "Case/Evid.".into(),
                     format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
                 ),
                 ("Examiner".into(), form.case.examiner.trim().to_string()),
                 (
-                    "In-scope databases".into(),
+                    "In scope".into(),
                     format!(
                         "{} of {} (~{})",
                         in_scope,
@@ -4021,10 +6148,114 @@ pub fn confirm_start_lines(app: &App, preview: &PreviewData) -> Vec<(String, Str
                 lines.push(("Ref. clock".into(), stamp));
             }
             if let Some(free) = pv.target_free {
-                lines.push(("Target free space".into(), human_bytes(free)));
+                lines.push(("Target free".into(), human_bytes(free)));
             }
             if form.output.allow_tmpfs {
-                lines.push(("Safety overrides".into(), "--allow-tmpfs".into()));
+                lines.push(("Overrides".into(), "--allow-tmpfs".into()));
+            }
+            lines
+        }
+        ModePreview::Imap { preview: pv, args } => {
+            let form = &app.imap_form;
+            let mut lines = vec![
+                (
+                    "IMAP server".into(),
+                    format!(
+                        "{}@{} ({})",
+                        args.user,
+                        args.server,
+                        args.security.as_cli_str()
+                    ),
+                ),
+                ("Output".into(), args.output.display().to_string()),
+                (
+                    "Case/Evid.".into(),
+                    format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
+                ),
+                ("Examiner".into(), form.case.examiner.trim().to_string()),
+                (
+                    "In scope".into(),
+                    format!(
+                        "{} of {} ({})",
+                        pv.in_scope,
+                        pv.messages,
+                        human_bytes(pv.bytes)
+                    ),
+                ),
+            ];
+            if let Some(stamp) = form.clock.stamp_hint() {
+                lines.push(("Ref. clock".into(), stamp));
+            }
+            if let Some(free) = pv.target_free {
+                lines.push(("Target free".into(), human_bytes(free)));
+            }
+            if form.output.allow_tmpfs {
+                lines.push(("Overrides".into(), "--allow-tmpfs".into()));
+            }
+            lines
+        }
+        ModePreview::Graph { preview: pv, args } => {
+            let form = &app.graph_form;
+            let mut lines = vec![
+                ("Mailbox".into(), pv.account.clone()),
+                ("Output".into(), args.output.display().to_string()),
+                (
+                    "Case/Evid.".into(),
+                    format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
+                ),
+                ("Examiner".into(), form.case.examiner.trim().to_string()),
+                (
+                    "In scope".into(),
+                    format!(
+                        "{} (~{}) across {} folder(s)",
+                        pv.in_scope,
+                        human_bytes(pv.bytes),
+                        pv.folders.len()
+                    ),
+                ),
+            ];
+            if let Some(stamp) = form.clock.stamp_hint() {
+                lines.push(("Ref. clock".into(), stamp));
+            }
+            if let Some(free) = pv.target_free {
+                lines.push(("Target free".into(), human_bytes(free)));
+            }
+            if form.output.allow_tmpfs {
+                lines.push(("Overrides".into(), "--allow-tmpfs".into()));
+            }
+            lines
+        }
+        ModePreview::Gmail { preview: pv, args } => {
+            let form = &app.gmail_form;
+            let mut lines = vec![
+                (
+                    "Mailbox".into(),
+                    format!("{} ({})", pv.account, pv.auth_method),
+                ),
+                ("Output".into(), args.output.display().to_string()),
+                (
+                    "Case/Evid.".into(),
+                    format!("{} / {}", form.case.case.trim(), form.case.evidence.trim()),
+                ),
+                ("Examiner".into(), form.case.examiner.trim().to_string()),
+                (
+                    "In scope".into(),
+                    format!(
+                        "{} of {} (~{})",
+                        pv.in_scope,
+                        pv.messages,
+                        human_bytes(pv.bytes)
+                    ),
+                ),
+            ];
+            if let Some(stamp) = form.clock.stamp_hint() {
+                lines.push(("Ref. clock".into(), stamp));
+            }
+            if let Some(free) = pv.target_free {
+                lines.push(("Target free".into(), human_bytes(free)));
+            }
+            if form.output.allow_tmpfs {
+                lines.push(("Overrides".into(), "--allow-tmpfs".into()));
             }
             lines
         }
@@ -4214,6 +6445,187 @@ mod tests {
         app.db_form.set_focus(DbField::Host);
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert!(app.db_credential.is_none());
+    }
+
+    #[test]
+    fn imap_graph_gmail_credentials_dropped_when_connection_fields_change() {
+        static MAIL_CRED_STOP: Stop = Stop::new();
+        let mut app = App::with_mounts(&MAIL_CRED_STOP, Vec::new(), Vec::new());
+
+        // IMAP credential dropped when server changes
+        app.open_imap_form();
+        app.imap_form.server = "mail.example.org".into();
+        app.imap_form.user = "alice@example.org".into();
+        let ikey = app.imap_form.conn_key();
+        app.imap_credential = Some((
+            ikey,
+            Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "pw".into(),
+            ))),
+        ));
+        app.imap_form.set_focus(ImapField::Server);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(app.imap_credential.is_none());
+
+        // Graph credential dropped when mailbox changes
+        app.open_graph_form();
+        app.graph_form.mailbox = "alice@contoso.example".into();
+        let gkey = app.graph_form.conn_key();
+        app.graph_credential = Some((
+            gkey,
+            Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "tok".into(),
+            ))),
+        ));
+        app.graph_form.set_focus(GraphField::Mailbox);
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(app.graph_credential.is_none());
+
+        // Gmail credential dropped when auth mode toggles
+        app.open_gmail_form();
+        app.gmail_form.mailbox = "alice@example.org".into();
+        let gmkey = app.gmail_form.conn_key();
+        app.gmail_credential = Some((
+            gmkey,
+            Credential(crate::common::CredentialKind::Password(Zeroizing::new(
+                "tok".into(),
+            ))),
+        ));
+        app.gmail_form.set_focus(GmailField::Auth);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(app.gmail_credential.is_none());
+    }
+
+    #[test]
+    fn sign_in_screen_round_trip_and_cancel() {
+        static SIGNIN_STOP: Stop = Stop::new();
+        SIGNIN_STOP.clear_examiner();
+        let mut app = App::with_mounts(&SIGNIN_STOP, Vec::new(), Vec::new());
+        let console = Arc::new(TuiConsole::new(&SIGNIN_STOP, app.secret_tx.clone()));
+        let progress = Arc::new(Progress::default());
+
+        let (step_tx, step_rx) = std::sync::mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<&'static str>();
+        let console_w = Arc::clone(&console);
+
+        let handle = std::thread::spawn(move || {
+            let ctx = RunCtx {
+                stop: &SIGNIN_STOP,
+                progress: None,
+                argv: None,
+                interactive: true,
+                preview: None,
+                credential: Default::default(),
+                reference_entered_ns: None,
+                console: console_w,
+            };
+            ctx.console.sign_in(&SignIn::DeviceCode {
+                message: "To sign in, open https://microsoft.com/devicelogin and enter ABCD-EFGH."
+                    .into(),
+                uri: "https://microsoft.com/devicelogin".into(),
+                code: "ABCD-EFGH".into(),
+                expires_at_ns: 2_000_000_000_000_000_000,
+            });
+            let _ = ready_tx.send("device");
+            let _ = step_rx.recv();
+
+            ctx.console.sign_in(&SignIn::Browser {
+                url: "https://accounts.google.com/o/oauth2/v2/auth?state=xyz".into(),
+                expires_at_ns: 2_000_000_000_000_000_000,
+            });
+            let _ = ready_tx.send("browser");
+            let pasted = loop {
+                if let Some(p) = ctx.console.pasted() {
+                    break p;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            assert_eq!(
+                pasted,
+                "http://127.0.0.1:43123/callback?code=4/test&state=xyz"
+            );
+            ctx.console.sign_in_done();
+            let _ = ready_tx.send("browser_done");
+            let _ = step_rx.recv();
+
+            ctx.console.sign_in(&SignIn::DeviceCode {
+                message: "Second device code sign-in".into(),
+                uri: "https://microsoft.com/devicelogin".into(),
+                code: "WXYZ-1234".into(),
+                expires_at_ns: 2_000_000_000_000_000_000,
+            });
+            let _ = ready_tx.send("cancel_wait");
+            while !ctx.stop.examiner.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            ctx.console.sign_in_done();
+            PreviewWorkerOutput {
+                result: Err(anyhow::anyhow!("cancelled by examiner")),
+                db_credential: None,
+                imap_credential: None,
+                graph_credential: None,
+                gmail_credential: None,
+            }
+        });
+
+        app.preview_state = Some(PreviewState::Running {
+            mode: Mode::Graph,
+            argv: vec!["dfcollect".into(), "graph".into()],
+            progress,
+            console: Arc::clone(&console),
+            started: Instant::now(),
+            handle: Some(handle),
+        });
+        app.screen = Screen::Preview;
+
+        // 1. DeviceCode sign-in from worker thread: 'y' copies code, 'u' copies URI
+        assert_eq!(ready_rx.recv().unwrap(), "device");
+        assert!(matches!(
+            app.active_sign_in(),
+            Some(SignIn::DeviceCode { .. })
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_osc52.as_deref(),
+            Some(base64(b"ABCD-EFGH").as_str())
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert_eq!(
+            app.pending_osc52.as_deref(),
+            Some(base64(b"https://microsoft.com/devicelogin").as_str())
+        );
+        step_tx.send(()).unwrap();
+
+        // 2. Browser sign-in from worker thread: typing redirect URL and pressing Enter wakes worker
+        assert_eq!(ready_rx.recv().unwrap(), "browser");
+        assert!(matches!(app.active_sign_in(), Some(SignIn::Browser { .. })));
+        let callback = "http://127.0.0.1:43123/callback?code=4/test&state=xyz";
+        for ch in callback.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ready_rx.recv().unwrap(), "browser_done");
+        assert!(app.active_sign_in().is_none());
+        step_tx.send(()).unwrap();
+
+        // 3. Pressing Esc opens ConfirmStopSignIn; 'n' cancels modal; Esc then 'y' sets stop.examiner
+        assert_eq!(ready_rx.recv().unwrap(), "cancel_wait");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.modal, Some(Modal::ConfirmStopSignIn));
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(!SIGNIN_STOP.examiner.load(Ordering::Relaxed));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(SIGNIN_STOP.examiner.load(Ordering::Relaxed));
+        assert!(app.active_sign_in().is_none());
+
+        app.wait_for_worker();
+        assert!(matches!(
+            app.preview_state,
+            Some(PreviewState::Failed { .. })
+        ));
     }
 
     struct TempDirGuard(PathBuf);
@@ -4458,5 +6870,221 @@ mod tests {
         assert_eq!(rep.members_ok, 2);
         assert_eq!(rep.files_ok, 0);
         assert_eq!(rep.audit_anchor_found, Some(true));
+    }
+
+    #[test]
+    fn mode_switch_clears_preview_and_stale_sign_in_modal_closes_cleanly() {
+        static R2_STOP: Stop = Stop::new();
+        R2_STOP.clear_examiner();
+        let mut app = sample_app(&R2_STOP);
+
+        let argv = files_argv(&app.files_form);
+        let args = parse_files_argv(&argv).unwrap();
+        let preview = Preview {
+            source: PathBuf::from("/media/evidence/sdb1"),
+            output: PathBuf::from("/media/target/sdc1/VG_12345_26/share01"),
+            files: 1,
+            bytes: 128,
+            directories: 1,
+            symlinks: 0,
+            special: 0,
+            out_of_scope: BTreeMap::new(),
+            excluded_trees: 0,
+            trees_outside_includes: 0,
+            other_filesystems: Vec::new(),
+            errors: Vec::new(),
+            sample: Vec::new(),
+            target_free: Some(500 << 30),
+            stopped: None,
+            at_ns: 1_776_000_000_000_000_000,
+        };
+        app.preview_state = Some(PreviewState::Ready(Box::new(PreviewData::from_files(
+            preview, argv, args,
+        ))));
+        assert!(app.preview_state.is_some());
+
+        // Switching to M365LogsForm (or any other mode) clears preview_state
+        app.open_m365_logs_form();
+        assert!(app.preview_state.is_none());
+
+        // If ConfirmStopSignIn is open when sign_in_done() runs, tick() closes it
+        // and pressing 'y' before tick() does NOT set stop.examiner.
+        let console = Arc::new(TuiConsole::new(&R2_STOP, app.secret_tx.clone()));
+        app.run_state = Some(RunState {
+            mode: Mode::M365Logs,
+            source_display: "tenant contoso".into(),
+            output: PathBuf::from("/tmp/out"),
+            argv: vec!["dfcollect".into(), "m365-logs".into()],
+            expected_files: 1,
+            expected_bytes: 0,
+            progress: Arc::new(Progress::default()),
+            console: Arc::clone(&console),
+            notices_expanded: false,
+            notices_scroll: 0,
+            started: Instant::now(),
+            rate_samples: VecDeque::new(),
+            stop_requested: false,
+            handle: None,
+        });
+        app.screen = Screen::Running;
+        console.sign_in(&SignIn::DeviceCode {
+            message: "msg".into(),
+            uri: "https://example.org/device".into(),
+            code: "1234".into(),
+            expires_at_ns: 2_000_000_000_000_000_000,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.modal, Some(Modal::ConfirmStopSignIn));
+
+        // Worker finishes signing in while modal is open:
+        console.sign_in_done();
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(!R2_STOP.examiner.load(Ordering::Relaxed));
+
+        // Also verify tick() auto-closes ConfirmStopSignIn if sign_in_done() happened:
+        app.modal = Some(Modal::ConfirmStopSignIn);
+        app.tick();
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn failed_preview_preserves_credential_and_result_reads_items_jsonl_errors() {
+        static R2_CRED_STOP: Stop = Stop::new();
+        R2_CRED_STOP.clear_examiner();
+        let mut app = App::with_mounts(&R2_CRED_STOP, Vec::new(), Vec::new());
+        app.open_imap_form();
+        app.imap_form.server = "mail.example.org".into();
+        app.imap_form.user = "alice@example.org".into();
+        let conn_key = app.imap_form.conn_key();
+
+        let console = Arc::new(TuiConsole::new(&R2_CRED_STOP, app.secret_tx.clone()));
+        let console_w = Arc::clone(&console);
+        let progress = Arc::new(Progress::default());
+        let handle = std::thread::spawn(move || {
+            let ctx = RunCtx {
+                stop: &R2_CRED_STOP,
+                progress: None,
+                argv: None,
+                interactive: true,
+                preview: None,
+                credential: Mutex::new(Some(Credential(crate::common::CredentialKind::Password(
+                    Zeroizing::new("saved-pw".into()),
+                )))),
+                reference_entered_ns: None,
+                console: console_w,
+            };
+            let (res, kept): (anyhow::Result<()>, Option<Credential>) = finish_preview(
+                Err(anyhow::anyhow!("folder listing failed after login")),
+                &ctx,
+            );
+            PreviewWorkerOutput {
+                result: res.map(|()| unreachable!()),
+                db_credential: None,
+                imap_credential: kept.map(|c| (conn_key, c)),
+                graph_credential: None,
+                gmail_credential: None,
+            }
+        });
+        app.preview_state = Some(PreviewState::Running {
+            mode: Mode::Imap,
+            argv: vec!["dfcollect".into(), "imap".into()],
+            progress,
+            console,
+            started: Instant::now(),
+            handle: Some(handle),
+        });
+        app.wait_for_worker();
+        assert!(matches!(
+            app.preview_state,
+            Some(PreviewState::Failed { .. })
+        ));
+        assert!(
+            app.imap_credential.is_some(),
+            "credential kept in RunCtx before listing failure must survive via finish_preview into app.imap_credential"
+        );
+
+        // Verify items.jsonl is NOT read when errors == 0, and IS read when errors > 0
+        let dir =
+            std::env::temp_dir().join(format!("dfcollect-tui-items-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _guard = TempDirGuard(dir.clone());
+        let item_err = serde_json::json!({
+            "path": "INBOX/uid-42.eml",
+            "kind": "file",
+            "status": "error",
+            "reason": "FETCH failed: UID 42 vanished",
+            "hashes": {}
+        });
+        std::fs::write(
+            dir.join(dfcore::manifest::ITEMS),
+            format!("{}\n", serde_json::to_string(&item_err).unwrap()),
+        )
+        .unwrap();
+
+        // Clean outcome (errors: 0, status: "completed"): does not scan items.jsonl
+        let clean_outcome = finish_run_outcome(
+            0,
+            serde_json::json!({
+                "collection": dir,
+                "status": "completed",
+                "messages": 3,
+                "bytes": 1024,
+                "errors": 0,
+                "problems": [],
+            }),
+            &dir,
+        );
+        let rd_clean = ResultData::from_outcome_for_mode(
+            Mode::Imap,
+            &clean_outcome,
+            dir.clone(),
+            vec!["dfcollect".into(), "imap".into()],
+        );
+        assert!(
+            rd_clean.problems.is_empty(),
+            "items.jsonl should not be scanned when errors == 0: {:?}",
+            rd_clean.problems
+        );
+
+        // Error outcome (errors: 1, status: "completed_with_errors"): worker scans items.jsonl via finish_run_outcome
+        let outcome = finish_run_outcome(
+            7,
+            serde_json::json!({
+                "collection": dir,
+                "status": "completed_with_errors",
+                "messages": 3,
+                "bytes": 1024,
+                "errors": 1,
+                "problems": [],
+            }),
+            &dir,
+        );
+        let rd = ResultData::from_outcome_for_mode(
+            Mode::Imap,
+            &outcome,
+            dir.clone(),
+            vec![
+                "dfcollect".into(),
+                "imap".into(),
+                "--user".into(),
+                "alice@example.org".into(),
+            ],
+        );
+        assert!(
+            rd.problems
+                .iter()
+                .any(|p| p.contains("INBOX/uid-42.eml: FETCH failed: UID 42 vanished")),
+            "problems should include failed item from items.jsonl: {:?}",
+            rd.problems
+        );
+
+        // Pressing 'c' on the Result screen copies the command via OSC 52
+        app.result_data = Some(rd);
+        app.screen = Screen::Result;
+        app.pending_osc52 = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.pending_osc52.is_some());
     }
 }
