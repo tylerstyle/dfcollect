@@ -538,7 +538,6 @@ pub const PREVIEW_SAMPLE: usize = 1000;
 
 impl CloudPreview {
     /// For the run's footprint
-    #[allow(dead_code)] // the TUI's preview hands it to the run (batch 1)
     pub fn note(&self) -> PreviewNote {
         PreviewNote {
             at_ns: self.at_ns,

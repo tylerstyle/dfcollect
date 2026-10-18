@@ -65,56 +65,91 @@ stderr (not with `--json`).
 ## Terminal UI
 
 Running `dfcollect` without arguments on a terminal opens the interactive TUI
-for `files` and `verify` (when `stdin` or `stdout` is not a terminal, `dfcollect`
-prints the command-line help and exits 2). The TUI uses the standard 16 ANSI
-colours and fits 80×24 serial and Linux virtual consoles without mouse capture,
-so paths and hashes stay selectable.
+for `files`, `verify`, `ingest`, `cloud` and `db` (when `stdin` or `stdout` is
+not a terminal, `dfcollect` prints the command-line help and exits 2). The TUI
+uses the standard 16 ANSI colours and fits 80×24 serial and Linux virtual
+consoles without mouse capture, so paths and hashes stay selectable.
 
-1. **Home.** Choose **Acquire files from a mounted directory** (`dfcollect files`)
-   or **Verify a collection** (`dfcollect verify`). The network, cloud, database
-   and provider modes are listed with their `dfcollect <mode> --help` command.
-2. **Files form.** Fill in the case metadata, pick a read-only source mount
-   (dfmount evidence under `/media/evidence/*` first, then read-only dfnet shares,
-   or type a path with `F4`/`Tab` autocompletion), set the output collection
-   directory (auto-suggested under the first writable `/media/target/*` mount as
-   `/media/target/<mount>/<case>/<evidence>` with path-safe characters), and
-   define the warrant scope (legal basis, `--include` / `--exclude` glob lists,
-   RFC 3339 time window with live UTC hints, or a `--scope` JSON file), reference
-   clock (type the trusted clock's time a few seconds ahead and press `Enter`
-   when the clock shows it to stamp the local clock), hashes (`--md5`, `--sha1`),
-   compression, and safety overrides (`--allow-tmpfs`, `--allow-writable-source`,
-   each requiring confirmation). The bottom line shows the equivalent
-   `dfcollect files …` command live.
-3. **Preview (`F2` or `p`).** Runs `files` in dry-run mode on a background
-   thread (`Esc` or `s` stops early). Shows in-scope counts and total bytes,
-   target free space (with a warning when free space is smaller than the
-   in-scope bytes), out-of-scope counts by reason, unlisted excluded/unreachable
-   directory trees, other filesystems, walk errors, a scrollable sample of the
-   first 1000 in-scope paths (`[f]` file, `[d]` directory, `[l]` symlink, `[s]`
-   special), and the wrapped CLI command (`c` copies it via OSC 52). Names
-   outside the scope are never held or shown. Starting an acquisition (`Enter` →
-   `y`) is only possible when the preview is complete and matches the form.
-4. **Run.** Shows the phase (`Copying → Checking container → Finishing`), a
-   progress gauge on bytes copied (then on container bytes verified), files
-   acquired, out-of-scope and error counts, 5-second rolling transfer rate,
-   elapsed time, ETA and current path. Pressing `s` or `Ctrl+C` (confirmed with
-   `y`) stops the acquisition cleanly (`aborted`, `"stopped by the examiner"`,
+1. **Home.** Choose **Acquire files from a mounted directory** (`dfcollect files`),
+   **Verify a collection** (`dfcollect verify`), **Record a provider or
+   third-party delivery** (`dfcollect ingest`), **Acquire from a pre-configured
+   rclone remote** (`dfcollect cloud`) or **Logical SQL dump from PostgreSQL or
+   MariaDB/MySQL** (`dfcollect db`). The remaining mail and tenant-log modes are
+   listed with their `dfcollect <mode> --help` command.
+2. **Mode forms.** Every acquisition form shares case metadata (`--case`,
+   `--evidence`, `--examiner`, `--description`, `--notes`), target output
+   suggestion (`/media/target/<mount>/<case>/<evidence>` with path-safe
+   characters and live free-space check), reference clock (type the trusted
+   clock's time a few seconds ahead and press `Enter` when the clock shows it to
+   stamp the local clock), hashes (`--md5`, `--sha1`), compression, and safety
+   overrides (`--allow-tmpfs`, `--allow-writable-source`, `--allow-unlisted`,
+   each requiring confirmation):
+   - **Files (`dfcollect files`).** Pick a read-only source mount (dfmount
+     evidence under `/media/evidence/*` first, then read-only dfnet shares, or
+     type a path with `F4`/`Tab` autocompletion), and set the warrant scope
+     (legal basis, `--include` / `--exclude` glob lists, RFC 3339 time window
+     with live UTC hints, or a `--scope` JSON file).
+   - **Provider delivery (`dfcollect ingest`).** Select the delivered package
+     file or directory, enter `--provider`, `--received-at` (RFC 3339 with live
+     UTC hint), optional `--channel`, `--reference`, companion `--hashes` sum
+     files, `--allow-unlisted` and `--legal-basis`.
+   - **Cloud (`dfcollect cloud`).** Pick a pre-configured remote discovered via
+     `rclone listremotes --long` (secrets in `rclone.conf` are never read by the
+     form), edit `REMOTE:path`, optional `--rclone-config` and safe read-only
+     `--rclone-arg` flags, and set the warrant scope (modification-time window,
+     include/exclude globs or `--scope` JSON file).
+   - **Database (`dfcollect db`).** Choose `postgres` or `mariadb`, set `--host`,
+     `--port` (`5432` / `3306` defaults), `--user`, `--password-file` or
+     `--no-password` (or leave both unset to be prompted in a masked modal on
+     preview/run), `--tls`, optional `--database` list, `--legal-basis`, and the
+     engine-specific option (`--serializable` for PostgreSQL,
+     `--binlog-position` for MariaDB/MySQL).
+
+   The bottom line always shows the equivalent `dfcollect <mode> …` CLI command
+   live (passwords are never placed in `argv`).
+3. **Preview (`F2` or `p`).** Runs the active mode in `--dry-run` mode on a
+   background thread (`Esc` or `s` stops early):
+   - `files`: in-scope counts and bytes, target free space, out-of-scope counts
+     by reason, unlisted excluded/unreachable trees, other filesystems, walk
+     errors and up to 1000 in-scope sample paths.
+   - `ingest`: package kind and SHA-256 (for archive packages), provider receipt
+     metadata, companion hash-list verification summary (matched, mismatched,
+     missing, unlisted) and sample entries.
+   - `cloud`: remote type and rclone version, in-scope vs listed objects and
+     bytes, out-of-scope counts by reason (never out-of-scope object names) and
+     in-scope sample objects.
+   - `db`: server and dumper versions, per-database table counts and estimated
+     bytes, target free space and privilege warnings. When a password is entered
+     in the masked modal during preview, it is kept in `Zeroizing` memory and
+     reused once for the acquisition run unless connection fields change.
+
+   Press `c` to copy the equivalent CLI command via OSC 52. Starting an
+   acquisition (`Enter` → `y`) is only possible when the preview is complete and
+   matches the form.
+4. **Run.** Shows the phase (`Copying → Checking container → Finishing`) and
+   sub-stage, a progress gauge on bytes or items, items acquired, out-of-scope
+   and error counts, 5-second rolling transfer rate, elapsed time, ETA, current
+   item and a live notices pane (`l` expands/collapses the full scrollable
+   50-entry notice log). Pressing `s` or `Ctrl+C` (confirmed with `y`) stops the
+   acquisition cleanly (`aborted`, `"stopped by the examiner"`, or `"cancelled
+   before anything was written"` if stopped during a pre-collection prompt,
    exit 8); quitting directly with `q` is disabled while running.
 5. **Result & Verify.** Shows the final status and exit-code meaning, collection
-   path, totals, audit anchor, and scrollable problems/warnings. Press `v` to
-   verify the collection immediately, `n` to start the next acquisition in the
-   same case (keeping case, examiner, source, scope and options, and clearing
-   evidence, description, notes, reference clock and safety overrides), or `q`
-   to quit.
+   path, totals, mode-specific summary fields, 64-hex audit anchor on its own
+   line, and scrollable problems/warnings. Press `v` to verify the collection
+   immediately, `n` to start the next acquisition in the same case (keeping
+   case, examiner, source/connection, scope and options, and clearing evidence,
+   description, notes, reference clock, safety overrides and cached credentials),
+   or `q` to quit.
 
 **What it records.** A collection started from the TUI records the equivalent
-`dfcollect files …` command in `manifest.json` (`method.argv`), plus two
+`dfcollect <mode> …` command in `manifest.json` (`method.argv`), plus two
 `footprint.jsonl` entries: `"started from the dfcollect TUI; method.argv is the equivalent command line"`
-and `"a preview listed the source before the acquisition (directory listings and lstat, no file opened)"`
-with the preview timestamp (`at`). When a reference clock reading is given,
-pressing `Enter` on the field stamps the local clock at that moment
-(`clocks.reference.local`), so `offset_seconds` reflects the offset when the
-reading was taken rather than when the run started.
+and the mode's preview note (`Preview::note()` / `IngestPreview::note()` /
+`CloudPreview::note()` / `DbPreview::note()`) with the preview timestamp (`at`).
+When a reference clock reading is given, pressing `Enter` on the field stamps
+the local clock at that moment (`clocks.reference.local`), so `offset_seconds`
+reflects the offset when the reading was taken rather than when the run started.
 
 ## What `dfcollect imap` does
 
