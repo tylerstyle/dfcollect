@@ -1,0 +1,29 @@
+version: 2
+
+# Cargo updates are intentionally omitted: dfcollect references ../dfcore as a
+# sibling path dependency, which Dependabot's single-repo sandbox cannot fetch.
+# Rust advisories are monitored by the `audit` job in .github/workflows/ci.yml.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "dfcore"
+    groups:
+      nix-inputs:
+        patterns:
+          - "*"
