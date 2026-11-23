@@ -1,12 +1,11 @@
 [package]
 name = "dfcollect"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Logical forensic acquisition with scope, per-item hashes, manifest and audit records"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tylerstyle/dfcollect"
-homepage = "https://github.com/tylerstyle/dfcollect"
 readme = "README.md"
 keywords = ["forensics", "dfir", "acquisition", "evidence", "tui"]
 categories = ["command-line-utilities"]
